@@ -1,0 +1,17 @@
+# App name is a placeholder; the owner decides it (see docs/plans/M4-account.md section 3).
+app = "catenga-focus"
+primary_region = "gru"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"

@@ -1,0 +1,283 @@
+html,
+body,
+#root {
+  height: 100%;
+}
+
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.app__header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--color-line);
+  background: var(--color-surface);
+}
+
+.app__brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 400;
+}
+
+.app__brand b {
+  font-weight: 700;
+}
+
+.app__nav {
+  display: flex;
+  gap: 4px;
+}
+
+.app__btn {
+  font: inherit;
+  font-size: 14px;
+  color: var(--color-ink);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  padding: 4px 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Heroicons (20/solid) inside buttons */
+.app__icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.app__btn:hover {
+  border-color: var(--color-ink-muted);
+}
+
+.app__date {
+  font-family: var(--font-display);
+  font-size: 18px;
+  text-transform: capitalize;
+}
+
+.app__banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 20px;
+  font-size: 14px;
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--color-tag-clay) 18%, var(--color-surface-raised));
+  border-bottom: 1px solid var(--color-tag-clay);
+}
+
+.day {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.day__grid {
+  position: relative;
+  margin: 12px 12px 12px 0;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.day__grid--disabled {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.day__line {
+  position: absolute;
+  left: 56px;
+  right: 0;
+  height: 0;
+  border-top: 1px solid var(--color-line);
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.day__line--hour {
+  opacity: 1;
+}
+
+.day__label {
+  position: absolute;
+  left: 0;
+  width: 48px;
+  transform: translateY(-50%);
+  text-align: right;
+  font-size: 12px;
+  color: var(--color-ink-muted);
+  pointer-events: none;
+}
+
+.day__track {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 68px;
+  right: 0;
+}
+
+.day__now {
+  position: absolute;
+  left: 56px;
+  right: 0;
+  height: 2px;
+  margin-top: -1px;
+  background: var(--color-tag-clay);
+  pointer-events: none;
+}
+
+.day__now::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: -4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-tag-clay);
+}
+
+.block {
+  position: absolute;
+  box-sizing: border-box;
+  padding: 2px 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 13px;
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--block-color, var(--color-line)) 22%, var(--color-surface-raised));
+  border: 1px solid var(--color-line);
+  border-left: 4px solid var(--block-color, var(--color-line));
+  border-radius: var(--radius-sm);
+  cursor: grab;
+  touch-action: none;
+}
+
+.block--untagged {
+  background: var(--color-surface-raised);
+}
+
+.block--selected {
+  outline: 2px solid var(--color-ink);
+  outline-offset: -1px;
+  z-index: 1;
+}
+
+.block--ghost {
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.block--compact {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.block__time {
+  font-size: 11px;
+  color: var(--color-ink-muted);
+  white-space: nowrap;
+}
+
+.block__title {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.block__title--empty {
+  color: var(--color-ink-muted);
+  font-weight: 400;
+}
+
+.block__input {
+  font: inherit;
+  min-width: 0;
+  color: var(--color-ink);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-ink-muted);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.block__handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 8px;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.block__handle--top {
+  top: -1px;
+}
+
+.block__handle--bottom {
+  bottom: -1px;
+}
+
+.app__main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* Google Calendar event with no block yet */
+.block--event {
+  background: transparent;
+  color: var(--color-ink-muted);
+  border: 1px dashed var(--color-ink-muted);
+  cursor: pointer;
+}
+
+.block--event:hover,
+.block--event:focus-visible {
+  background: color-mix(in srgb, var(--color-sun) 12%, transparent);
+  outline: none;
+}
+
+.block--event .block__title {
+  font-weight: 400;
+}
+
+.block__cal {
+  width: 12px;
+  height: 12px;
+  margin-right: 4px;
+  vertical-align: -2px;
+}
+
+/* Project (Google calendar) color: a stripe just inside the tag-colored left border */
+.block__stripe {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 4px;
+  background: var(--project, transparent);
+  pointer-events: none;
+}

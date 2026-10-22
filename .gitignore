@@ -1,0 +1,19 @@
+node_modules
+dist
+target
+*.local
+*.log
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Tauri-generated capability schemas
+apps/desktop/src-tauri/gen/schemas
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+server/dev.sqlite*

@@ -1,0 +1,58 @@
+.settings__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: color-mix(in srgb, var(--color-ink) 30%, transparent);
+}
+
+.settings {
+  width: min(420px, calc(100vw - 32px));
+  padding: 20px;
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  outline: none;
+}
+
+.settings__title {
+  margin: 0 0 16px;
+  font-size: 20px;
+}
+
+.settings__section {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.settings__section--spaced {
+  margin-top: 20px;
+}
+
+.settings__heading {
+  margin: 0;
+  font-size: 11px;
+  font-family: var(--font-body);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-ink-muted);
+}
+
+.settings__text {
+  margin: 0;
+  font-size: 14px;
+}
+
+.settings__text--error {
+  color: var(--color-tag-clay);
+}
+
+.app__gear {
+  margin-left: auto;
+}

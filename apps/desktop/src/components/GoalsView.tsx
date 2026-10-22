@@ -1,0 +1,60 @@
+import { useEffect } from "react";
+import { ChevronLeftIcon } from "@heroicons/react/20/solid";
+import type { GoogleStatus, TimerStatus } from "../api";
+import { useProjects } from "../hooks/useProjects";
+import { useTags } from "../hooks/useTags";
+import { GoalsSection } from "./GoalsSection";
+import { ProjectsTags } from "./ProjectsTags";
+import "../projects.css";
+
+interface Props {
+  /** Shared with the timeline and the notes panel. */
+  projects: ReturnType<typeof useProjects>;
+  google: GoogleStatus | null;
+  onConnect: () => void;
+  onBack: () => void;
+  timerStatus: TimerStatus;
+  nowMs: number;
+}
+
+/** The Goals page: goals, then the projects (Google calendars) and tags they can point at. */
+export function GoalsView({ projects, google, onConnect, onBack, timerStatus, nowMs }: Props) {
+  const tags = useTags();
+  const { refresh } = projects;
+  const canRead = !!google?.connected && !google.needsReconnect;
+
+  // Opening the page re-reads the calendar list, at most every 10 minutes.
+  useEffect(() => {
+    if (canRead) void refresh(false);
+  }, [canRead, refresh]);
+
+  return (
+    <section className="goalspage" aria-label="Goals">
+      <div className="goalspage__scroll">
+        <div className="goalspage__inner">
+          <header className="goalspage__header">
+            <button className="app__btn" onClick={onBack}>
+              <ChevronLeftIcon className="app__icon" aria-hidden="true" />
+              Day
+            </button>
+            <h2 className="goalspage__title">Goals</h2>
+          </header>
+          <GoalsSection projects={projects.list} tags={tags.list} timerStatus={timerStatus} nowMs={nowMs} />
+          <ProjectsTags
+            projects={projects.list}
+            projectsError={projects.error}
+            refreshing={projects.refreshing}
+            google={google}
+            onRefresh={() => void projects.refresh(true)}
+            onConnect={onConnect}
+            onSetShown={(id, shown) => void projects.setShown(id, shown)}
+            tags={tags.list}
+            tagsError={tags.error}
+            onSaveTag={tags.save}
+            onDeleteTag={tags.remove}
+          />
+        </div>
+      </div>
+    </section>
+  );
+}

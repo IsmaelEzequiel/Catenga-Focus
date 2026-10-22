@@ -1,0 +1,12 @@
+{
+  "name": "catenga",
+  "private": true,
+  "packageManager": "pnpm@8.15.4",
+  "scripts": {
+    "dev": "pnpm --filter @catenga/desktop tauri dev",
+    "build": "pnpm --filter @catenga/desktop tauri build",
+    "server:dev": "pnpm --filter @catenga/server dev",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  }
+}

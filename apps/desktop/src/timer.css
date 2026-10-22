@@ -1,0 +1,263 @@
+.timer {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--color-line);
+  font-size: 13px;
+}
+
+.timer__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timer__modes {
+  display: inline-flex;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.timer__mode {
+  font: inherit;
+  font-size: 12px;
+  color: var(--color-ink-muted);
+  background: var(--color-surface-raised);
+  border: 0;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.timer__mode--on {
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--color-sun) 28%, var(--color-surface-raised));
+}
+
+.timer__mode:disabled {
+  cursor: default;
+}
+
+.timer__clock {
+  flex: 1;
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.timer__phase {
+  font-size: 12px;
+  color: var(--color-ink-muted);
+}
+
+.timer__btn--start {
+  background: var(--color-sun);
+  border-color: var(--color-sun);
+}
+
+.timer__sessions {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.timer__session {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+  color: var(--color-ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.timer__delete {
+  display: inline-flex;
+  color: var(--color-ink-muted);
+  background: none;
+  border: 0;
+  padding: 2px;
+  cursor: pointer;
+}
+
+.timer__delete:hover {
+  color: var(--color-tag-clay);
+}
+
+.timer__total {
+  margin: 4px 0 0;
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+.chip {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--color-sun);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-sun) 18%, var(--color-surface-raised));
+  overflow: hidden;
+}
+
+.chip__open,
+.chip__stop {
+  font: inherit;
+  font-size: 14px;
+  color: var(--color-ink);
+  background: none;
+  border: 0;
+  padding: 4px 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chip__stop {
+  border-left: 1px solid var(--color-sun);
+}
+
+.chip__open:hover,
+.chip__stop:hover {
+  background: color-mix(in srgb, var(--color-sun) 25%, transparent);
+}
+
+.chip__title {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.chip__phase {
+  color: var(--color-ink-muted);
+  font-size: 12px;
+}
+
+.chip__time {
+  font-variant-numeric: tabular-nums;
+}
+
+.chip + .app__gear {
+  margin-left: 12px;
+}
+
+.app__banner--timer {
+  background: color-mix(in srgb, var(--color-sun) 22%, var(--color-surface-raised));
+  border-bottom-color: var(--color-sun);
+}
+
+.banner__actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* Timeline: sessions in a narrow gutter, and the block being timed */
+.day__gutter {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 58px;
+  width: 6px;
+  pointer-events: none;
+}
+
+.day__session {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: var(--color-sun);
+  border-radius: 2px;
+}
+
+.block--timing {
+  box-shadow: 0 0 0 2px var(--color-sun);
+}
+
+/* Pomodoro plan row: [4] × [25] min focus · [5] min break */
+.timer__focus {
+  padding: 4px 8px;
+}
+
+.timer__cycle {
+  margin: 8px 0 0;
+  color: var(--color-ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.plan {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  margin-top: 8px;
+  color: var(--color-ink-muted);
+  font-size: 12px;
+}
+
+.stepper {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+  overflow: hidden;
+}
+
+.stepper__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6em;
+  align-self: stretch;
+  color: var(--color-ink-muted);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.stepper__btn:hover:not(:disabled) {
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--color-sun) 22%, transparent);
+}
+
+.stepper__btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.stepper__icon {
+  width: 0.95em;
+  height: 0.95em;
+}
+
+.stepper__input {
+  width: 2.4em;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-ink);
+  text-align: center;
+  background: none;
+  border: 0;
+  padding: 3px 0;
+}
+
+.stepper__input:focus {
+  outline: none;
+  background: color-mix(in srgb, var(--color-sun) 14%, transparent);
+}
+
+.plan--large {
+  justify-content: center;
+  gap: 8px 10px;
+  margin-top: 0;
+  font-size: 16px;
+}
+
+.plan--large .stepper__input {
+  font-size: 18px;
+  font-family: var(--font-display);
+  font-weight: 600;
+}

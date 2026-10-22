@@ -1,0 +1,8 @@
+**/node_modules
+**/target
+**/dist
+.git
+server/dev.sqlite*
+**/.env
+**/.env.*
+!**/.env.example

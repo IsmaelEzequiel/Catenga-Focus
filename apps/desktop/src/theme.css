@@ -1,0 +1,49 @@
+/* Catenga Focus design tokens — see "Design" in CLAUDE.md. Use these, never raw hex values. */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/bricolage-grotesque";
+
+:root {
+  /* Surfaces */
+  --color-bg: #f5efe3; /* sand — app background */
+  --color-surface: #fffcf5; /* paper — panels, cards */
+  --color-surface-raised: #ffffff;
+  --color-line: #e3d9c6; /* borders, dividers */
+
+  /* Text */
+  --color-ink: #1e2b22; /* primary text, the calango */
+  --color-ink-muted: #5b6459; /* secondary text, labels */
+
+  /* Accent */
+  --color-sun: #e9a23b; /* brand accent, focus/timer */
+
+  /* Tag palette (tag → color mapping in config.json) */
+  --color-tag-sun: #e9a23b;
+  --color-tag-clay: #c8553d;
+  --color-tag-leaf: #4f7a4a;
+  --color-tag-sky: #3d6fb6;
+
+  /* Type */
+  --font-display: "Bricolage Grotesque Variable", system-ui, sans-serif;
+  --font-body: "Inter Variable", system-ui, sans-serif;
+
+  /* Shape */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}

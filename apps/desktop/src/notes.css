@@ -1,0 +1,118 @@
+.notes {
+  flex: 0 0 380px;
+  min-width: 320px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--color-line);
+  background: var(--color-surface);
+}
+
+.notes--empty {
+  padding: 24px 20px;
+  color: var(--color-ink-muted);
+  font-size: 14px;
+}
+
+.notes--empty p {
+  margin: 0 0 12px;
+}
+
+.notes__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-line);
+}
+
+.notes__title {
+  margin: 0;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notes__status {
+  flex: none;
+  min-height: 1em;
+  font-size: 12px;
+  color: var(--color-ink-muted);
+}
+
+.notes__saved {
+  animation: notes-fade 2s ease-out forwards;
+}
+
+@keyframes notes-fade {
+  0%,
+  70% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.notes__link {
+  font: inherit;
+  color: var(--color-tag-clay);
+  background: none;
+  border: 0;
+  padding: 0;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.notes__history {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.notes__history:hover {
+  text-decoration: underline;
+}
+
+.notes__conflict {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 16px;
+  font-size: 13px;
+  background: color-mix(in srgb, var(--color-tag-clay) 18%, var(--color-surface-raised));
+  border-bottom: 1px solid var(--color-tag-clay);
+}
+
+.notes__actions {
+  display: flex;
+  gap: 6px;
+}
+
+.notes__editor {
+  flex: 1;
+  min-height: 0;
+  margin: 12px;
+  padding: 10px 12px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-ink);
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  resize: none;
+}
+
+.notes__editor:focus {
+  outline: none;
+  border-color: var(--color-sun);
+}
