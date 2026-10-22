@@ -1,32 +1,35 @@
 import { useState, type FormEvent } from "react";
-import { ArrowPathIcon, PlusIcon, TrashIcon } from "@heroicons/react/20/solid";
-import type { GoogleStatus, Project, Tag, TagColor } from "../api";
-import { canReconnect, projectStyle, reconnectHint } from "../lib/projects";
+import { ArchiveBoxIcon, ArchiveBoxXMarkIcon, ArrowPathIcon, PlusIcon, TrashIcon } from "@heroicons/react/20/solid";
+import type { Calendar, GoogleStatus, Project, Tag, TagColor } from "../api";
+import { canReconnect, listProjects, projectHint, projectStyle, reconnectHint } from "../lib/projects";
 import { isValidTagName, TAG_PALETTE, tagVar } from "../lib/tags";
 import { ProjectDot } from "./ProjectPicker";
 import "../projects.css";
 
 interface Props {
   projects: Project[];
+  calendars: Calendar[];
   projectsError: string | null;
   refreshing: boolean;
   google: GoogleStatus | null;
   onRefresh: () => void;
   onConnect: () => void;
   onSetShown: (id: number, shown: boolean) => void;
+  onSetArchived: (id: number, archived: boolean) => void;
   tags: Tag[];
   tagsError: string | null;
   onSaveTag: (name: string, color: TagColor) => Promise<string | null>;
   onDeleteTag: (id: number) => Promise<string | null>;
 }
 
-/** Projects (Google calendars) with their timeline toggle, and the tag list with colors. */
+/** Projects (repeating events), the calendars that feed the timeline, and the tag list with colors. */
 export function ProjectsTags(p: Props) {
   const hint = reconnectHint(p.google);
-  const shown = p.projects.filter((x) => !x.archived);
+  const projects = listProjects(p.projects);
+  const calendars = p.calendars.filter((c) => !c.archived);
   return (
-    <section className="projtags" aria-label="Projects and tags">
-      <h3 className="dash__h projtags__h">Projects &amp; tags</h3>
+    <section className="projtags" aria-label="Projects, calendars and tags">
+      <h3 className="dash__h projtags__h">Projects, calendars &amp; tags</h3>
 
       <div className="projtags__card">
         <header className="projtags__head">
@@ -38,7 +41,9 @@ export function ProjectsTags(p: Props) {
             </button>
           )}
         </header>
-        <p className="projtags__text">Each Google calendar is a project. Its events, and the blocks and timer sessions made from them, belong to it.</p>
+        <p className="projtags__text">
+          A repeating event is a project: all its occurrences, and the blocks and timer sessions made from them, belong to it.
+        </p>
         {hint && (
           <p className="projtags__hint" role="status">
             {hint}
@@ -50,20 +55,54 @@ export function ProjectsTags(p: Props) {
           </p>
         )}
         {p.projectsError && <p className="dash__error">{p.projectsError}</p>}
-        {shown.length === 0 && !hint && <p className="projtags__text">No calendars yet.</p>}
-        {shown.length > 0 && (
+        {projects.length === 0 && !hint && <p className="projtags__text">Repeating events from your calendar show up here.</p>}
+        {projects.length > 0 && (
           <ul className="projtags__list">
-            {shown.map((x) => (
+            {projects.map((x) => (
               <li key={x.id} className="projtags__row" style={projectStyle(x.color)}>
                 <ProjectDot color={x.color} />
-                <span className="projtags__name">{x.name}</span>
-                {x.isPrimary && <span className="projtags__badge">primary</span>}
-                <label className="projtags__toggle" title={x.isPrimary ? "The primary calendar is always shown" : undefined}>
+                <span className={`projtags__name${x.archived ? " projtags__name--off" : ""}`}>{x.name}</span>
+                <span className="projtags__hintnote">{projectHint(x)}</span>
+                {x.archived && <span className="projtags__badge">archived</span>}
+                <button
+                  type="button"
+                  className="app__btn projtags__archive"
+                  onClick={() => p.onSetArchived(x.id, !x.archived)}
+                  aria-label={`${x.archived ? "Restore" : "Archive"} ${x.name}`}
+                >
+                  {x.archived ? (
+                    <ArchiveBoxXMarkIcon className="app__icon" aria-hidden="true" />
+                  ) : (
+                    <ArchiveBoxIcon className="app__icon" aria-hidden="true" />
+                  )}
+                  {x.archived ? "Restore" : "Archive"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div className="projtags__card">
+        <header className="projtags__head">
+          <h4 className="projtags__sub">Calendars</h4>
+        </header>
+        <p className="projtags__text">Calendars only decide what shows on the timeline.</p>
+        {calendars.length === 0 ? (
+          <p className="projtags__text">No calendars yet.</p>
+        ) : (
+          <ul className="projtags__list">
+            {calendars.map((c) => (
+              <li key={c.id} className="projtags__row" style={projectStyle(c.color)}>
+                <ProjectDot color={c.color} />
+                <span className="projtags__name">{c.name}</span>
+                {c.isPrimary && <span className="projtags__badge">primary</span>}
+                <label className="projtags__toggle" title={c.isPrimary ? "The primary calendar is always shown" : undefined}>
                   <input
                     type="checkbox"
-                    checked={x.showOnTimeline || x.isPrimary}
-                    disabled={x.isPrimary}
-                    onChange={(e) => p.onSetShown(x.id, e.target.checked)}
+                    checked={c.showOnTimeline || c.isPrimary}
+                    disabled={c.isPrimary}
+                    onChange={(e) => p.onSetShown(c.id, e.target.checked)}
                   />
                   Show on timeline
                 </label>

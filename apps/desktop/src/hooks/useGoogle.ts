@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { googleCancelConnect, googleConnect, googleDisconnect, googleStatus, onProjectsChanged, type GoogleStatus } from "../api";
+import { googleCancelConnect, googleConnect, googleDisconnect, googleStatus, onCalendarsChanged, onProjectsChanged, type GoogleStatus } from "../api";
 import { createPkce, randomState } from "../lib/pkce";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -43,16 +43,18 @@ export function useGoogle() {
   // The background calendar-list refresh can find a token without the new scope (needsReconnect).
   useEffect(() => {
     let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    onProjectsChanged(() => void recheck()).then(
-      (fn) => (cancelled ? fn() : (unlisten = fn)),
-      () => {
-        // No event bridge (tests, plain browser).
-      },
-    );
+    const unlisten: Array<() => void> = [];
+    for (const on of [onProjectsChanged, onCalendarsChanged]) {
+      on(() => void recheck()).then(
+        (fn) => (cancelled ? fn() : unlisten.push(fn)),
+        () => {
+          // No event bridge (tests, plain browser).
+        },
+      );
+    }
     return () => {
       cancelled = true;
-      unlisten?.();
+      unlisten.forEach((fn) => fn());
     };
   }, [recheck]);
 

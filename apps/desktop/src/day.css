@@ -281,3 +281,76 @@ body,
   background: var(--project, transparent);
   pointer-events: none;
 }
+
+/* Delete-event button on a Google Calendar event (shown on hover/focus) */
+.block__trash {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  color: var(--color-ink-muted);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.block--event:hover .block__trash,
+.block--event:focus-within .block__trash {
+  display: inline-flex;
+}
+
+.block__trash:hover,
+.block__trash:focus-visible {
+  color: var(--color-tag-clay);
+  border-color: var(--color-tag-clay);
+}
+
+/* Inline confirm over the timeline (delete event / block) */
+.dayask {
+  position: sticky;
+  top: 8px;
+  z-index: 5;
+  margin: 8px 12px 0;
+  padding: 10px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  font-size: 14px;
+  color: var(--color-ink);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-tag-clay);
+  border-radius: var(--radius-sm);
+}
+
+.dayask__text {
+  flex: 1 1 220px;
+}
+
+.dayask__hint {
+  display: block;
+  font-size: 13px;
+  color: var(--color-ink-muted);
+}
+
+.dayask__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dayask__danger {
+  color: var(--color-tag-clay);
+  border-color: var(--color-tag-clay);
+}
+
+/* "Start now": sun-tinted, like the running timer chip */
+.app__btn--start {
+  border-color: var(--color-sun);
+  background: color-mix(in srgb, var(--color-sun) 18%, var(--color-surface-raised));
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeConflict, overlayNotes, reconcileKeys, type UiBlock } from "./reconcile";
+import { mergeConflict, overlayNotes, reconcileKeys, recoveryConflicts, type UiBlock } from "./reconcile";
 
 let n = 0;
 const ui = (start: number, end: number, title: string, body = "", tags: string[] = []): UiBlock => ({
@@ -138,5 +138,25 @@ describe("overlayNotes", () => {
     const extra = ui(700, 760, "Extra", "x\n");
     const out = overlayNotes([savedA], [localA, extra]);
     expect(out).toEqual([{ ...savedA, body: "typed\n" }]);
+  });
+});
+
+describe("recoveryConflicts", () => {
+  const disk = [{ start: 540, end: 600, title: "A", tags: [], body: "disk\n", key: "k1" }];
+  it("is empty when the recovered text equals the file", () => {
+    expect(recoveryConflicts(disk, [{ ...disk[0], body: "disk\n" }])).toEqual([]);
+  });
+  it("keeps my differing text as a conflict on the matching block", () => {
+    const [c] = recoveryConflicts(disk, [{ start: 540, end: 600, title: "A", tags: [], body: "mine\n" }]);
+    expect(c.key).toBe("k1");
+    expect(c.mine.body).toBe("mine\n");
+  });
+  it("keeps text of a block that no longer exists, skips blank ones", () => {
+    const gone = { start: 700, end: 760, title: "Gone", tags: [], body: "precious\n" };
+    const blank = { start: 800, end: 860, title: "Blank", tags: [], body: "" };
+    const out = recoveryConflicts(disk, [gone, blank]);
+    expect(out).toHaveLength(1);
+    expect(out[0].mine.body).toBe("precious\n");
+    expect(out[0].key).not.toBe("k1");
   });
 });

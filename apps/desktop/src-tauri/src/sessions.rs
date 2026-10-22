@@ -41,7 +41,7 @@ pub struct SessionBlock {
     pub title: String,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Google calendar id of the block's project, when it had one at start.
+    /// Project key (`series:<id>` / `event:<id>`) of the block, when it had one at start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
 }
@@ -129,6 +129,95 @@ fn read_at(path: &Path) -> Result<Vec<Session>, String> {
         return Err(bad(&format!("unsupported version {}", sidecar.version)));
     }
     Ok(sidecar.sessions)
+}
+
+/// Sessions in the bytes of a sidecar (validated like `read_at`).
+fn parse_bytes(bytes: &[u8]) -> Result<Vec<Session>, String> {
+    let sidecar: Sidecar =
+        serde_json::from_slice(bytes).map_err(|e| format!("not valid session data ({e})"))?;
+    if sidecar.version != VERSION {
+        return Err(format!(
+            "not valid session data (unsupported version {})",
+            sidecar.version
+        ));
+    }
+    Ok(sidecar.sessions)
+}
+
+/// How long a session ran (or has been running, by `last_seen`), in seconds.
+fn length(s: &Session) -> i64 {
+    s.end
+        .as_deref()
+        .or(s.last_seen.as_deref())
+        .and_then(|end| seconds_between(&s.start, end))
+        .unwrap_or(0)
+}
+
+/// Union of two devices' sessions by `start`. When both have the same `start` but differ,
+/// the one with an `end` wins, else the longer one (a tie keeps `local`).
+pub fn merge_sessions(local: Vec<Session>, remote: Vec<Session>) -> Vec<Session> {
+    let mut all = local;
+    for r in remote {
+        match all.iter_mut().find(|l| l.start == r.start) {
+            None => all.push(r),
+            Some(l) if *l == r => {}
+            Some(l) => {
+                let take_remote = match (l.end.is_some(), r.end.is_some()) {
+                    (false, true) => true,
+                    (true, false) => false,
+                    _ => length(&r) > length(l),
+                };
+                if take_remote {
+                    *l = r;
+                }
+            }
+        }
+    }
+    all
+}
+
+/// Notes sync (M9b): merges a sidecar downloaded from the account into the local one
+/// (atomically, under the sidecar lock). Errors, writing nothing, when either side is invalid.
+pub fn merge_remote(root: &Path, date: &str, remote: &[u8]) -> Result<(), String> {
+    let remote = parse_bytes(remote)?;
+    update(root, date, |all| {
+        *all = merge_sessions(std::mem::take(all), remote);
+        Ok(())
+    })
+}
+
+/// Notes sync (M9b): replaces (`Some`) or deletes (`None`) the sidecar, but only while it
+/// still is what the caller looked at (`expect` = SHA-256 rev of it; `None` = no file).
+/// `false`: it changed meanwhile and nothing was touched.
+pub fn replace_synced(
+    root: &Path,
+    date: &str,
+    expect: Option<&str>,
+    bytes: Option<&[u8]>,
+) -> Result<bool, String> {
+    let _guard = lock();
+    let path = sidecar_path(root, date)?;
+    let current = match fs::read(&path) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    if current
+        .as_deref()
+        .map(crate::notes_crypto::rev_of)
+        .as_deref()
+        != expect
+    {
+        return Ok(false);
+    }
+    match bytes {
+        Some(b) => atomic::write_atomic(&path, b)?,
+        None if current.is_some() => {
+            fs::remove_file(&path).map_err(|e| format!("deleting {}: {e}", path.display()))?
+        }
+        None => {}
+    }
+    Ok(true)
 }
 
 /// That day's sessions in file order; `[]` when there is no sidecar.
@@ -501,5 +590,81 @@ mod tests {
         let got = read(&tmp.0, DATE).unwrap();
         assert_eq!(got[0].block.project, None);
         assert_eq!(got[1].block.project.as_deref(), Some("mest@x"));
+    }
+
+    fn open_session(start: &str, seen: &str) -> Session {
+        Session {
+            last_seen: Some(seen.into()),
+            ..s(start, None)
+        }
+    }
+
+    #[test]
+    fn merge_is_a_union_by_start() {
+        let m = merge_sessions(
+            vec![s(T0, Some(T1))],
+            vec![s(T2, Some("2026-10-20T10:30:00-03:00")), s(T0, Some(T1))],
+        );
+        let starts: Vec<_> = m.iter().map(|x| x.start.as_str()).collect();
+        assert_eq!(starts, [T0, T2]);
+    }
+
+    #[test]
+    fn merge_same_start_prefers_the_finished_one_then_the_longer_then_local() {
+        // Remote finished, local still open: remote wins.
+        let m = merge_sessions(vec![open_session(T0, T1)], vec![s(T0, Some(T1))]);
+        assert_eq!(m[0].end.as_deref(), Some(T1));
+        // Local finished, remote open: local stays.
+        let m = merge_sessions(vec![s(T0, Some(T1))], vec![open_session(T0, T2)]);
+        assert_eq!(m[0].end.as_deref(), Some(T1));
+        // Both finished: the longer wins, either way round.
+        let m = merge_sessions(vec![s(T0, Some(T1))], vec![s(T0, Some(T2))]);
+        assert_eq!(m[0].end.as_deref(), Some(T2));
+        let m = merge_sessions(vec![s(T0, Some(T2))], vec![s(T0, Some(T1))]);
+        assert_eq!(m[0].end.as_deref(), Some(T2));
+        // Both open: the one seen later (longer) wins.
+        let m = merge_sessions(vec![open_session(T0, T1)], vec![open_session(T0, T2)]);
+        assert_eq!(m[0].last_seen.as_deref(), Some(T2));
+        // A tie keeps local.
+        let mut remote = s(T0, Some(T1));
+        remote.block.title = "Remote".into();
+        let m = merge_sessions(vec![s(T0, Some(T1))], vec![remote]);
+        assert_eq!(m[0].block.title, "A");
+    }
+
+    #[test]
+    fn merge_remote_writes_the_union_sorted_and_refuses_bad_data() {
+        let tmp = TempDir::new();
+        upsert(&tmp.0, DATE, s(T2, Some("2026-10-20T10:30:00-03:00"))).unwrap();
+        let remote = serde_json::to_vec(&Sidecar {
+            version: VERSION,
+            sessions: vec![s(T0, Some(T1))],
+        })
+        .unwrap();
+        merge_remote(&tmp.0, DATE, &remote).unwrap();
+        let all = read(&tmp.0, DATE).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].start, T0);
+        let before = fs::read(sidecar_path(&tmp.0, DATE).unwrap()).unwrap();
+        assert!(merge_remote(&tmp.0, DATE, b"{ nope").is_err());
+        assert!(merge_remote(&tmp.0, DATE, br#"{"version":9,"sessions":[]}"#).is_err());
+        assert_eq!(
+            fs::read(sidecar_path(&tmp.0, DATE).unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn replace_synced_only_touches_the_expected_content() {
+        let tmp = TempDir::new();
+        let path = sidecar_path(&tmp.0, DATE).unwrap();
+        assert!(replace_synced(&tmp.0, DATE, None, Some(b"{\"version\":1}")).unwrap());
+        let rev = crate::notes_crypto::rev_of(b"{\"version\":1}");
+        assert!(!replace_synced(&tmp.0, DATE, None, Some(b"x")).unwrap());
+        assert!(!replace_synced(&tmp.0, DATE, Some("nope"), None).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"{\"version\":1}");
+        assert!(replace_synced(&tmp.0, DATE, Some(&rev), None).unwrap());
+        assert!(!path.exists());
+        assert!(replace_synced(&tmp.0, DATE, None, None).unwrap());
     }
 }

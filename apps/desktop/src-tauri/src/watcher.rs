@@ -14,12 +14,14 @@ pub const DEBOUNCE: Duration = Duration::from_millis(300);
 /// Starts one recursive watcher over the store's root. Keep the returned
 /// handle alive; dropping it stops watching. `on_change` runs on the
 /// debouncer's thread. `on_index` hears about every change to a day file (own
-/// saves included) and about folder-level changes that need a rescan.
+/// saves included) and about folder-level changes that need a rescan. `on_path` hears
+/// about every changed path (the notes sync decides whether it is one of its files).
 pub fn start(
     store: Arc<DayStore>,
     debounce: Duration,
     on_change: impl Fn(DayChanged) + Send + 'static,
     on_index: impl Fn(IndexEvent) + Send + 'static,
+    on_path: impl Fn(&Path) + Send + 'static,
 ) -> Result<Debouncer<RecommendedWatcher>, String> {
     let root = store.root().to_path_buf();
     let handler_store = store.clone();
@@ -32,6 +34,7 @@ pub fn start(
                 if !seen.insert(event.path.clone()) {
                     continue;
                 }
+                on_path(&event.path);
                 match index_event(&index_root, &event.path) {
                     Some(IndexEvent::Rescan) => rescan = true,
                     Some(day) => on_index(day),
@@ -94,14 +97,20 @@ mod tests {
         store: Arc<DayStore>,
         rx: Receiver<DayChanged>,
         rx_index: Receiver<IndexEvent>,
+        rx_path: Receiver<std::path::PathBuf>,
         _handle: Debouncer<RecommendedWatcher>,
     }
 
     fn fixture() -> Fixture {
         let tmp = TempDir::new();
         let store = Arc::new(DayStore::new(fs::canonicalize(&tmp.0).unwrap()));
+        // The month folder exists before watching starts: on a busy machine macOS can fold
+        // "folder created" and "file written" into one event, which the watcher treats as a
+        // rescan instead of a day change, and the tests would wait forever.
+        fs::create_dir_all(day_path(store.root(), DATE).unwrap().parent().unwrap()).unwrap();
         let (tx, rx) = channel();
         let (tx_index, rx_index) = channel();
+        let (tx_path, rx_path) = channel();
         let handle = start(
             store.clone(),
             TEST_DEBOUNCE,
@@ -111,6 +120,9 @@ mod tests {
             move |e| {
                 let _ = tx_index.send(e);
             },
+            move |p| {
+                let _ = tx_path.send(p.to_path_buf());
+            },
         )
         .unwrap();
         Fixture {
@@ -118,6 +130,7 @@ mod tests {
             store,
             rx,
             rx_index,
+            rx_path,
             _handle: handle,
         }
     }
@@ -283,5 +296,30 @@ mod tests {
         settle(&f);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
         assert!(wait_for(&f, &IndexEvent::Rescan));
+    }
+
+    #[test]
+    fn watcher_reports_config_json_and_sidecars_to_the_path_hook() {
+        let f = fixture();
+        settle(&f);
+        while f.rx_path.try_recv().is_ok() {}
+        let config = f.store.root().join("config.json");
+        fs::write(&config, "{}").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = false;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match f.rx_path.recv_timeout(left) {
+                Ok(p) if p == config => {
+                    seen = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            seen,
+            "config.json reaches the hook, which the day events never did"
+        );
     }
 }

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { loadDay, onDayChanged, saveDay, type DayChanged, type LoadedDay } from "../api";
+import { loadDay, onDayChanged, type DayChanged, type LoadedDay } from "../api";
 import { createAutosaveTimer } from "../lib/autosaveTimer";
 import { applyNote, isLastBlock } from "../lib/note";
-import { mergeConflict, overlayNotes, reconcileKeys, type Conflict, type UiBlock } from "../lib/reconcile";
+import { mergeConflict, overlayNotes, reconcileKeys, recoveryConflicts, type Conflict, type UiBlock } from "../lib/reconcile";
+import { openDecision, type RecoveryTracker } from "../lib/recovery";
 
 export type { Conflict, UiBlock };
 
@@ -16,8 +17,9 @@ const stripKey = ({ key: _key, ...block }: UiBlock) => block;
 /**
  * Single owner of a day's blocks and of every write to its file. Saves run one at a time;
  * each carries the revision it was based on, so edits made outside the app are never overwritten.
+ * A save that fails (or conflicts after the day was left) is kept in `recovery`, never dropped.
  */
-export function useDay(date: string, onNotice: (message: string) => void) {
+export function useDay(date: string, onNotice: (message: string) => void, recovery: RecoveryTracker) {
   const [blocks, setBlocks] = useState<UiBlock[]>([]);
   const [loadedDate, setLoadedDate] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -44,6 +46,8 @@ export function useDay(date: string, onNotice: (message: string) => void) {
   const failed = useRef({ loadId: -1, upToSeq: -1 });
   const onNoticeRef = useRef(onNotice);
   onNoticeRef.current = onNotice;
+  const recoveryRef = useRef(recovery);
+  recoveryRef.current = recovery;
 
   const refreshSaveState = useCallback(() => {
     let state: SaveState;
@@ -66,11 +70,21 @@ export function useDay(date: string, onNotice: (message: string) => void) {
     setConflicts(next);
   }, []);
 
+  /**
+   * Keeps what a failed save tried to write. For the day on screen that is the structure on disk plus
+   * the typed text (what the editor still holds); for a day already left, the snapshot itself.
+   */
+  const keepUnsaved = useCallback(async (id: number, saveDate: string, snapshot: UiBlock[], baseRev: string) => {
+    const keep = id === loadId.current ? overlayNotes(saved.current, blocksRef.current) : snapshot;
+    await recoveryRef.current.record(saveDate, keep.map(stripKey), baseRev);
+  }, []);
+
   const handleConflict = useCallback(
-    (id: number, saveDate: string, diskBlocks: LoadedDay) => {
+    async (id: number, saveDate: string, diskBlocks: LoadedDay, snapshot: UiBlock[], baseRev: string) => {
       revs.current.set(saveDate, diskBlocks.rev);
       if (id !== loadId.current) {
-        setError("A day file you edited changed on disk; your last note edit there was not saved.");
+        await keepUnsaved(id, saveDate, snapshot, baseRev);
+        setError("A day file you edited changed on disk; your last note edit there was kept safely and needs review.");
         return;
       }
       const merged = mergeConflict(saved.current, blocksRef.current, diskBlocks.blocks);
@@ -91,7 +105,7 @@ export function useDay(date: string, onNotice: (message: string) => void) {
         }
       }
     },
-    [setBlocksBoth, setConflictsBoth],
+    [keepUnsaved, setBlocksBoth, setConflictsBoth],
   );
 
   const enqueueRef = useRef<(saveDate: string, snapshot: UiBlock[]) => void>(() => {});
@@ -103,16 +117,23 @@ export function useDay(date: string, onNotice: (message: string) => void) {
       refreshSaveState();
       chain.current = chain.current.then(async () => {
         try {
-          if (failed.current.loadId === id && mySeq <= failed.current.upToSeq) return;
-          const out = await saveDay(saveDate, snapshot.map(stripKey), revs.current.get(saveDate) ?? "");
+          const baseRev = revs.current.get(saveDate) ?? "";
+          if (failed.current.loadId === id && mySeq <= failed.current.upToSeq) {
+            // Skipped after an earlier failure; this snapshot may be newer than the one kept.
+            await keepUnsaved(id, saveDate, snapshot, baseRev);
+            return;
+          }
+          const out = await recoveryRef.current.attempt(saveDate, snapshot.map(stripKey), baseRev);
           if (out.status === "saved") {
             revs.current.set(saveDate, out.rev);
             retries.current = 0;
             if (errored.current) setError(null);
             errored.current = false;
             if (id === loadId.current) saved.current = snapshot;
+            // Saved: any kept copy of this day is superseded (unless conflicts still hold my text).
+            if (id !== loadId.current || conflictsRef.current.length === 0) await recoveryRef.current.drop(saveDate);
           } else {
-            handleConflict(id, saveDate, out);
+            await handleConflict(id, saveDate, out, snapshot, baseRev);
           }
         } catch (e) {
           failed.current = { loadId: id, upToSeq: seq.current };
@@ -122,6 +143,12 @@ export function useDay(date: string, onNotice: (message: string) => void) {
             // Structure goes back to what is on disk, but typed text is never rolled back.
             setBlocksBoth(overlayNotes(saved.current, blocksRef.current));
             dirty.current = noteEdited.current;
+            // What was kept must match what the editor is left with, not the rolled-back layout.
+            await recoveryRef.current.record(
+              saveDate,
+              blocksRef.current.map(stripKey),
+              revs.current.get(saveDate) ?? "",
+            );
           }
         } finally {
           inflight.current--;
@@ -129,7 +156,7 @@ export function useDay(date: string, onNotice: (message: string) => void) {
         }
       });
     },
-    [handleConflict, refreshSaveState, setBlocksBoth],
+    [handleConflict, keepUnsaved, refreshSaveState, setBlocksBoth],
   );
   enqueueRef.current = enqueue;
 
@@ -185,6 +212,7 @@ export function useDay(date: string, onNotice: (message: string) => void) {
     refreshSaveState();
     // Wait for the previous day's flush so a quick back-and-forth can't load a stale file.
     chain.current
+      .then(() => recoveryRef.current.ready)
       .then(() => loadDay(date))
       .then(
         (loaded) => {
@@ -195,6 +223,26 @@ export function useDay(date: string, onNotice: (message: string) => void) {
           loadedRef.current = true;
           setBlocksBoth(next);
           setLoadedDate(date);
+          const kept = recoveryRef.current.get(date);
+          if (!kept || kept.error !== null) return;
+          if (openDecision(loaded.rev, kept) === "apply") {
+            // The file is as it was when the save failed: the kept notes become unsaved edits again.
+            setBlocksBoth(reconcileKeys(next, kept.blocks));
+            setNoteVersion((v) => v + 1);
+            dirty.current = true;
+            noteEdited.current = true;
+            timer.current?.touch();
+            refreshSaveState();
+            onNoticeRef.current("Recovered notes that could not be saved earlier; saving them now.");
+          } else {
+            const found = recoveryConflicts(next, kept.blocks);
+            if (found.length === 0) {
+              void recoveryRef.current.drop(date);
+            } else {
+              setConflictsBoth(found);
+              onNoticeRef.current("This day changed on disk after a failed save. Choose Keep mine or Use file's for each note.");
+            }
+          }
         },
         (e) => {
           if (id !== loadId.current) return;
@@ -311,6 +359,10 @@ export function useDay(date: string, onNotice: (message: string) => void) {
       if (choice === "file") {
         setNoteVersion((v) => v + 1);
         refreshSaveState();
+        // Nothing of mine is left to save: the kept copy is no longer needed.
+        if (conflictsRef.current.length === 0 && !dirty.current && inflight.current === 0) {
+          void recoveryRef.current.drop(dateRef.current);
+        }
         return;
       }
       const current = blocksRef.current;

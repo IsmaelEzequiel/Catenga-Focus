@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { calendarOps, ghostEvents, matchBlocks, type CalBlock, type CalEvent } from "./calendar";
+import { blockDeletePlan, calendarOps, ghostEvents, isSeriesInstance, matchBlocks, type CalBlock, type CalEvent } from "./calendar";
 
 const block = (key: string, start: number, end: number, title: string): CalBlock => ({ key, start, end, title });
-const event = (id: string, start: number, end: number, title: string): CalEvent => ({ id, start, end, title, projectId: null, color: "#3d6fb6" });
+const event = (id: string, start: number, end: number, title: string): CalEvent => ({ id, start, end, title, projectKey: null, projectId: null, color: "#3d6fb6" });
 
 describe("matchBlocks", () => {
   it("matches_on_start_end_and_trimmed_title", () => {
@@ -122,5 +122,30 @@ describe("calendarOps", () => {
     const prev = [block("a", 540, 600, "Study"), block("o", 800, 860, "Old")];
     const next = [block("a", 540, 600, "Study"), block("o", 800, 860, "Old"), block("n", 900, 960, "New")];
     expect(calendarOps(prev, next, events)).toEqual([{ kind: "create", block: next[2] }]);
+  });
+});
+
+describe("isSeriesInstance", () => {
+  it("is_true_only_for_series_projects", () => {
+    expect(isSeriesInstance({ ...event("e", 1, 2, "x"), projectKey: "series:abc" })).toBe(true);
+    expect(isSeriesInstance({ ...event("e", 1, 2, "x"), projectKey: "event:abc" })).toBe(false);
+    expect(isSeriesInstance(event("e", 1, 2, "x"))).toBe(false);
+  });
+});
+
+describe("blockDeletePlan", () => {
+  const e = event("e1", 540, 600, "x");
+  it("an_empty_block_without_an_event_is_deleted_straight_away", () => {
+    expect(blockDeletePlan({ hasSessions: false, hasNote: false, event: undefined, canDeleteEvent: true })).toEqual({ kind: "delete" });
+    expect(blockDeletePlan({ hasSessions: false, hasNote: false, event: e, canDeleteEvent: false })).toEqual({ kind: "delete" });
+  });
+  it("an_empty_block_with_an_event_asks_which_to_delete", () => {
+    expect(blockDeletePlan({ hasSessions: false, hasNote: false, event: e, canDeleteEvent: true })).toEqual({ kind: "confirm", event: e });
+  });
+  it("a_block_with_sessions_or_a_note_is_refused_and_may_offer_deleting_the_event", () => {
+    expect(blockDeletePlan({ hasSessions: true, hasNote: true, event: e, canDeleteEvent: true })).toEqual({ kind: "refuse", reason: "sessions", event: e });
+    expect(blockDeletePlan({ hasSessions: false, hasNote: true, event: e, canDeleteEvent: true })).toEqual({ kind: "refuse", reason: "notes", event: e });
+    expect(blockDeletePlan({ hasSessions: false, hasNote: true, event: undefined, canDeleteEvent: true })).toEqual({ kind: "refuse", reason: "notes", event: null });
+    expect(blockDeletePlan({ hasSessions: true, hasNote: false, event: e, canDeleteEvent: false })).toEqual({ kind: "refuse", reason: "sessions", event: null });
   });
 });

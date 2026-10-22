@@ -5,22 +5,27 @@ import {
   buildDraft,
   cellFill,
   fromMinutes,
+  goalExtras,
+  goalMetaLine,
   goalSubjectText,
   goalSummary,
+  goalTitle,
+  goalsSummary,
   groupGoals,
   liveFocusMinutes,
   matchesGoal,
   ringFraction,
+  stripCells,
   toMinutes,
 } from "./goals";
 
 const project = (over: Partial<Project> = {}): Project => ({
   id: 1,
-  googleCalendarId: "mestrado@group.calendar.google.com",
-  name: "Mestrado",
+  kind: "series",
+  key: "series:rust",
+  name: "Learn Rust",
   color: "#3d6fb6",
-  showOnTimeline: true,
-  isPrimary: false,
+  calendarName: "Mestrado",
   archived: false,
   ...over,
 });
@@ -121,14 +126,14 @@ describe("matchesGoal", () => {
   const block = (over: Partial<{ title: string; tags: string[]; project: string | null }> = {}) => ({
     title: "Rust book",
     tags: ["Study"],
-    project: "mestrado@group.calendar.google.com",
+    project: "series:rust",
     ...over,
   });
   const mestrado = project();
-  it("project_filter_compares_the_google_calendar_id", () => {
+  it("project_filter_compares_the_project_key", () => {
     const p = goal({ project: mestrado }, { projectId: 1, title: null });
     expect(matchesGoal(p, block())).toBe(true);
-    expect(matchesGoal(p, block({ project: "other" }))).toBe(false);
+    expect(matchesGoal(p, block({ project: "series:other" }))).toBe(false);
     expect(matchesGoal(p, block({ project: null }))).toBe(false);
   });
   it("tags_match_any_ignoring_hash_and_case", () => {
@@ -142,14 +147,19 @@ describe("matchesGoal", () => {
     expect(matchesGoal(p, block({ title: "  RUST " }))).toBe(true);
     expect(matchesGoal(p, block({ title: "Rust book" }))).toBe(false);
   });
-  it("all_present_filters_must_hold", () => {
-    const p = goal({ project: mestrado, tags: [tag(1, "study")] }, { projectId: 1, tagIds: [1], title: null });
+  it("a_project_goal_matches_by_the_project_only", () => {
+    const p = goal({ project: mestrado, tags: [tag(1, "study")] }, { projectId: 1, tagIds: [1], title: "Rust book" });
     expect(matchesGoal(p, block())).toBe(true);
-    expect(matchesGoal(p, block({ tags: ["go"] }))).toBe(false);
+    expect(matchesGoal(p, block({ tags: ["go"], title: "x" }))).toBe(true);
+    expect(matchesGoal(p, block({ tags: [], title: "" }))).toBe(true);
     expect(matchesGoal(p, block({ project: null }))).toBe(false);
-    const withTitle = goal({ project: mestrado, tags: [tag(1, "study")] }, { projectId: 1, tagIds: [1], title: "Rust book" });
-    expect(matchesGoal(withTitle, block())).toBe(true);
-    expect(matchesGoal(withTitle, block({ title: "x" }))).toBe(false);
+    expect(matchesGoal(p, block({ project: "series:other" }))).toBe(false);
+  });
+  it("tags_and_title_both_hold_without_a_project", () => {
+    const p = goal({ tags: [tag(1, "study")] }, { tagIds: [1], title: "Rust book" });
+    expect(matchesGoal(p, block())).toBe(true);
+    expect(matchesGoal(p, block({ title: "x" }))).toBe(false);
+    expect(matchesGoal(p, block({ tags: ["go"] }))).toBe(false);
   });
   it("a_goal_without_any_filter_matches_nothing", () => {
     expect(matchesGoal(goal({}, { title: null }), block())).toBe(false);
@@ -162,7 +172,7 @@ describe("matchesGoal", () => {
 describe("goalSubjectText", () => {
   it("joins_project_tags_and_title", () => {
     const p = goal({ project: project(), tags: [tag(1, "rust"), tag(2, "go")] }, { projectId: 1, tagIds: [1, 2], title: "Book" });
-    expect(goalSubjectText(p)).toBe("Mestrado · #rust #go · Book");
+    expect(goalSubjectText(p)).toBe("Learn Rust · #rust #go · Book");
   });
   it("skips_what_is_absent", () => {
     expect(goalSubjectText(goal())).toBe("Rust");
@@ -272,5 +282,90 @@ describe("groupGoals", () => {
     const f1 = goal({ status: "finished", end: "2026-09-01" });
     const f2 = goal({ status: "finished", end: "2026-10-01" });
     expect(groupGoals([f1, a, u, f2])).toEqual({ active: [a], upcoming: [u], past: [f2, f1] });
+  });
+});
+
+describe("goalTitle", () => {
+  it("shows the project once, even when the title filter repeats it", () => {
+    const p = goal({ project: project({ name: "Teoria da Computação" }) }, { projectId: 1, title: "Teoria da Computação" });
+    expect(goalTitle(p)).toBe("Teoria da Computação");
+  });
+  it("falls back to the title, then to the tags", () => {
+    expect(goalTitle(goal({}, { title: "Rust" }))).toBe("Rust");
+    expect(goalTitle(goal({ tags: [tag(1, "rust"), tag(2, "go")] }, { title: null, tagIds: [1, 2] }))).toBe("#rust #go");
+    expect(goalTitle(goal({}, { title: null }))).toBe("Goal");
+  });
+});
+
+describe("goalExtras", () => {
+  it("lists the title filter only when it differs from the project name", () => {
+    const base = { project: project({ name: "Mestrado" }), tags: [tag(1, "rust")] };
+    expect(goalExtras(goal(base, { projectId: 1, title: "Mestrado" }))).toEqual({ title: null, tags: ["rust"] });
+    expect(goalExtras(goal(base, { projectId: 1, title: " book " }))).toEqual({ title: "book", tags: ["rust"] });
+  });
+  it("does not repeat what the headline already shows", () => {
+    expect(goalExtras(goal({}, { title: "Rust" }))).toEqual({ title: null, tags: [] });
+    expect(goalExtras(goal({ tags: [tag(1, "rust")] }, { title: null }))).toEqual({ title: null, tags: [] });
+    expect(goalExtras(goal({ tags: [tag(1, "rust")] }, { title: "Book" }))).toEqual({ title: null, tags: ["rust"] });
+  });
+});
+
+describe("goalMetaLine", () => {
+  it("reads like the summary", () => {
+    expect(goalMetaLine(goal(), "2026-10-21")).toBe("1h a day · day 12 of 30");
+  });
+  it("uses relative words for today and tomorrow", () => {
+    const open = goal({ elapsedDays: 1 }, { days: null, start: "2026-10-21" });
+    expect(goalMetaLine(open, "2026-10-21")).toBe("1h a day · since today");
+    const later = goal({ status: "upcoming" }, { start: "2026-10-22" });
+    expect(goalMetaLine(later, "2026-10-21")).toBe("1h a day · starts tomorrow");
+  });
+});
+
+describe("stripCells", () => {
+  it("always returns 14 cells ending today, with placeholders before the start", () => {
+    const cells = stripCells(
+      [
+        { date: "2026-10-20", minutes: 60, met: true },
+        { date: "2026-10-21", minutes: 10, met: false },
+      ],
+      "2026-10-20",
+      "2026-10-21",
+    );
+    expect(cells).toHaveLength(14);
+    expect(cells[13]).toEqual({ date: "2026-10-21", minutes: 10, met: false, placeholder: false });
+    expect(cells[12]).toEqual({ date: "2026-10-20", minutes: 60, met: true, placeholder: false });
+    expect(cells.slice(0, 12).every((c) => c.placeholder && c.minutes === 0)).toBe(true);
+    expect(cells[0].date).toBe("2026-10-08");
+  });
+  it("keeps missed days after the start as real, empty cells", () => {
+    const cells = stripCells([], "2026-10-01", "2026-10-21");
+    expect(cells.every((c) => !c.placeholder && c.minutes === 0 && !c.met)).toBe(true);
+  });
+});
+
+describe("goalsSummary", () => {
+  const g = (today: number, perDay: number, met: number, elapsed: number, cur: number, best: number) =>
+    goal({ todayMinutes: today, metDays: met, elapsedDays: elapsed, currentStreak: cur, longestStreak: best }, { minutesPerDay: perDay });
+
+  it("sums today over the goals", () => {
+    const s = goalsSummary([g(90, 180, 3, 4, 2, 5), g(0, 120, 1, 4, 1, 3)], 80);
+    expect(s.today).toEqual({ value: "1.5/5 hours", sub: "30% of target" });
+    expect(s.success).toEqual({ value: "50%", sub: "4 of 8 days met" });
+    expect(s.streak).toEqual({ value: "5", sub: "current 2" });
+    expect(s.logged).toEqual({ value: "1h 20m", sub: "all focus today" });
+  });
+  it("uses minutes under an hour and allows more than 100%", () => {
+    expect(goalsSummary([g(54, 45, 0, 1, 0, 0)], 0).today).toEqual({ value: "54/45 min", sub: "120% of target" });
+  });
+  it("has no success rate before a complete day", () => {
+    expect(goalsSummary([g(0, 60, 0, 3, 0, 0)], 0).success).toEqual({ value: "—", sub: "no complete days yet" });
+  });
+  it("copes with no active goals", () => {
+    const s = goalsSummary([], 0);
+    expect(s.today).toEqual({ value: "0/0 min", sub: "no active goals" });
+    expect(s.success).toEqual({ value: "—", sub: "no active goals" });
+    expect(s.streak).toEqual({ value: "0", sub: "no active goals" });
+    expect(s.logged).toEqual({ value: "0m", sub: "all focus today" });
   });
 });

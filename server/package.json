@@ -1,6 +1,7 @@
 {
   "name": "@catenga/server",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -10,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "aws4fetch": "^1.0.20",
     "cloudflare": "^7.3.0",
     "express": "^5.3.0",
     "resend": "^6.34.1"

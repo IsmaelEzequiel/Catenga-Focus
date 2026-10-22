@@ -29,3 +29,38 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sync_items (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL,
+  key TEXT NOT NULL,
+  data TEXT,
+  changed_at INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  seq INTEGER NOT NULL,
+  PRIMARY KEY (user_id, kind, key)
+);
+CREATE INDEX IF NOT EXISTS sync_items_seq ON sync_items(user_id, seq);
+
+CREATE TABLE IF NOT EXISTS sync_counters (
+  user_id TEXT PRIMARY KEY REFERENCES users(id),
+  value INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_keys (
+  user_id TEXT PRIMARY KEY REFERENCES users(id),
+  wrapped TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS note_files (
+  user_id TEXT NOT NULL REFERENCES users(id),
+  path TEXT NOT NULL,
+  rev TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  changed_at INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  PRIMARY KEY (user_id, path)
+);
+CREATE INDEX IF NOT EXISTS note_files_seq ON note_files(user_id, seq);

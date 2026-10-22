@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="12 6 96 108">
+  <!-- Catenga Focus menu bar icon: the calango alone, black on transparent (macOS template image) -->
+  <g transform="rotate(-35 60 60)" fill="#000">
+    <ellipse cx="60" cy="27" rx="8" ry="10"/>
+    <ellipse cx="60" cy="51" rx="9.5" ry="17"/>
+    <path d="M54.5 64C54 84 70 94 68 114C74 94 66 82 65.5 64Z"/>
+    <path d="M53 41L41 35L39 28M67 41L79 35L81 28M53 61L41 68L39 76M67 61L79 68L81 76" fill="none" stroke="#000" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

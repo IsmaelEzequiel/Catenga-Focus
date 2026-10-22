@@ -1,15 +1,21 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { CheckIcon, EllipsisHorizontalIcon, FireIcon, PlusIcon } from "@heroicons/react/20/solid";
+import { ArrowsPointingOutIcon, CheckIcon, EllipsisHorizontalIcon, FireIcon, PlayIcon, PlusIcon } from "@heroicons/react/20/solid";
 import type { GoalDraft, GoalProgress, Project, Tag, TimerStatus } from "../api";
 import { useGoals } from "../hooks/useGoals";
+import { useLoggedToday } from "../hooks/useLoggedToday";
 import { fmtDuration } from "../lib/dashboard";
 import {
   applyLive,
   buildDraft,
   cellFill,
   fromMinutes,
+  goalExtras,
+  goalMetaLine,
   goalSummary,
   goalSubjectText,
+  goalTitle,
+  goalsSummary,
+  stripCells,
   groupGoals,
   liveFocusMinutes,
   matchesGoal,
@@ -29,15 +35,16 @@ interface Props {
   tags: Tag[];
   timerStatus: TimerStatus;
   nowMs: number;
+  onPlay: (p: GoalProgress) => void;
 }
 
 const PRESETS = [30, 60, 120];
-const RING_R = 24;
+const RING_R = 30;
 const RING_C = 2 * Math.PI * RING_R;
 
 type FormState = { goal: GoalProgress | null } | null;
 
-export function GoalsSection({ projects, tags, timerStatus, nowMs }: Props) {
+export function GoalsSection({ projects, tags, timerStatus, nowMs, onPlay }: Props) {
   const g = useGoals();
   const [form, setForm] = useState<FormState>(null);
   const [showArchived, setShowArchived] = useState(false);
@@ -53,12 +60,18 @@ export function GoalsSection({ projects, tags, timerStatus, nowMs }: Props) {
   const groups = useMemo(() => groupGoals(g.list ?? []), [g.list]);
   const total = (g.list ?? []).length;
 
+  const loggedToday = useLoggedToday(today);
+  const kpi = goalsSummary(groups.active.map(view), loggedToday + live);
+  const timed = timerStatus.state === "running" ? timerStatus.block : null;
+
   const card = (p: GoalProgress) => (
     <GoalCard
       key={p.goal.id}
       p={view(p)}
       live={view(p) !== p}
       today={today}
+      running={timed !== null && matchesGoal(p, timed)}
+      onPlay={() => onPlay(p)}
       onEdit={() => setForm({ goal: p })}
       onArchive={() => void g.setArchived(p.goal.id, true)}
       onDelete={() => g.remove(p.goal.id)}
@@ -76,6 +89,13 @@ export function GoalsSection({ projects, tags, timerStatus, nowMs }: Props) {
           </button>
         )}
       </header>
+
+      <div className="goalkpi" role="group" aria-label="Goals summary">
+        <Kpi label="Today" {...kpi.today} />
+        <Kpi label="Success rate" {...kpi.success} />
+        <Kpi label="Best streak" {...kpi.streak} icon subIcon />
+        <Kpi label="Logged · today" {...kpi.logged} />
+      </div>
 
       {g.error && <p className="dash__error">{g.error}</p>}
 
@@ -133,7 +153,7 @@ export function GoalsSection({ projects, tags, timerStatus, nowMs }: Props) {
                 <li key={p.goal.id}>
                   <ArchivedRow
                     p={p}
-                    onRestore={() => void g.setArchived(p.goal.id, false)}
+                    onRestore={() => g.setArchived(p.goal.id, false)}
                     onDelete={() => g.remove(p.goal.id)}
                   />
                 </li>
@@ -174,20 +194,27 @@ function Ring({ minutes, target }: { minutes: number; target: number }) {
   const frac = ringFraction(minutes, target);
   return (
     <span className="goalring" data-met={met} role="img" aria-label={`${fmtDuration(minutes)} of ${fmtDuration(target)} today`}>
-      <svg viewBox="0 0 56 56" width="56" height="56" aria-hidden="true">
-        <circle className="goalring__track" cx="28" cy="28" r={RING_R} />
+      <svg viewBox="0 0 72 72" width="72" height="72" aria-hidden="true">
+        <circle className="goalring__track" cx="36" cy="36" r={RING_R} />
         <circle
           className="goalring__arc"
-          cx="28"
-          cy="28"
+          cx="36"
+          cy="36"
           r={RING_R}
           strokeDasharray={RING_C}
           strokeDashoffset={RING_C * (1 - frac)}
-          transform="rotate(-90 28 28)"
+          transform="rotate(-90 36 36)"
         />
       </svg>
       <span className="goalring__center">
-        {met ? <CheckIcon className="goalring__check" aria-hidden="true" /> : <b>{Math.round(minutes)}</b>}
+        {met ? (
+          <CheckIcon className="goalring__check" aria-hidden="true" />
+        ) : (
+          <>
+            <b>{Math.round(minutes)}</b>
+            <small>min</small>
+          </>
+        )}
       </span>
     </span>
   );
@@ -197,6 +224,8 @@ function GoalCard(props: {
   p: GoalProgress;
   live: boolean;
   today: string;
+  running: boolean;
+  onPlay: () => void;
   onEdit: () => void;
   onArchive: () => void;
   onDelete: () => Promise<string | null>;
@@ -206,22 +235,49 @@ function GoalCard(props: {
   const active = p.status === "active";
   const [confirm, setConfirm] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const extras = goalExtras(p);
+  const cells = stripCells(p.last14, p.goal.start, today);
+  const playHint = active ? undefined : p.status === "upcoming" ? "This goal hasn't started yet" : "This goal has ended";
   return (
     <article className="goal" data-status={p.status}>
-      {active ? <Ring minutes={p.todayMinutes} target={target} /> : <span className="goalring goalring--idle" aria-hidden="true" />}
-      <div className="goal__body">
-        <div className="goal__top">
-          <GoalSubject p={p} />
-          {props.live && <span className="goal__live" title="A timer is running for this goal">live</span>}
+      <header className="goal__head">
+        <div className="goal__heading">
+          <h4 className="goal__name" title={goalSubjectText(p)} style={projectStyle(p.project?.color ?? null)}>
+            {p.project && <ProjectDot color={p.project.color} />}
+            <span>{goalTitle(p)}</span>
+            {props.live && <span className="goal__live" title="A timer is running for this goal">live</span>}
+          </h4>
+          <p className="goal__meta">{goalMetaLine(p, today)}</p>
         </div>
-        <p className="goal__meta">{goalSummary(p)}</p>
-        {active && (
-          <p className="goal__today">
-            {Math.round(p.todayMinutes)} / {fmtDuration(target)} today
-          </p>
-        )}
-      </div>
-      {confirm ? (
+        <div className="goal__actions">
+          <button
+            className="goal__play"
+            data-running={props.running}
+            disabled={!active}
+            title={playHint}
+            aria-label={props.running ? `Open focus screen for ${goalTitle(p)}` : `Start ${goalTitle(p)}`}
+            onClick={props.onPlay}
+          >
+            {props.running ? <ArrowsPointingOutIcon className="app__icon" aria-hidden="true" /> : <PlayIcon className="app__icon" aria-hidden="true" />}
+            {props.running ? "Open" : "Start"}
+          </button>
+          {!confirm && <GoalMenu onEdit={props.onEdit} onArchive={props.onArchive} onDelete={() => setConfirm(true)} />}
+        </div>
+      </header>
+      {(extras.title || extras.tags.length > 0) && (
+        <div className="goal__chips">
+          {extras.title && <span className="goal__filter">{extras.title}</span>}
+          {extras.tags.map((name) => {
+            const t = p.tags.find((x) => x.name === name);
+            return (
+              <span key={name} className="goal__chip" style={{ ["--chip" as string]: tagVar(t?.color ?? "sun") }}>
+                #{name}
+              </span>
+            );
+          })}
+        </div>
+      )}
+      {confirm && (
         <div className="goal__confirm" role="group" aria-label="Confirm delete">
           <span>Delete this goal?</span>
           <button
@@ -237,38 +293,58 @@ function GoalCard(props: {
             Keep
           </button>
         </div>
-      ) : (
-        <GoalMenu onEdit={props.onEdit} onArchive={props.onArchive} onDelete={() => setConfirm(true)} />
       )}
       {err && <p className="dash__error goal__err">{err}</p>}
-      <div className="goal__stats">
-        <span>
-          Met {p.metDays} of {p.elapsedDays} {p.elapsedDays === 1 ? "day" : "days"}
-        </span>
-        <span className="goal__streak" data-hot={p.currentStreak > 0}>
-          <FireIcon className="goal__fire" aria-hidden="true" />
-          <b>{p.currentStreak}</b> <span className="goal__best">best {p.longestStreak}</span>
-        </span>
+      <div className="goal__body">
+        {active ? <Ring minutes={p.todayMinutes} target={target} /> : <span className="goalring goalring--idle" aria-hidden="true" />}
+        <div className="goal__figures">
+          {active && (
+            <p className="goal__today">
+              <b>{Math.round(p.todayMinutes)}</b> / {Math.round(target)} min today
+            </p>
+          )}
+          <p className="goal__days">
+            Met {p.metDays} of {p.elapsedDays} {p.elapsedDays === 1 ? "day" : "days"}
+          </p>
+          <p className="goal__streak" data-hot={p.currentStreak > 0}>
+            <FireIcon className="goal__fire" aria-hidden="true" />
+            <b>{p.currentStreak}</b> <span className="goal__best">best {p.longestStreak}</span>
+          </p>
+        </div>
       </div>
-      {p.last14.length > 0 && (
-        <ol className="goalstrip" aria-label="Last 14 days">
-          {p.last14.map((d) => {
-            const c = cellFill(d, target);
-            return (
-              <li
-                key={d.date}
-                className={`goalstrip__cell${d.date === today ? " goalstrip__cell--today" : ""}`}
-                data-state={c.state}
-                title={`${d.date} · ${fmtDuration(d.minutes)}`}
-                aria-label={`${d.date}, ${fmtDuration(d.minutes)}${d.met ? ", met" : ""}`}
-              >
-                <i style={{ height: `${c.fill * 100}%` }} />
-              </li>
-            );
-          })}
-        </ol>
-      )}
+      <ol className="goalstrip" aria-label="Last 14 days">
+        {cells.map((d) => {
+          const c = cellFill(d, target);
+          return (
+            <li
+              key={d.date}
+              className={`goalstrip__cell${d.date === today ? " goalstrip__cell--today" : ""}`}
+              data-state={d.placeholder ? "placeholder" : c.state}
+              title={d.placeholder ? `${d.date} · before the start` : `${d.date} · ${fmtDuration(d.minutes)}`}
+              aria-label={d.placeholder ? `${d.date}, before the start` : `${d.date}, ${fmtDuration(d.minutes)}${d.met ? ", met" : ""}`}
+            >
+              <i style={{ height: `${c.fill * 100}%` }} />
+            </li>
+          );
+        })}
+      </ol>
     </article>
+  );
+}
+
+function Kpi(props: { label: string; value: string; sub: string; icon?: boolean; subIcon?: boolean }) {
+  return (
+    <div className="goalkpi__card">
+      <p className="goalkpi__label">{props.label}</p>
+      <p className="goalkpi__value">
+        {props.value}
+        {props.icon && <FireIcon className="goalkpi__fire" aria-hidden="true" />}
+      </p>
+      <p className="goalkpi__sub">
+        {props.subIcon && <FireIcon className="goalkpi__subfire" aria-hidden="true" />}
+        {props.sub}
+      </p>
+    </div>
   );
 }
 
@@ -316,10 +392,13 @@ function GoalMenu({ onEdit, onArchive, onDelete }: { onEdit: () => void; onArchi
 
 function ArchivedRow(props: {
   p: GoalProgress;
-  onRestore: () => void;
+  onRestore: () => Promise<string | null>;
   onDelete: () => Promise<string | null>;
 }) {
   const [confirm, setConfirm] = useState(false);
+  // e.g. "Pick a project, a tag or a title before restoring this goal" — never fail silently.
+  const [err, setErr] = useState<string | null>(null);
+  const run = (action: () => Promise<string | null>) => void action().then(setErr);
   return (
     <div className="goal goal--row">
       <div className="goal__body">
@@ -329,7 +408,7 @@ function ArchivedRow(props: {
       {confirm ? (
         <div className="goal__confirm" role="group" aria-label="Confirm delete">
           <span>Delete this goal?</span>
-          <button className="app__btn goal__danger" onClick={() => void props.onDelete()}>
+          <button className="app__btn goal__danger" onClick={() => run(props.onDelete)}>
             Delete
           </button>
           <button className="app__btn" onClick={() => setConfirm(false)}>
@@ -338,7 +417,7 @@ function ArchivedRow(props: {
         </div>
       ) : (
         <div className="goal__row-actions">
-          <button className="app__btn" onClick={props.onRestore}>
+          <button className="app__btn" onClick={() => run(props.onRestore)}>
             Restore
           </button>
           <button className="app__btn" onClick={() => setConfirm(true)}>
@@ -346,6 +425,7 @@ function ArchivedRow(props: {
           </button>
         </div>
       )}
+      {err && <p className="dash__error goal__err">{err}</p>}
     </div>
   );
 }

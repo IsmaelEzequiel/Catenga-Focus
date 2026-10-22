@@ -68,22 +68,37 @@ pub fn merge_tags(saved: Vec<Tag>, index_tags: &[String]) -> Vec<Tag> {
 
 /// Inserts the tag unless one with the same normalised name exists; returns
 /// its id and whether it was created.
+/// A deleted (tombstoned) tag that is used again is brought back with the given
+/// name and color, and counts as created. `ms` stamps `changed_at` (sync).
 pub fn ensure_tag(
     conn: &Connection,
     name: &str,
     color: &str,
     now: i64,
+    ms: i64,
 ) -> rusqlite::Result<(i64, bool)> {
     let key = norm_tag(name);
-    let existing = conn.query_row("SELECT id FROM tags WHERE name_norm = ?1", [&key], |r| {
-        r.get(0)
-    });
+    let existing = conn.query_row(
+        "SELECT id, deleted_at IS NOT NULL FROM tags WHERE name_norm = ?1",
+        [&key],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)),
+    );
     match existing {
-        Ok(id) => Ok((id, false)),
+        Ok((id, false)) => Ok((id, false)),
+        Ok((id, true)) => {
+            conn.execute(
+                "UPDATE tags SET name = ?2, color = ?3, deleted_at = NULL,
+                                 changed_at = max(?4, changed_at + 1), dirty = 1
+                 WHERE id = ?1",
+                params![id, name, color, ms],
+            )?;
+            Ok((id, true))
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             conn.execute(
-                "INSERT INTO tags(name, name_norm, color, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![name, key, color, now],
+                "INSERT INTO tags(name, name_norm, color, created_at, changed_at, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                params![name, key, color, now, ms],
             )?;
             Ok((conn.last_insert_rowid(), true))
         }
@@ -95,7 +110,7 @@ pub fn saved_tags_in(conn: &Connection) -> rusqlite::Result<Vec<Tag>> {
     let mut stmt = conn.prepare(
         "SELECT t.id, t.name, t.color,
                 (SELECT count(*) FROM goal_tags g WHERE g.tag_id = t.id)
-         FROM tags t ORDER BY t.name_norm",
+         FROM tags t WHERE t.deleted_at IS NULL ORDER BY t.name_norm",
     )?;
     stmt.query_map([], |r| {
         Ok(Tag {
@@ -123,13 +138,15 @@ impl AppDb {
     pub fn tag_save(&self, name: &str, color: &str, now: i64) -> Result<(), String> {
         let name = clean_name(name)?;
         check_color(color)?;
+        let ms = self.ms();
         self.with_conn("saving tag", |conn| {
             let tx = conn.transaction()?;
-            let (id, created) = ensure_tag(&tx, &name, color, now)?;
+            let (id, created) = ensure_tag(&tx, &name, color, now, ms)?;
             if !created {
                 tx.execute(
-                    "UPDATE tags SET color = ?2 WHERE id = ?1",
-                    params![id, color],
+                    "UPDATE tags SET color = ?2, changed_at = max(?3, changed_at + 1), dirty = 1
+                     WHERE id = ?1",
+                    params![id, color, ms],
                 )?;
             }
             tx.commit()
@@ -137,13 +154,15 @@ impl AppDb {
     }
 
     /// Only a saved tag no goal uses; tags inside notes are not touched.
+    /// The row stays as a tombstone so the deletion syncs.
     pub fn tag_delete(&self, id: i64) -> Result<(), String> {
+        let ms = self.ms();
         self.with_conn("deleting tag", |conn| {
             let tx = conn.transaction()?;
             let used: Option<i64> = tx
                 .query_row(
                     "SELECT (SELECT count(*) FROM goal_tags WHERE tag_id = ?1)
-                     FROM tags WHERE id = ?1",
+                     FROM tags WHERE id = ?1 AND deleted_at IS NULL",
                     [id],
                     |r| r.get(0),
                 )
@@ -156,7 +175,12 @@ impl AppDb {
                 None => Err("Tag not found"),
                 Some(n) if n > 0 => Err("A goal uses this tag"),
                 Some(_) => {
-                    tx.execute("DELETE FROM tags WHERE id = ?1", [id])?;
+                    tx.execute(
+                        "UPDATE tags SET deleted_at = ?2, changed_at = max(?2, changed_at + 1),
+                                         dirty = 1
+                         WHERE id = ?1",
+                        params![id, ms],
+                    )?;
                     Ok(())
                 }
             };
@@ -190,6 +214,7 @@ impl AppDb {
         };
         let config: Config =
             serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        let ms = self.ms();
         self.with_conn("importing tag colors", |conn| {
             let tx = conn.transaction()?;
             if flag_in(&tx, CONFIG_IMPORTED)? {
@@ -202,7 +227,7 @@ impl AppDb {
                 } else {
                     DEFAULT_COLOR
                 };
-                ensure_tag(&tx, &name, color, now)?;
+                ensure_tag(&tx, &name, color, now, ms)?;
             }
             set_flag_in(&tx, CONFIG_IMPORTED)?;
             tx.commit()

@@ -1,5 +1,5 @@
 import { useRef, type CSSProperties, type PointerEvent } from "react";
-import { CalendarIcon } from "@heroicons/react/20/solid";
+import { CalendarIcon, TrashIcon } from "@heroicons/react/20/solid";
 import { fmtMinutes, PX_PER_MIN } from "../lib/time";
 import { formatTitleInput } from "../lib/tags";
 import { projectStyle } from "../lib/projects";
@@ -22,9 +22,13 @@ export interface TimelineBlockProps {
   /** "event": a Google Calendar event with no block yet (dashed, click to make a block); "synced": a block standing for one. */
   calendar?: "event" | "synced";
   onEventClick?: () => void;
+  /** Event only: shows a trash button (hover/focus) that asks to delete the event in Google Calendar. */
+  onEventDelete?: () => void;
   onBodyPointerDown?: (e: PointerEvent<HTMLElement>) => void;
   onHandlePointerDown?: (e: PointerEvent<HTMLElement>, edge: "start" | "end") => void;
   onDoubleClick?: () => void;
+  /** Right-click (not while typing in the title): the parent pops up the native menu. */
+  onContextMenu?: () => void;
   onEditCommit?: (text: string) => void;
   onEditCancel?: () => void;
 }
@@ -64,6 +68,12 @@ export function TimelineBlock(p: TimelineBlockProps) {
       className={classes}
       style={style}
       data-block
+      data-ghost={p.calendar === "event" ? "" : undefined}
+      onContextMenu={(e) => {
+        if (p.editing || !p.onContextMenu) return;
+        e.preventDefault();
+        p.onContextMenu();
+      }}
       onPointerDown={p.editing ? (e) => e.stopPropagation() : p.onBodyPointerDown}
       onDoubleClick={p.onDoubleClick}
       onClick={p.calendar === "event" ? p.onEventClick : undefined}
@@ -92,6 +102,22 @@ export function TimelineBlock(p: TimelineBlockProps) {
         {p.calendar && <CalendarIcon className="block__cal" aria-hidden="true" />}
         {fmtMinutes(p.start)}–{fmtMinutes(p.end)}
       </span>
+      {p.calendar === "event" && p.onEventDelete && (
+        <button
+          type="button"
+          className="block__trash"
+          aria-label="Delete event"
+          title="Delete event"
+          onClick={(e) => {
+            e.stopPropagation();
+            p.onEventDelete?.();
+          }}
+          onKeyDown={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <TrashIcon className="app__icon" aria-hidden="true" />
+        </button>
+      )}
       {p.editing ? (
         <input
           className="block__input"

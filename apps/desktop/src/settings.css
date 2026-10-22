@@ -56,3 +56,8 @@
 .app__gear {
   margin-left: auto;
 }
+
+.settings__path {
+  font-size: 13px;
+  word-break: break-all;
+}

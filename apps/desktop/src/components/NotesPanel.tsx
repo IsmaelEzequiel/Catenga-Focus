@@ -28,6 +28,9 @@ interface Props {
   project: ProjectPanel;
 }
 
+/** Shown in an empty note editor only; never written into the file. */
+export const NOTE_PROMPT = "What does a good outcome for this block look like?";
+
 const STATUS: Partial<Record<SaveState, string>> = {
   saving: "Saving…",
   saved: "Saved",
@@ -88,7 +91,7 @@ export function NotesPanel(p: Props) {
           )}
         </span>
       </header>
-      <ProjectChip panel={p.project} hasTitle={block.title.trim() !== ""} />
+      <ProjectChip panel={p.project} />
       <TimerBar block={block} timer={p.timer} />
       {conflict && (
         <div className="notes__conflict" role="alert">
@@ -169,6 +172,7 @@ export function NoteEditor(p: {
       ref={ref}
       className={p.className ?? "notes__editor"}
       aria-label="Block note"
+      placeholder={NOTE_PROMPT}
       value={text}
       onChange={(e) => {
         setText(e.target.value);

@@ -53,6 +53,9 @@ pub struct GoalDraft {
 pub struct GoalView {
     pub goal: Goal,
     pub project: Option<ProjectRow>,
+    /// Synced from another computer whose project this one doesn't know yet
+    /// (until the next Google refresh); sessions are still matched by this key.
+    pub pending_project_key: Option<String>,
     pub tags: Vec<Tag>,
 }
 
@@ -106,7 +109,7 @@ fn parse_date(s: &str) -> Option<Date> {
     s.parse().ok()
 }
 
-fn check_numbers(minutes: u32, days: Option<u32>, start: &str) -> Result<(), String> {
+pub(crate) fn check_numbers(minutes: u32, days: Option<u32>, start: &str) -> Result<(), String> {
     if !(MIN_MINUTES..=MAX_MINUTES).contains(&minutes) {
         return Err(format!(
             "Minutes per day must be {MIN_MINUTES}–{MAX_MINUTES}"
@@ -160,11 +163,12 @@ fn set_goal_tags(
     goal_id: i64,
     names: &[String],
     now: i64,
+    ms: i64,
 ) -> rusqlite::Result<bool> {
     tx.execute("DELETE FROM goal_tags WHERE goal_id = ?1", [goal_id])?;
     let mut created_any = false;
     for name in names {
-        let (tag_id, created) = tags::ensure_tag(tx, name, DEFAULT_COLOR, now)?;
+        let (tag_id, created) = tags::ensure_tag(tx, name, DEFAULT_COLOR, now, ms)?;
         created_any |= created;
         tx.execute(
             "INSERT OR IGNORE INTO goal_tags(goal_id, tag_id) VALUES (?1, ?2)",
@@ -195,25 +199,28 @@ fn read_views(conn: &Connection, archived: bool) -> rusqlite::Result<Vec<GoalVie
          WHERE g.goal_id = ?1 ORDER BY t.name_norm",
     )?;
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, title, minutes_per_day, start, days, archived
-         FROM goals WHERE archived = ?1 ORDER BY id",
+        "SELECT id, project_id, title, minutes_per_day, start, days, archived, pending_project_key
+         FROM goals WHERE archived = ?1 AND deleted_at IS NULL ORDER BY id",
     )?;
     let rows = stmt
         .query_map([archived], |r| {
-            Ok(Goal {
-                id: r.get(0)?,
-                project_id: r.get(1)?,
-                tag_ids: Vec::new(),
-                title: r.get(2)?,
-                minutes_per_day: r.get(3)?,
-                start: r.get(4)?,
-                days: r.get(5)?,
-                archived: r.get(6)?,
-            })
+            Ok((
+                Goal {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    tag_ids: Vec::new(),
+                    title: r.get(2)?,
+                    minutes_per_day: r.get(3)?,
+                    start: r.get(4)?,
+                    days: r.get(5)?,
+                    archived: r.get(6)?,
+                },
+                r.get::<_, Option<String>>(7)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::new();
-    for mut goal in rows {
+    for (mut goal, pending_project_key) in rows {
         let tags = all_tags
             .query_map([goal.id], |r| {
                 Ok(Tag {
@@ -232,6 +239,7 @@ fn read_views(conn: &Connection, archived: bool) -> rusqlite::Result<Vec<GoalVie
         out.push(GoalView {
             goal,
             project,
+            pending_project_key,
             tags,
         });
     }
@@ -241,26 +249,31 @@ fn read_views(conn: &Connection, archived: bool) -> rusqlite::Result<Vec<GoalVie
 impl AppDb {
     pub fn goal_create(&self, draft: &GoalDraft, now: i64) -> Result<GoalWrite, String> {
         let clean = validate(draft)?;
+        let ms = self.ms();
         self.with_conn("saving goal", |conn| {
             let tx = conn.transaction()?;
             if let Err(m) = check_project(&tx, clean.project_id)? {
                 return Ok(Err(m.to_string()));
             }
+            let uid = crate::app_db::new_uuid(&tx)?;
             tx.execute(
                 "INSERT INTO goals(project_id, title, minutes_per_day, start, days, archived,
-                                   created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
+                                   created_at, updated_at, uid, changed_at, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6,
+                         ?7, ?8, 1)",
                 params![
                     clean.project_id,
                     clean.title,
                     draft.minutes_per_day,
                     draft.start,
                     draft.days,
-                    now
+                    now,
+                    uid,
+                    ms
                 ],
             )?;
             let id = tx.last_insert_rowid();
-            let tags_created = set_goal_tags(&tx, id, &clean.tag_names, now)?;
+            let tags_created = set_goal_tags(&tx, id, &clean.tag_names, now, ms)?;
             tx.commit()?;
             Ok(Ok(GoalWrite { id, tags_created }))
         })?
@@ -269,6 +282,7 @@ impl AppDb {
     /// Replaces everything but the id and the archived flag; returns whether tags were created.
     pub fn goal_edit(&self, id: i64, draft: &GoalDraft, now: i64) -> Result<bool, String> {
         let clean = validate(draft)?;
+        let ms = self.ms();
         self.with_conn("saving goal", |conn| {
             let tx = conn.transaction()?;
             if let Err(m) = check_project(&tx, clean.project_id)? {
@@ -276,7 +290,9 @@ impl AppDb {
             }
             let changed = tx.execute(
                 "UPDATE goals SET project_id = ?2, title = ?3, minutes_per_day = ?4, start = ?5,
-                                  days = ?6, updated_at = ?7 WHERE id = ?1",
+                                  days = ?6, updated_at = ?7, pending_project_key = NULL,
+                                  changed_at = max(?8, changed_at + 1), dirty = 1
+                 WHERE id = ?1 AND deleted_at IS NULL",
                 params![
                     id,
                     clean.project_id,
@@ -284,35 +300,74 @@ impl AppDb {
                     draft.minutes_per_day,
                     draft.start,
                     draft.days,
-                    now
+                    now,
+                    ms
                 ],
             )?;
             if changed == 0 {
                 return Ok(Err("Goal not found".to_string()));
             }
-            let created = set_goal_tags(&tx, id, &clean.tag_names, now)?;
+            let created = set_goal_tags(&tx, id, &clean.tag_names, now, ms)?;
             tx.commit()?;
             Ok(Ok(created))
         })?
     }
 
     pub fn goal_set_archived(&self, id: i64, archived: bool, now: i64) -> Result<(), String> {
-        let changed = self.with_conn("updating goal", |conn| {
-            conn.execute(
-                "UPDATE goals SET archived = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id, archived, now],
-            )
-        })?;
-        if changed == 0 {
-            return Err("Goal not found".into());
-        }
-        Ok(())
+        let ms = self.ms();
+        self.with_conn("updating goal", |conn| {
+            let tx = conn.transaction()?;
+            // A goal that M8c archived for losing its calendar link has no subject
+            // left: it would count every session if restored as it is.
+            let has_subject: Option<bool> = tx
+                .query_row(
+                    "SELECT project_id IS NOT NULL
+                         OR (title IS NOT NULL AND trim(title) <> '')
+                         OR EXISTS (SELECT 1 FROM goal_tags WHERE goal_id = goals.id)
+                     FROM goals WHERE id = ?1 AND deleted_at IS NULL",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })?;
+            let result = match has_subject {
+                None => Err("Goal not found".to_string()),
+                Some(false) if !archived => {
+                    Err("Pick a project, a tag or a title before restoring this goal".to_string())
+                }
+                Some(_) => {
+                    tx.execute(
+                        "UPDATE goals SET archived = ?2, updated_at = ?3,
+                                          changed_at = max(?4, changed_at + 1), dirty = 1
+                         WHERE id = ?1",
+                        params![id, archived, now, ms],
+                    )?;
+                    Ok(())
+                }
+            };
+            tx.commit()?;
+            Ok(result)
+        })?
     }
 
-    /// Removes the goal; its tags stay saved.
+    /// Deletes the goal (hidden everywhere; the row stays as a tombstone so the
+    /// deletion syncs and nothing but its uid is kept); its tags stay saved.
     pub fn goal_delete(&self, id: i64) -> Result<(), String> {
+        let ms = self.ms();
         let changed = self.with_conn("deleting goal", |conn| {
-            conn.execute("DELETE FROM goals WHERE id = ?1", [id])
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
+                "UPDATE goals SET deleted_at = ?2, changed_at = max(?2, changed_at + 1), dirty = 1,
+                                  project_id = NULL, pending_project_key = NULL, title = NULL
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![id, ms],
+            )?;
+            tx.execute("DELETE FROM goal_tags WHERE goal_id = ?1", [id])?;
+            tx.commit()?;
+            Ok(changed)
         })?;
         if changed == 0 {
             return Err("Goal not found".into());
@@ -344,27 +399,29 @@ impl AppDb {
             )
         };
         let legacy = parse_legacy(&bytes).map_err(|e| bad(&e))?;
-        let imported = self.with_conn("importing goals", |conn| {
-            let tx = conn.transaction()?;
-            if flag_in(&tx, IMPORTED)? {
-                return Ok(false);
-            }
-            for g in &legacy {
-                tx.execute(
-                    "INSERT INTO goals(project_id, title, minutes_per_day, start, days, archived,
-                                       created_at, updated_at)
-                     VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    params![g.title, g.minutes_per_day, g.start, g.days, g.archived, now],
-                )?;
-                if let Some(tag) = &g.tag {
-                    let id = tx.last_insert_rowid();
-                    set_goal_tags(&tx, id, std::slice::from_ref(tag), now)?;
+        let ms = self.ms();
+        let imported =
+            self.with_conn("importing goals", |conn| {
+                let tx = conn.transaction()?;
+                if flag_in(&tx, IMPORTED)? {
+                    return Ok(false);
                 }
-            }
-            set_flag_in(&tx, IMPORTED)?;
-            tx.commit()?;
-            Ok(true)
-        })?;
+                for g in &legacy {
+                    tx.execute(
+                    "INSERT INTO goals(project_id, title, minutes_per_day, start, days, archived,
+                                       created_at, updated_at, changed_at, dirty)
+                     VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)",
+                    params![g.title, g.minutes_per_day, g.start, g.days, g.archived, now, ms],
+                )?;
+                    if let Some(tag) = &g.tag {
+                        let id = tx.last_insert_rowid();
+                        set_goal_tags(&tx, id, std::slice::from_ref(tag), now, ms)?;
+                    }
+                }
+                set_flag_in(&tx, IMPORTED)?;
+                tx.commit()?;
+                Ok(true)
+            })?;
         if imported && let Err(e) = rename_imported(&path) {
             // The flag is set, so nothing is imported twice; the file just stays.
             eprintln!("renaming {}: {e}", path.display());
@@ -543,17 +600,34 @@ pub fn progress(goal: &Goal, minutes: &BTreeMap<Date, i64>, today: Date) -> Goal
 /// What a session must match (every present filter holds).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filter {
-    /// Google calendar id of the goal's project.
-    pub calendar_id: Option<String>,
+    /// Key of the goal's project (`series:…` / `event:…`), as stored in `sessions.project`.
+    pub project_key: Option<String>,
     /// Normalised tags; the session needs any of them.
     pub tag_norms: Vec<String>,
     pub title_norm: Option<String>,
 }
 
 impl GoalView {
+    /// What a session must match to count. Owner rule: a goal with a project matches by
+    /// the project only (its occurrence counts whatever its tags/title); tags and title
+    /// only filter goals without a project.
     pub fn filter(&self) -> Filter {
+        if let Some(p) = &self.project {
+            return Filter {
+                project_key: Some(p.project.key.clone()),
+                tag_norms: Vec::new(),
+                title_norm: None,
+            };
+        }
+        if let Some(key) = &self.pending_project_key {
+            return Filter {
+                project_key: Some(key.clone()),
+                tag_norms: Vec::new(),
+                title_norm: None,
+            };
+        }
         Filter {
-            calendar_id: self.project.as_ref().map(|p| p.calendar_id.clone()),
+            project_key: None,
             tag_norms: self
                 .tags
                 .iter()
@@ -569,7 +643,7 @@ impl GoalView {
 pub fn minutes_by_day(conn: &Connection, filter: &Filter) -> rusqlite::Result<BTreeMap<Date, i64>> {
     let mut sql = String::from("SELECT date, SUM(minutes) FROM sessions s WHERE 1 = 1");
     let mut args: Vec<String> = Vec::new();
-    if let Some(c) = &filter.calendar_id {
+    if let Some(c) = &filter.project_key {
         args.push(c.clone());
         sql += &format!(" AND s.project = ?{}", args.len());
     }
@@ -640,7 +714,7 @@ pub fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_db::test_util::{Fixture, cal, fixture};
+    use crate::app_db::test_util::{Fixture, add_series, cal, fixture};
     use crate::index::test_util::Env;
     use crate::sessions::{self, Mode, Session, SessionBlock};
 
@@ -871,10 +945,11 @@ mod tests {
         }
     }
 
+    /// The series project "Mestrado" (key `series:mest`) on a calendar.
     fn with_project(f: &Fixture) -> i64 {
-        f.db.upsert_calendars(&[cal("mest@x", "Mestrado", false, true)], 1)
+        f.db.upsert_calendars(&[cal("cal@x", "Work", false, true)], 1)
             .unwrap();
-        f.db.projects().unwrap()[0].id
+        add_series(&f.db, "cal@x", "mest", "Mestrado")
     }
 
     #[test]
@@ -901,7 +976,7 @@ mod tests {
         let names: Vec<_> = v.tags.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["go", "Rust"], "duplicates by norm collapse, sorted");
         assert_eq!(v.goal.tag_ids.len(), 2);
-        assert_eq!(v.project.as_ref().unwrap().calendar_id, "mest@x");
+        assert_eq!(v.project.as_ref().unwrap().project.key, "series:mest");
         assert!(!v.goal.archived);
         // Reusing existing tags creates nothing.
         let w2 = f.db.goal_create(&draft(), 6).unwrap();
@@ -1003,8 +1078,8 @@ mod tests {
         let mut d = draft();
         d.project_id = Some(pid);
         f.db.goal_create(&d, 1).unwrap();
-        // The calendar disappears from Google: archived, but the goal keeps pointing at it.
-        f.db.upsert_calendars(&[], 2).unwrap();
+        // The series disappears from Google: archived, but the goal keeps pointing at it.
+        f.db.sync_series(&[("cal@x".into(), vec![])], 2).unwrap();
         let v = &f.db.goal_views(false).unwrap()[0];
         assert!(v.project.as_ref().unwrap().project.archived);
         assert_eq!(v.goal.project_id, Some(pid));
@@ -1038,8 +1113,8 @@ mod tests {
             serde_json::json!({
                 "goal": {"id": 1, "projectId": 1, "tagIds": [1], "title": null,
                          "minutesPerDay": 60, "start": "2026-10-21", "days": 30, "archived": false},
-                "project": {"id": 1, "googleCalendarId": "mest@x", "name": "Mestrado",
-                            "color": "#16a765", "showOnTimeline": true, "isPrimary": false, "archived": false},
+                "project": {"id": 1, "kind": "series", "key": "series:mest", "name": "Mestrado",
+                            "color": "#16a765", "calendarName": "Work", "archived": false},
                 "tags": [{"id": 1, "name": "rust", "color": "sun", "saved": true, "goalCount": 1}],
                 "status": "active", "todayMinutes": 36, "elapsedDays": 1, "metDays": 0,
                 "totalMinutes": 36, "currentStreak": 0, "longestStreak": 0, "end": "2026-11-19",
@@ -1229,6 +1304,55 @@ mod tests {
     }
 
     #[test]
+    fn a_goal_with_a_project_matches_by_the_project_only() {
+        // Owner rule: the project wins — today's occurrence counts whatever its tags/title.
+        let view = GoalView {
+            goal: Goal {
+                id: 1,
+                project_id: Some(26),
+                tag_ids: vec![1],
+                title: Some("Teoria da Computação".into()),
+                minutes_per_day: 60,
+                start: "2026-10-20".into(),
+                days: None,
+                archived: false,
+            },
+            project: Some(ProjectRow {
+                project: Project {
+                    id: 26,
+                    kind: crate::app_db::ProjectKind::Series,
+                    key: "series:tc".into(),
+                    name: "Teoria da Computação".into(),
+                    color: "#000000".into(),
+                    calendar_name: "Me".into(),
+                    archived: false,
+                },
+                google_id: "tc".into(),
+                calendar_id: "me@x".into(),
+            }),
+            pending_project_key: None,
+            tags: vec![Tag {
+                id: Some(1),
+                name: "mestrado".into(),
+                color: "sun".into(),
+                saved: true,
+                goal_count: 1,
+            }],
+        };
+        let f = view.filter();
+        assert_eq!(f.project_key.as_deref(), Some("series:tc"));
+        assert!(f.tag_norms.is_empty());
+        assert_eq!(f.title_norm, None);
+        // Without a project, tags and title still filter.
+        let f = GoalView {
+            project: None,
+            ..view
+        }
+        .filter();
+        assert_eq!((f.tag_norms.len(), f.title_norm.is_some()), (1, true));
+    }
+
+    #[test]
     fn matching_combines_project_tags_and_title() {
         let env = Env::new();
         let rows = [
@@ -1238,16 +1362,23 @@ mod tests {
                 30,
                 "Rust  Lang",
                 &["mestrado", "Mestrado"],
-                Some("mest@x"),
+                Some("series:mest"),
             ),
-            sess("2026-10-20", "11:00", 20, "rust lang", &[], Some("mest@x")),
+            sess(
+                "2026-10-20",
+                "11:00",
+                20,
+                "rust lang",
+                &[],
+                Some("series:mest"),
+            ),
             sess(
                 "2026-10-20",
                 "14:00",
                 45,
                 "Other",
                 &["mestrado"],
-                Some("work@x"),
+                Some("series:work"),
             ),
             sess("2026-10-21", "09:00", 60, "Other", &["go"], None),
             sess(
@@ -1256,23 +1387,26 @@ mod tests {
                 15,
                 "Other",
                 &["go", "rust"],
-                Some("mest@x"),
+                Some("series:mest"),
             ),
         ];
         let idx = indexed(&env, &rows);
         let conn = idx.reader().unwrap();
         let f = |c: Option<&str>, tags: &[&str], t: Option<&str>| Filter {
-            calendar_id: c.map(str::to_string),
+            project_key: c.map(str::to_string),
             tag_norms: tags.iter().map(|s| s.to_string()).collect(),
             title_norm: t.map(str::to_string),
         };
         // project only
         assert_eq!(
-            minutes(&conn, &f(Some("mest@x"), &[], None)),
+            minutes(&conn, &f(Some("series:mest"), &[], None)),
             mins(&[("2026-10-20", 50), ("2026-10-21", 15)])
         );
         // sessions without a project never match a project goal
-        assert_eq!(minutes(&conn, &f(Some("none@x"), &[], None)), mins(&[]));
+        assert_eq!(
+            minutes(&conn, &f(Some("series:none"), &[], None)),
+            mins(&[])
+        );
         // tags: ANY of them, a session with a duplicated tag counts once
         assert_eq!(
             minutes(&conn, &f(None, &["mestrado"], None)),
@@ -1289,24 +1423,27 @@ mod tests {
         );
         // project AND tags
         assert_eq!(
-            minutes(&conn, &f(Some("mest@x"), &["mestrado"], None)),
+            minutes(&conn, &f(Some("series:mest"), &["mestrado"], None)),
             mins(&[("2026-10-20", 30)])
         );
         assert_eq!(
-            minutes(&conn, &f(Some("work@x"), &["mestrado"], None)),
+            minutes(&conn, &f(Some("series:work"), &["mestrado"], None)),
             mins(&[("2026-10-20", 45)])
         );
         assert_eq!(
-            minutes(&conn, &f(Some("mest@x"), &["go", "rust"], None)),
+            minutes(&conn, &f(Some("series:mest"), &["go", "rust"], None)),
             mins(&[("2026-10-21", 15)])
         );
         // project AND tags AND title
         assert_eq!(
-            minutes(&conn, &f(Some("mest@x"), &["mestrado"], Some("rust lang"))),
+            minutes(
+                &conn,
+                &f(Some("series:mest"), &["mestrado"], Some("rust lang"))
+            ),
             mins(&[("2026-10-20", 30)])
         );
         assert_eq!(
-            minutes(&conn, &f(Some("mest@x"), &["go"], Some("rust lang"))),
+            minutes(&conn, &f(Some("series:mest"), &["go"], Some("rust lang"))),
             mins(&[])
         );
         // no filter at all matches everything (callers validate that a goal has one)
@@ -1314,6 +1451,74 @@ mod tests {
             minutes(&conn, &f(None, &[], None)).values().sum::<i64>(),
             170
         );
+    }
+
+    #[test]
+    fn sessions_with_old_calendar_ids_or_other_kinds_never_match_a_project_key() {
+        let env = Env::new();
+        let rows = [
+            sess(
+                "2026-10-20",
+                "09:00",
+                30,
+                "Learn Rust",
+                &[],
+                Some("series:s1"),
+            ),
+            // renamed occurrence: same series key, different title
+            sess(
+                "2026-10-20",
+                "11:00",
+                20,
+                "Rust (moved)",
+                &[],
+                Some("series:s1"),
+            ),
+            // M8b wrote bare calendar ids: they match nothing
+            sess("2026-10-20", "13:00", 40, "Learn Rust", &[], Some("s1")),
+            sess("2026-10-20", "15:00", 50, "Learn Rust", &[], Some("mest@x")),
+            // an event project with the same id is a different key
+            sess("2026-10-20", "17:00", 60, "One-off", &[], Some("event:s1")),
+        ];
+        let idx = indexed(&env, &rows);
+        let conn = idx.reader().unwrap();
+        let by = |key: &str| Filter {
+            project_key: Some(key.into()),
+            ..Filter::default()
+        };
+        assert_eq!(
+            minutes(&conn, &by("series:s1")),
+            mins(&[("2026-10-20", 50)])
+        );
+        assert_eq!(minutes(&conn, &by("event:s1")), mins(&[("2026-10-20", 60)]));
+        assert!(minutes(&conn, &by("series:mest@x")).is_empty());
+    }
+
+    #[test]
+    fn restoring_a_goal_with_no_subject_is_refused_but_archiving_is_fine() {
+        let f = fixture();
+        let pid = with_project(&f);
+        let mut d = draft();
+        d.project_id = Some(pid);
+        d.tag_names = vec![];
+        let id = f.db.goal_create(&d, 1).unwrap().id;
+        f.db.with_conn("t", |c| {
+            c.execute("UPDATE goals SET project_id = NULL, archived = 1", [])
+        })
+        .unwrap();
+        assert_eq!(
+            f.db.goal_set_archived(id, false, 2).unwrap_err(),
+            "Pick a project, a tag or a title before restoring this goal"
+        );
+        assert!(f.db.goal_views(true).unwrap()[0].goal.archived);
+        // giving it a subject (edit) makes restoring possible
+        let mut fixed = draft();
+        fixed.project_id = Some(pid);
+        fixed.tag_names = vec![];
+        f.db.goal_edit(id, &fixed, 3).unwrap();
+        f.db.goal_set_archived(id, false, 4).unwrap();
+        assert_eq!(f.db.goal_views(false).unwrap().len(), 1);
+        f.db.goal_set_archived(id, true, 5).unwrap();
     }
 
     #[test]
@@ -1355,7 +1560,7 @@ mod tests {
             40,
             "X",
             &["rust"],
-            Some("mest@x"),
+            Some("series:mest"),
         )];
         let idx = indexed(&env, &rows);
         let views = f.db.goal_views(false).unwrap();
@@ -1364,7 +1569,7 @@ mod tests {
         assert_eq!(ids, [early, late, up, fin_new, fin_old]);
         assert_eq!(
             out[0].today_minutes, 40,
-            "project goal counted the mest@x session"
+            "project goal counted the series:mest session"
         );
         assert_eq!(out[0].project.as_ref().unwrap().name, "Mestrado");
         assert_eq!(out[1].today_minutes, 40, "tag goal counted it too");

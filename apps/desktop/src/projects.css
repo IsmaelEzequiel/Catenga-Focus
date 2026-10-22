@@ -58,14 +58,6 @@
   border-radius: var(--radius-sm);
 }
 
-.projpick--chip .projpick__trigger {
-  font-size: 12px;
-  padding: 2px 10px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-line);
-  border-radius: 999px;
-}
-
 .projpick__trigger:hover:not(:disabled) {
   border-color: var(--color-ink-muted);
 }
@@ -166,14 +158,19 @@
   flex: none;
 }
 
-.projchip__plus {
-  width: 14px;
-  height: 14px;
+.projchip__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  font-size: 12px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
 }
 
-.projchip__hint {
+.projchip__make {
   font-size: 12px;
-  color: var(--color-ink-muted);
 }
 
 /* Tag chip input */
@@ -360,12 +357,25 @@
   color: var(--chip);
 }
 
+.projtags__name--off {
+  color: var(--color-ink-muted);
+}
+
+.projtags__archive {
+  margin-left: auto;
+}
+
 .projtags__badge {
   font-size: 11px;
   color: var(--color-ink-muted);
   padding: 1px 8px;
   border: 1px solid var(--color-line);
   border-radius: 999px;
+}
+
+.projtags__hintnote {
+  font-size: 12px;
+  color: var(--color-ink-muted);
 }
 
 .projtags__toggle {

@@ -5,20 +5,30 @@ mod commands;
 mod config;
 mod dashboard;
 mod day_file;
+mod file_sync;
 mod goals;
 mod google;
 mod google_client;
 mod google_commands;
 mod index;
+mod lifecycle;
 mod loopback;
 mod mirror;
+mod notes_crypto;
+mod recovery;
 mod search;
 mod sessions;
+mod settings;
 mod storage;
+mod sync;
+mod sync_client;
+mod sync_commands;
 mod tags;
 mod timer;
 mod timer_commands;
 mod timer_service;
+mod tray;
+mod tray_model;
 mod watcher;
 
 use commands::IndexHandle;
@@ -33,12 +43,14 @@ fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// `CATENGA_NOTES_DIR` if set (dev/test override), else `~/Catenga/`.
+/// `CATENGA_NOTES_DIR` (dev override), else the folder chosen in Settings, else `~/Catenga/`.
 fn notes_root(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    match std::env::var_os("CATENGA_NOTES_DIR") {
-        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
-        _ => Ok(app.path().home_dir()?.join("Catenga")),
-    }
+    let (root, _) = settings::resolve(
+        std::env::var_os("CATENGA_NOTES_DIR"),
+        &app.path().app_data_dir()?,
+        &app.path().home_dir()?,
+    );
+    Ok(root)
 }
 
 /// `CATENGA_INDEX_DB` if set (dev/test override), else `<app cache dir>/index.sqlite`.
@@ -69,6 +81,15 @@ fn timer_json_path(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Erro
     }
 }
 
+/// `CATENGA_RECOVERY_DIR` if set (dev/test override), else `<app data dir>/recovery`.
+/// Unsaved-note copies stay out of the notes folder (not synced, not indexed).
+fn recovery_dir_path(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match std::env::var_os("CATENGA_RECOVERY_DIR") {
+        Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
+        _ => Ok(app.path().app_data_dir()?.join("recovery")),
+    }
+}
+
 /// Full reconciliation, reporting progress to the frontend.
 fn sync_with_events(index: &Index, handle: &tauri::AppHandle) {
     index.sync_all_with(&|status| {
@@ -83,8 +104,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(commands::SignInState::default())
         .manage(google_commands::GoogleState::new())
+        .manage(lifecycle::QuitState::default())
         .setup(|app| {
             let root = notes_root(app)?;
             std::fs::create_dir_all(&root)?;
@@ -93,6 +116,7 @@ pub fn run() {
             atomic::cleanup_stale_temps(&root);
             let store = Arc::new(DayStore::new(root.clone()));
             app.manage(store.clone());
+            app.manage(recovery::RecoveryDir(recovery_dir_path(app)?));
             let timer = timer_service::TimerService::new(
                 root.clone(),
                 timer_json_path(app)?,
@@ -113,6 +137,11 @@ pub fn run() {
                 .map(Arc::new);
             match &app_db {
                 Ok(db) => {
+                    // Sync rows belong to one notes folder; a different one starts over
+                    // (never a delete) before any sync pass can run.
+                    if let Err(e) = db.files_adopt_root(&root.to_string_lossy()) {
+                        eprintln!("resetting notes sync state: {e}");
+                    }
                     let now = commands::now_secs();
                     if let Err(e) = db.import_config_tag_colors(&root, now) {
                         eprintln!("importing tag colors: {e}");
@@ -124,6 +153,14 @@ pub fn run() {
                 Err(e) => eprintln!("app database disabled: {e}"),
             }
             app.manage(commands::AppDbHandle(app_db));
+            // Sync is optional: without its HTTP client the app just never syncs.
+            match sync_commands::SyncService::new() {
+                Ok(service) => {
+                    app.manage(Arc::new(service));
+                    sync_commands::start(app.handle());
+                }
+                Err(e) => eprintln!("sync disabled: {e}"),
+            }
             google_commands::refresh_projects_in_background(app.handle());
             // Without the index the app still works; only search and history are off.
             let index = index_db_path(app)
@@ -168,19 +205,38 @@ pub fn run() {
                     eprintln!("emitting day-changed: {e}");
                 }
             };
-            match watcher::start(store, watcher::DEBOUNCE, on_change, on_index) {
+            let sync_handle = app.handle().clone();
+            let on_path = move |path: &std::path::Path| {
+                sync_commands::notes_path_changed(&sync_handle, path);
+            };
+            match watcher::start(store, watcher::DEBOUNCE, on_change, on_index, on_path) {
                 Ok(debouncer) => {
                     app.manage(Mutex::new(debouncer));
                 }
                 Err(e) => eprintln!("folder watching disabled: {e}"),
             }
+            // Without the menu bar item the app still works; closing the window
+            // would then leave no way back except the Dock, so say so.
+            if let Err(e) = tray::start(app.handle()) {
+                eprintln!("menu bar item disabled: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_version,
+            lifecycle::app_hide,
+            lifecycle::app_show,
+            lifecycle::app_exit,
+            lifecycle::app_cancel_quit,
+            settings::notes_dir_info,
+            settings::set_notes_dir,
+            settings::app_restart,
             commands::load_config,
             commands::load_day,
             commands::save_day,
+            recovery::recovery_put,
+            recovery::recovery_list,
+            recovery::recovery_drop,
             commands::search,
             commands::history,
             commands::dashboard,
@@ -190,8 +246,10 @@ pub fn run() {
             commands::goal_update,
             commands::goal_set_archived,
             commands::goal_delete,
+            commands::calendars,
+            commands::calendar_set_shown,
             commands::projects,
-            commands::project_set_shown,
+            commands::project_set_archived,
             commands::tags,
             commands::tag_save,
             commands::tag_delete,
@@ -202,6 +260,8 @@ pub fn run() {
             commands::get_account_token,
             commands::set_account_token,
             commands::clear_account_token,
+            sync_commands::sync_now,
+            sync_commands::sync_status,
             google_commands::google_status,
             google_commands::google_connect,
             google_commands::google_cancel_connect,
@@ -210,8 +270,9 @@ pub fn run() {
             google_commands::calendar_refresh,
             google_commands::calendar_create,
             google_commands::calendar_update,
-            google_commands::calendar_move,
+            google_commands::calendar_delete,
             google_commands::projects_refresh,
+            google_commands::project_from_event,
             timer_commands::timer_status,
             timer_commands::timer_start,
             timer_commands::timer_stop,
@@ -221,6 +282,7 @@ pub fn run() {
             timer_commands::timer_delete_session,
             timer_commands::timer_relink
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| lifecycle::on_run_event(app, &event));
 }

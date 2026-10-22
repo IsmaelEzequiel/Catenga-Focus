@@ -2,12 +2,14 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
+import type { BlobStore } from "../src/blobs.js";
 import { codeChallengeFor } from "../src/auth.js";
 import { applySchema, sqliteDb, type Db } from "../src/db.js";
 import type { Mailer } from "../src/mail.js";
 
 type Sent = { to: string; name: string; link: string };
 
+const nullBlobs: BlobStore = { put: async () => {}, get: async () => null, del: async () => {} };
 let db: Db;
 let sent: Sent[];
 let server: Server;
@@ -34,7 +36,7 @@ beforeEach(async () => {
   };
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
-  const app = createApp({ db, mailer, baseUrl: base, now: () => clock });
+  const app = createApp({ db, mailer, baseUrl: base, blobs: nullBlobs, notesKek: Buffer.alloc(32), now: () => clock });
   server = await new Promise<Server>((resolve) => {
     const s = app.listen(port, "127.0.0.1", () => resolve(s));
   });

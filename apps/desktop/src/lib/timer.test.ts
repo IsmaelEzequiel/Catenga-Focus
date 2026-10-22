@@ -129,9 +129,9 @@ describe("toBlockRef", () => {
     const b = { key: "k", start: 1, end: 2, title: "t", tags: ["a"], body: "x" };
     expect(toBlockRef(b)).toEqual({ start: 1, end: 2, title: "t", tags: ["a"], project: null });
   });
-  it("carries_the_google_calendar_id_of_the_blocks_project", () => {
+  it("carries_the_project_key_of_the_blocks_project", () => {
     const b = { key: "k", start: 1, end: 2, title: " t ", tags: [] };
-    expect(toBlockRef(b, "cal-1")).toEqual({ start: 1, end: 2, title: "t", tags: [], project: "cal-1" });
+    expect(toBlockRef(b, "series:abc")).toEqual({ start: 1, end: 2, title: "t", tags: [], project: "series:abc" });
   });
 });
 

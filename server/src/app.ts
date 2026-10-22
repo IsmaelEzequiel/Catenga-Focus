@@ -13,9 +13,12 @@ import {
   parseCodeChallenge,
   parseEmail,
   parseName,
+  sha256Hex,
   SESSION_TTL,
 } from "./auth.js";
+import type { BlobStore } from "./blobs.js";
 import type { Db } from "./db.js";
+import { fileChanges, getOrCreateNotesKey, isRev, isSyncPath, MAX_FILE_BYTES, readFile, removeFile, writeFile } from "./files.js";
 import type { Mailer } from "./mail.js";
 import {
   checkEmailPage,
@@ -28,8 +31,18 @@ import {
   type AppParams,
 } from "./pages.js";
 import { createRateLimiter } from "./rateLimit.js";
+import { parseSyncRequest, runSync, sessionUserId, syncStatus } from "./sync.js";
 
-export type AppDeps = { db: Db; mailer: Mailer; baseUrl: string; now?: () => number };
+export type AppDeps = {
+  db: Db;
+  mailer: Mailer;
+  baseUrl: string;
+  /** Where encrypted note blobs live (R2 in production, a local directory in dev/tests). */
+  blobs?: BlobStore;
+  /** Master key (32 bytes) that wraps each user's notes key. Without both, notes routes answer 503. */
+  notesKek?: Buffer;
+  now?: () => number;
+};
 
 const COOKIE = "catenga_session";
 const HOUR = 3_600_000;
@@ -66,7 +79,7 @@ const bearer = (req: Request): string | null => {
   return m?.[1] ?? null;
 };
 
-export function createApp({ db, mailer, baseUrl, now = Date.now }: AppDeps): express.Express {
+export function createApp({ db, mailer, baseUrl, blobs, notesKek, now = Date.now }: AppDeps): express.Express {
   const app = express();
   app.set("trust proxy", 1);
   app.disable("x-powered-by");
@@ -76,6 +89,8 @@ export function createApp({ db, mailer, baseUrl, now = Date.now }: AppDeps): exp
   const emailLimit = createRateLimiter(5, HOUR, now);
   const ipEmailLimit = createRateLimiter(20, HOUR, now);
   const tokenLimit = createRateLimiter(30, HOUR, now);
+  const syncLimit = createRateLimiter(120, HOUR, now);
+  const filesLimit = createRateLimiter(600, HOUR, now);
 
   const html = (res: Response, status: number, body: string) => res.status(status).type("html").send(body);
   const badRequest = (res: Response) =>
@@ -100,8 +115,9 @@ export function createApp({ db, mailer, baseUrl, now = Date.now }: AppDeps): exp
     if (o && CORS_ORIGINS.has(o)) {
       res.set({
         "Access-Control-Allow-Origin": o,
-        "Access-Control-Allow-Methods": "GET, POST",
-        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Base-Rev, X-Rev",
+        "Access-Control-Expose-Headers": "X-Rev",
         Vary: "Origin",
       });
     }
@@ -253,6 +269,111 @@ export function createApp({ db, mailer, baseUrl, now = Date.now }: AppDeps): exp
     const token = bearer(req);
     if (token) await deleteSession(db, token);
     res.sendStatus(204);
+  });
+
+  app.post("/api/sync", express.json({ limit: "1mb" }), async (req, res) => {
+    const token = bearer(req);
+    const userId = token ? await sessionUserId(db, token, now()) : null;
+    if (!token || !userId) return res.status(401).json({ error: "Not signed in" });
+    if (!syncLimit(sha256Hex(token))) return res.status(429).json({ error: "Too many sync requests" });
+    const parsed = parseSyncRequest(req.body);
+    if (typeof parsed === "string") return res.status(400).json({ error: parsed });
+    res.json(await runSync(db, userId, parsed));
+  });
+
+  app.get("/api/sync/status", async (req, res) => {
+    const token = bearer(req);
+    const userId = token ? await sessionUserId(db, token, now()) : null;
+    if (!userId) return res.status(401).json({ error: "Not signed in" });
+    res.json(await syncStatus(db, userId));
+  });
+
+  // --- notes files (encrypted blobs) ----------------------------------------
+
+  /** Bearer auth + the 600/hour/token limit shared by the key and file routes. */
+  const filesAuth: RequestHandler = async (req, res, next) => {
+    if (!blobs || !notesKek) {
+      res.status(503).json({ error: "Notes sync isn't configured on this server" });
+      return;
+    }
+    const token = bearer(req);
+    const userId = token ? await sessionUserId(db, token, now()) : null;
+    if (!token || !userId) {
+      res.status(401).json({ error: "Not signed in" });
+      return;
+    }
+    if (!filesLimit(sha256Hex(token))) {
+      res.status(429).json({ error: "Too many requests" });
+      return;
+    }
+    res.locals.userId = userId;
+    next();
+  };
+  const uid = (res: Response): string => res.locals.userId as string;
+  /** The `path` query value if it is a syncable path, else answers 400. */
+  const syncPath = (req: Request, res: Response): string | null => {
+    const p = req.query.path;
+    if (typeof p !== "string" || !isSyncPath(p)) {
+      res.status(400).json({ error: "Invalid path" });
+      return null;
+    }
+    return p;
+  };
+  const baseRevOf = (req: Request, res: Response): string | null => {
+    const v = req.headers["x-base-rev"];
+    const base = typeof v === "string" ? v : "";
+    if (base !== "" && !isRev(base)) {
+      res.status(400).json({ error: "Invalid X-Base-Rev" });
+      return null;
+    }
+    return base;
+  };
+
+  app.get("/api/notes/key", filesAuth, async (_req, res) => {
+    res.json({ key: await getOrCreateNotesKey(db, notesKek!, uid(res), now()) });
+  });
+
+  app.get("/api/files/changes", filesAuth, async (req, res) => {
+    const raw = req.query.cursor;
+    const cursor = raw === undefined ? 0 : typeof raw === "string" && /^\d{1,15}$/.test(raw) ? Number(raw) : -1;
+    if (cursor < 0) return res.status(400).json({ error: "Invalid cursor" });
+    res.json(await fileChanges(db, uid(res), cursor));
+  });
+
+  app.get("/api/files/content", filesAuth, async (req, res) => {
+    const path = syncPath(req, res);
+    if (path === null) return;
+    const file = await readFile(db, blobs!, uid(res), path);
+    if (!file) return res.status(404).json({ error: "Not found" });
+    res.set({ "Content-Type": "application/octet-stream", "X-Rev": file.rev });
+    res.send(Buffer.from(file.bytes));
+  });
+
+  app.put(
+    "/api/files/content",
+    filesAuth,
+    express.raw({ type: () => true, limit: MAX_FILE_BYTES }),
+    async (req, res) => {
+      const path = syncPath(req, res);
+      if (path === null) return;
+      const base = baseRevOf(req, res);
+      if (base === null) return;
+      const rev = req.headers["x-rev"];
+      if (typeof rev !== "string" || !isRev(rev)) return res.status(400).json({ error: "Invalid X-Rev" });
+      const body: unknown = req.body;
+      if (!Buffer.isBuffer(body) || body.length === 0) return res.status(400).json({ error: "Empty body" });
+      const out = await writeFile(db, blobs!, uid(res), path, body, rev, base, now());
+      res.status(out.status).json(out.status === 200 ? { seq: out.seq } : { rev: out.rev });
+    },
+  );
+
+  app.delete("/api/files/content", filesAuth, async (req, res) => {
+    const path = syncPath(req, res);
+    if (path === null) return;
+    const base = baseRevOf(req, res);
+    if (base === null) return;
+    const out = await removeFile(db, blobs!, uid(res), path, base, now());
+    res.status(out.status).json(out.status === 200 ? { seq: out.seq } : { rev: out.rev });
   });
 
   app.use("/api", (err: unknown, _req: Request, res: Response, next: (e?: unknown) => void) => {

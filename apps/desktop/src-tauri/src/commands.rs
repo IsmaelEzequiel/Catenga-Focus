@@ -1,5 +1,5 @@
 use crate::account;
-use crate::app_db::{AppDb, Project};
+use crate::app_db::{AppDb, Calendar, Project};
 use crate::config::{self, Config};
 use crate::dashboard::{DashRange, Dashboard};
 use crate::day_file::Block;
@@ -266,7 +266,25 @@ pub async fn goal_delete(
     .await
 }
 
-// ------------------------------------------------------------ projects & tags
+// ------------------------------------------------- calendars, projects & tags
+
+#[tauri::command]
+pub fn calendars(db: State<AppDbHandle>) -> Result<Vec<Calendar>, String> {
+    db.get()?.calendars()
+}
+
+#[tauri::command]
+pub fn calendar_set_shown(
+    app: AppHandle,
+    db: State<AppDbHandle>,
+    id: i64,
+    shown: bool,
+) -> Result<Vec<Calendar>, String> {
+    let db = db.get()?;
+    db.set_shown(id, shown, now_secs())?;
+    emit(&app, "calendars-changed");
+    db.calendars()
+}
 
 #[tauri::command]
 pub fn projects(db: State<AppDbHandle>) -> Result<Vec<Project>, String> {
@@ -274,14 +292,14 @@ pub fn projects(db: State<AppDbHandle>) -> Result<Vec<Project>, String> {
 }
 
 #[tauri::command]
-pub fn project_set_shown(
+pub fn project_set_archived(
     app: AppHandle,
     db: State<AppDbHandle>,
     id: i64,
-    shown: bool,
+    archived: bool,
 ) -> Result<Vec<Project>, String> {
     let db = db.get()?;
-    db.set_shown(id, shown, now_secs())?;
+    db.project_set_archived(id, archived, now_secs())?;
     emit(&app, "projects-changed");
     db.projects()
 }
@@ -418,8 +436,18 @@ pub fn set_account_token(token: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn clear_account_token() -> Result<(), String> {
-    account::delete_token()
+pub fn clear_account_token(
+    app: AppHandle,
+    sync: State<Arc<crate::sync_commands::SyncService>>,
+) -> Result<(), String> {
+    account::delete_token()?;
+    // The notes key goes with the sign-in; notes already on this computer stay.
+    if let Err(e) = crate::file_sync::KeyStore::delete(&account::KeychainNotesKey) {
+        eprintln!("removing the notes key: {e}");
+    }
+    // Signed out: syncing stops; local data is untouched.
+    sync.signed_out(&app);
+    Ok(())
 }
 
 #[cfg(test)]

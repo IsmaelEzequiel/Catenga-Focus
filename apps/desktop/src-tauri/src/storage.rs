@@ -3,6 +3,7 @@
 use crate::atomic;
 use crate::day_file::{self, Block, DayFile};
 use crate::mirror;
+use crate::notes_crypto;
 use crate::sessions::{self, Session, SessionBlock};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -284,6 +285,15 @@ fn date_from_path_suffix(root: &Path, path: &Path, suffix: &str) -> Option<Strin
     (year == &date[0..4] && month == &date[5..7]).then(|| date.to_string())
 }
 
+/// What `DayStore::replace_synced` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replaced {
+    /// Done; `Some` when the frontend must be told the day changed.
+    Done(Option<DayChanged>),
+    /// The file is not what the caller expected (edited meanwhile): nothing was touched.
+    Changed,
+}
+
 /// Serialises all reads/writes of day files and remembers the last rev the
 /// frontend was told about per day, so watcher events caused by our own writes
 /// (or no-op touches) can be told apart from foreign edits.
@@ -399,6 +409,48 @@ impl DayStore {
             date: date.to_string(),
             rev: new,
         }))
+    }
+
+    /// Notes sync (M9b): replaces (`Some(bytes)`) or deletes (`None`) a day file, but only
+    /// while its current content is the one the caller looked at (`expect` is the SHA-256
+    /// rev of it, `None` for "no file"). Same lock and atomic write as `save`, so the
+    /// existing conflict handling applies to anything the frontend still holds. The
+    /// returned `DayChanged` is for the caller to emit: the watcher echo is suppressed.
+    pub fn replace_synced(
+        &self,
+        date: &str,
+        expect: Option<&str>,
+        bytes: Option<&[u8]>,
+    ) -> Result<Replaced, String> {
+        let mut state = self.state();
+        let path = day_path(&self.root, date)?;
+        let current = match fs::read(&path) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("reading {}: {e}", path.display())),
+        };
+        if current.as_deref().map(notes_crypto::rev_of).as_deref() != expect {
+            return Ok(Replaced::Changed);
+        }
+        let new_rev = match bytes {
+            Some(b) => {
+                atomic::write_atomic(&path, b)?;
+                rev_of(b)
+            }
+            None => {
+                if current.is_none() {
+                    return Ok(Replaced::Done(None));
+                }
+                fs::remove_file(&path).map_err(|e| format!("deleting {}: {e}", path.display()))?;
+                String::new()
+            }
+        };
+        state.aliases.remove(date);
+        state.known.insert(date.to_string(), new_rev.clone());
+        Ok(Replaced::Done(Some(DayChanged {
+            date: date.to_string(),
+            rev: new_rev,
+        })))
     }
 
     /// Called for each path the watcher reports. `Some` only when the file's
@@ -1286,6 +1338,82 @@ mod tests {
         assert_eq!(
             fs::read_to_string(day_file_path(&s)).unwrap(),
             "## 09:00–10:00 · A\nnote\n"
+        );
+    }
+
+    fn plain_store(tmp: &TempDir) -> DayStore {
+        DayStore::new(fs::canonicalize(&tmp.0).unwrap())
+    }
+
+    #[test]
+    fn replace_synced_writes_only_over_the_expected_content_and_tells_the_frontend() {
+        let tmp = TempDir::new();
+        let s = plain_store(&tmp);
+        let path = day_path(s.root(), DATE).unwrap();
+        // No file yet: expecting "no file" works and the watcher echo is suppressed.
+        let out = s
+            .replace_synced(
+                DATE,
+                None,
+                Some(b"## 09:00\xE2\x80\x9310:00 \xC2\xB7 A\nremote\n"),
+            )
+            .unwrap();
+        let Replaced::Done(Some(changed)) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(changed.date, DATE);
+        assert_eq!(changed.rev, s.load(DATE).unwrap().rev);
+        assert!(
+            s.check_external(&path).is_none(),
+            "own write is not external"
+        );
+        let current = fs::read(&path).unwrap();
+        // Edited meanwhile: expecting the old content is refused and nothing is touched.
+        let stale = notes_crypto::rev_of(b"something else");
+        assert_eq!(
+            s.replace_synced(DATE, Some(&stale), Some(b"x")).unwrap(),
+            Replaced::Changed
+        );
+        assert_eq!(
+            s.replace_synced(DATE, None, Some(b"x")).unwrap(),
+            Replaced::Changed
+        );
+        assert_eq!(fs::read(&path).unwrap(), current);
+        // The frontend's next save is based on the rev it was told about.
+        let loaded = s.load(DATE).unwrap();
+        assert_eq!(loaded.blocks[0].body, "remote\n");
+        let out = s.save(DATE, &loaded.blocks, &loaded.rev).unwrap();
+        assert!(matches!(out, SaveOutcome::Saved { .. }), "{out:?}");
+    }
+
+    #[test]
+    fn replace_synced_deletes_only_the_expected_content() {
+        let tmp = TempDir::new();
+        let s = plain_store(&tmp);
+        let path = day_path(s.root(), DATE).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "## 09:00–10:00 · A\nmine\n").unwrap();
+        let wrong = notes_crypto::rev_of(b"other");
+        assert_eq!(
+            s.replace_synced(DATE, Some(&wrong), None).unwrap(),
+            Replaced::Changed
+        );
+        assert!(path.exists());
+        let right = notes_crypto::rev_of(&fs::read(&path).unwrap());
+        let out = s.replace_synced(DATE, Some(&right), None).unwrap();
+        assert_eq!(
+            out,
+            Replaced::Done(Some(DayChanged {
+                date: DATE.into(),
+                rev: String::new()
+            }))
+        );
+        assert!(!path.exists());
+        assert!(s.check_external(&path).is_none());
+        // Already gone, expecting nothing: a no-op.
+        assert_eq!(
+            s.replace_synced(DATE, None, None).unwrap(),
+            Replaced::Done(None)
         );
     }
 }

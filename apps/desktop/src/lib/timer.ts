@@ -15,7 +15,7 @@ interface RefLike extends Slot {
   tags: string[];
 }
 
-/** `project` = Google calendar id of the block's project (derived from its matched event). */
+/** `project` = project key (`series:…` / `event:…`) of the block's matched event. */
 export const toBlockRef = (b: RefLike, project: string | null = null): BlockRef => ({
   start: b.start,
   end: b.end,

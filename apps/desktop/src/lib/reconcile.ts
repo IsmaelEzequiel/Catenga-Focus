@@ -108,3 +108,18 @@ export function mergeConflict(base: UiBlock[], local: UiBlock[], disk: Block[]):
   const shape = (list: Block[]) => list.map(identity).sort().join("|");
   return { disk: diskBlocks, blocks, conflicts, structureDropped: shape(local) !== shape(base), changed };
 }
+
+/**
+ * Conflicts for a recovered snapshot whose file changed since it was taken: every recovered note
+ * that differs from the file's block (or has no block there any more) is kept as `mine`.
+ * Blank notes without a block are not worth keeping.
+ */
+export function recoveryConflicts(disk: UiBlock[], recovered: Block[]): Conflict[] {
+  const conflicts: Conflict[] = [];
+  const diskByKey = new Map(disk.map((b) => [b.key, b]));
+  for (const mine of reconcileKeys(disk, recovered)) {
+    const there = diskByKey.get(mine.key);
+    if (there ? there.body !== mine.body : mine.body.trim() !== "") conflicts.push({ key: mine.key, mine });
+  }
+  return conflicts;
+}

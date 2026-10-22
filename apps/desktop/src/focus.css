@@ -586,3 +586,7 @@
     opacity: 0;
   }
 }
+
+.focus__editor::placeholder {
+  color: var(--color-ink-muted);
+}

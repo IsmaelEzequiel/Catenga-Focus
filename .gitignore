@@ -17,3 +17,5 @@ apps/desktop/src-tauri/gen/schemas
 !.env.example
 
 server/dev.sqlite*
+
+server/dev-blobs/

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const SCOPE: &str = "https://www.googleapis.com/auth/calendar.events";
-/// Lets us list the user's calendars (the projects).
+/// Lets us list the user's calendars.
 pub const CALENDAR_LIST_SCOPE: &str =
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly";
 /// Fallback when Google sends no color.
@@ -39,16 +39,30 @@ pub struct CalEvent {
     /// Cached for later use; not part of the frontend contract.
     #[serde(skip_serializing, default)]
     pub html_link: Option<String>,
-    /// The project (DB id) of the event's calendar; filled when the events are
-    /// handed to the frontend.
+    /// `recurringEventId` of an instance of a repeating series. Backend only.
+    #[serde(skip_serializing, default)]
+    pub recurring_event_id: Option<String>,
+    /// `series:<recurringEventId>`, or `event:<id>` for a one-off event that is a
+    /// project; filled when the events are handed to the frontend.
+    #[serde(default)]
+    pub project_key: Option<String>,
+    /// DB id of that project, when its row exists; filled like `project_key`.
     #[serde(default)]
     pub project_id: Option<i64>,
-    /// The project's color (`#rrggbb`), or `""` when the calendar has no project yet.
+    /// The event's calendar color (`#rrggbb`), or `""` when the calendar is unknown.
     #[serde(default)]
     pub color: String,
 }
 
-/// A calendar of the user's Google calendar list (a project).
+/// A repeating series: the master event of a recurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesInfo {
+    /// The master event id (the instances' `recurringEventId`).
+    pub id: String,
+    pub name: String,
+}
+
+/// A calendar of the user's Google calendar list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalendarInfo {
     pub id: String,
@@ -199,6 +213,9 @@ struct Item {
     end: Option<EventTime>,
     #[serde(rename = "htmlLink")]
     html_link: Option<String>,
+    #[serde(rename = "recurringEventId")]
+    recurring_event_id: Option<String>,
+    recurrence: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +277,8 @@ fn to_cal_event(item: Item, day: Date, tz: &TimeZone) -> Option<CalEvent> {
         title,
         calendar_id: String::new(),
         html_link: item.html_link,
+        recurring_event_id: item.recurring_event_id.filter(|s| !s.is_empty()),
+        project_key: None,
         project_id: None,
         color: String::new(),
     })
@@ -288,6 +307,60 @@ pub fn parse_event(body: &str, date: &str, tz: &TimeZone) -> Result<CalEvent, St
     let item: Item =
         serde_json::from_str(body).map_err(|e| format!("unexpected event response: {e}"))?;
     to_cal_event(item, day, tz).ok_or_else(|| "Google returned an event outside the day".into())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SeriesPage {
+    pub series: Vec<SeriesInfo>,
+    pub next_page_token: Option<String>,
+}
+
+/// Whether a series repeats at least once a week (owner rule: only those are projects).
+/// Reads just `FREQ` and `INTERVAL` of the `RRULE` lines — Google expands the occurrences;
+/// nothing here computes dates. Any one qualifying rule is enough.
+pub fn at_least_weekly(recurrence: &[String]) -> bool {
+    recurrence.iter().any(|line| {
+        let Some(rule) = line.strip_prefix("RRULE:") else {
+            return false;
+        };
+        let part = |key: &str| {
+            rule.split(';')
+                .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        };
+        let interval: u32 = part("INTERVAL").and_then(|v| v.parse().ok()).unwrap_or(1);
+        match part("FREQ") {
+            Some("SECONDLY" | "MINUTELY" | "HOURLY") => true,
+            Some("DAILY") => interval <= 7,
+            Some("WEEKLY") => interval <= 1,
+            _ => false,
+        }
+    })
+}
+
+/// Parses one page of `events.list` made with `singleEvents=false`: the master
+/// events (the ones with a `recurrence`) that are not cancelled and repeat at least weekly.
+pub fn parse_series_list(body: &str) -> Result<SeriesPage, String> {
+    let list: ListBody =
+        serde_json::from_str(body).map_err(|e| format!("unexpected events response: {e}"))?;
+    let series = list
+        .items
+        .into_iter()
+        .filter(|i| i.status.as_deref() != Some("cancelled"))
+        .filter(|i| i.recurrence.as_deref().is_some_and(at_least_weekly))
+        .filter_map(|i| {
+            let id = i.id.filter(|s| !s.is_empty())?;
+            let name = i
+                .summary
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| NO_TITLE.to_string());
+            Some(SeriesInfo { id, name })
+        })
+        .collect();
+    Ok(SeriesPage {
+        series,
+        next_page_token: list.next_page_token,
+    })
 }
 
 #[derive(Deserialize)]
@@ -552,6 +625,8 @@ mod tests {
                 title: "Deep work".into(),
                 calendar_id: String::new(),
                 html_link: Some("https://l/e1".into()),
+                recurring_event_id: None,
+                project_key: None,
                 project_id: None,
                 color: String::new(),
             }]
@@ -738,13 +813,98 @@ mod tests {
             title: "t".into(),
             calendar_id: "cal@x".into(),
             html_link: Some("l".into()),
+            recurring_event_id: Some("series1".into()),
+            project_key: Some("series:series1".into()),
             project_id: Some(3),
             color: "#16a765".into(),
         };
         assert_eq!(
             serde_json::to_value(&e).unwrap(),
-            json!({"id":"i","start":1,"end":2,"title":"t","projectId":3,"color":"#16a765"})
+            json!({"id":"i","start":1,"end":2,"title":"t","projectKey":"series:series1","projectId":3,"color":"#16a765"})
         );
+        let none = CalEvent {
+            recurring_event_id: None,
+            project_key: None,
+            project_id: None,
+            color: String::new(),
+            ..e
+        };
+        assert_eq!(
+            serde_json::to_value(&none).unwrap(),
+            json!({"id":"i","start":1,"end":2,"title":"t","projectKey":null,"projectId":null,"color":""})
+        );
+    }
+
+    #[test]
+    fn instances_keep_their_recurring_event_id() {
+        let body = list(
+            r#"{"id":"s1_20261021T120000Z","recurringEventId":"s1","status":"confirmed","summary":"Learn Rust","start":{"dateTime":"2026-10-21T09:00:00-03:00"},"end":{"dateTime":"2026-10-21T10:00:00-03:00"}},
+               {"id":"one","summary":"Dentist","start":{"dateTime":"2026-10-21T11:00:00-03:00"},"end":{"dateTime":"2026-10-21T12:00:00-03:00"}}"#,
+        );
+        let r = parse_event_list(&body, "2026-10-21", &sp()).unwrap();
+        assert_eq!(r.events[0].recurring_event_id.as_deref(), Some("s1"));
+        assert_eq!(r.events[1].recurring_event_id, None);
+    }
+
+    #[test]
+    fn at_least_weekly_keeps_daily_and_weekly_rules_only() {
+        let yes = |r: &str| at_least_weekly(&[r.to_string()]);
+        assert!(yes("RRULE:FREQ=DAILY"));
+        assert!(yes("RRULE:FREQ=DAILY;INTERVAL=7"));
+        assert!(yes("RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"));
+        assert!(yes("RRULE:FREQ=WEEKLY;INTERVAL=1;UNTIL=20261231T000000Z"));
+        assert!(yes("RRULE:INTERVAL=1;FREQ=WEEKLY"));
+        assert!(!yes("RRULE:FREQ=DAILY;INTERVAL=8"));
+        assert!(!yes("RRULE:FREQ=WEEKLY;INTERVAL=2"));
+        assert!(!yes("RRULE:FREQ=MONTHLY"));
+        assert!(!yes("RRULE:FREQ=YEARLY"));
+        assert!(!yes("RDATE;VALUE=DATE:20261101"));
+        assert!(!at_least_weekly(&[]));
+        // Several rules: one weekly rule is enough; EXDATE lines are ignored.
+        assert!(at_least_weekly(&[
+            "EXDATE;TZID=America/Sao_Paulo:20261102T090000".into(),
+            "RRULE:FREQ=MONTHLY".into(),
+            "RRULE:FREQ=WEEKLY".into(),
+        ]));
+    }
+
+    #[test]
+    fn series_list_drops_series_repeating_less_than_weekly() {
+        let body = r#"{"items":[
+            {"id":"d","summary":"Learn Rust","recurrence":["RRULE:FREQ=DAILY"]},
+            {"id":"m","summary":"Rent","recurrence":["RRULE:FREQ=MONTHLY;BYMONTHDAY=5"]},
+            {"id":"b","summary":"1:1","recurrence":["RRULE:FREQ=WEEKLY;INTERVAL=2"]}
+          ]}"#;
+        let ids: Vec<_> = parse_series_list(body)
+            .unwrap()
+            .series
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["d"]);
+    }
+
+    #[test]
+    fn series_list_keeps_masters_with_a_recurrence_and_drops_the_rest() {
+        let body = r#"{"items":[
+            {"id":"s1","status":"confirmed","summary":" Learn Rust ","recurrence":["RRULE:FREQ=DAILY;BYDAY=MO,TU"]},
+            {"id":"s2","summary":"","recurrence":["RRULE:FREQ=WEEKLY"]},
+            {"id":"gone","status":"cancelled","summary":"Gone","recurrence":["RRULE:FREQ=DAILY"]},
+            {"id":"one","summary":"Dentist"},
+            {"id":"s1_exc","recurringEventId":"s1","summary":"Learn Rust (moved)"},
+            {"id":"empty","summary":"x","recurrence":[]},
+            {"summary":"no id","recurrence":["RRULE:FREQ=DAILY"]}
+          ],"nextPageToken":"P2"}"#;
+        let page = parse_series_list(body).unwrap();
+        assert_eq!(page.next_page_token.as_deref(), Some("P2"));
+        let got: Vec<_> = page
+            .series
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str()))
+            .collect();
+        assert_eq!(got, [("s1", "Learn Rust"), ("s2", "(no title)")]);
+        assert!(parse_series_list("nope").is_err());
+        assert!(parse_series_list("{}").unwrap().series.is_empty());
     }
 
     #[test]

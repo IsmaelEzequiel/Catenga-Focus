@@ -40,7 +40,7 @@ pub struct BlockRef {
     pub end: u16,
     pub title: String,
     pub tags: Vec<String>,
-    /// Google calendar id of the block's project; the frontend derives it
+    /// Project key (`series:<id>` / `event:<id>`) of the block; the frontend derives it
     /// from the calendar event the block matches.
     #[serde(default)]
     pub project: Option<String>,
@@ -1357,6 +1357,25 @@ mod tests {
         assert_eq!(again.status(), TimerStatus::Idle);
         assert!(!fx.timer_json.exists());
         assert_eq!(fx.sidecar().len(), 1);
+    }
+
+    #[test]
+    fn recover_on_another_notes_folder_drops_the_pointer_and_keeps_the_old_sidecar() {
+        let fx = Fx::new();
+        fx.svc.start(DATE, br(), Mode::Free, None).unwrap();
+        fx.set_now(ts(9, 5, 0));
+        let sidecar = sessions::sidecar_path(&fx.root, DATE).unwrap();
+        let before = fs::read(&sidecar).unwrap();
+        // The owner switched the notes folder: same timer.json, another (empty) root.
+        let other = fx.root.parent().unwrap().join("other-notes");
+        fs::create_dir_all(&other).unwrap();
+        let store = Arc::new(DayStore::new(other.clone()));
+        let again = Fx::service(&other, &fx.timer_json, &store, &fx.sink, &fx.now);
+        again.recover();
+        assert_eq!(again.status(), TimerStatus::Idle);
+        assert!(!fx.timer_json.exists());
+        assert_eq!(fs::read(&sidecar).unwrap(), before);
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
     }
 
     #[test]

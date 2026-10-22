@@ -2,7 +2,7 @@
 //! tests run against a local fake server. The refresh token lives in the OS keychain,
 //! the access token only in memory.
 
-use crate::google::{self, CalEvent, CalendarInfo, TokenError, Tokens};
+use crate::google::{self, CalEvent, CalendarInfo, SeriesInfo, TokenError, Tokens};
 use jiff::tz::TimeZone;
 use keyring::Entry;
 use reqwest::Method;
@@ -94,14 +94,14 @@ fn get_entry(user: &str) -> Result<Option<String>, String> {
     match entry(user)?.get_password() {
         Ok(v) => Ok(Some(v)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("reading the keychain: {e}")),
+        Err(e) => Err(crate::account::keychain_error("reading", &e)),
     }
 }
 
 fn delete_entry(user: &str) -> Result<(), String> {
     match entry(user)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("deleting from the keychain: {e}")),
+        Err(e) => Err(crate::account::keychain_error("deleting from", &e)),
     }
 }
 
@@ -112,7 +112,7 @@ impl TokenStore for KeychainStore {
     fn set_refresh_token(&self, token: &str) -> Result<(), String> {
         entry(KEYCHAIN_REFRESH_USER)?
             .set_password(token)
-            .map_err(|e| format!("saving to the keychain: {e}"))
+            .map_err(|e| crate::account::keychain_error("saving to", &e))
     }
     fn delete_refresh_token(&self) -> Result<(), String> {
         delete_entry(KEYCHAIN_REFRESH_USER)
@@ -124,7 +124,7 @@ impl TokenStore for KeychainStore {
         let _ = match email {
             Some(e) => entry(KEYCHAIN_EMAIL_USER).and_then(|en| {
                 en.set_password(e)
-                    .map_err(|e| format!("saving to the keychain: {e}"))
+                    .map_err(|e| crate::account::keychain_error("saving to", &e))
             }),
             None => delete_entry(KEYCHAIN_EMAIL_USER),
         };
@@ -136,7 +136,7 @@ impl TokenStore for KeychainStore {
         let _ = match scope {
             Some(s) => entry(KEYCHAIN_SCOPE_USER).and_then(|en| {
                 en.set_password(s)
-                    .map_err(|e| format!("saving to the keychain: {e}"))
+                    .map_err(|e| crate::account::keychain_error("saving to", &e))
             }),
             None => delete_entry(KEYCHAIN_SCOPE_USER),
         };
@@ -336,8 +336,13 @@ impl Client {
         }
     }
 
-    /// Authorised request; one refresh + retry on a 401. Returns the response body.
-    async fn call(&self, method: Method, url: &str, body: Option<&Value>) -> Result<String, Error> {
+    /// Authorised request; one refresh + retry on a 401. Returns the status and body of the final response.
+    async fn send(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, String), Error> {
         for attempt in 0..2 {
             let token = self.access_token(attempt > 0).await?;
             let mut request = self.http.request(method.clone(), url).bearer_auth(token);
@@ -353,12 +358,18 @@ impl Client {
             if status == 403 && text.contains("insufficient") && text.contains("cope") {
                 return Err(Error::MissingScope);
             }
-            if !(200..300).contains(&status) {
-                return Err(Error::Message(api_message(status, &text)));
-            }
-            return Ok(text);
+            return Ok((status, text));
         }
         Err(Error::Message("Google rejected the credentials".into()))
+    }
+
+    /// Like `send`, but any non-2xx answer is an error. Returns the response body.
+    async fn call(&self, method: Method, url: &str, body: Option<&Value>) -> Result<String, Error> {
+        let (status, text) = self.send(method, url, body).await?;
+        if !(200..300).contains(&status) {
+            return Err(Error::Message(api_message(status, &text)));
+        }
+        Ok(text)
     }
 
     /// `<api>/calendars/<id>/<tail…>` with every part percent-encoded.
@@ -373,7 +384,7 @@ impl Client {
         Ok(url)
     }
 
-    /// The calendar list, every page (the projects).
+    /// The calendar list, every page.
     pub async fn list_calendars(&self) -> Result<Vec<CalendarInfo>, Error> {
         let mut calendars = Vec::new();
         let mut page_token: Option<String> = None;
@@ -407,6 +418,42 @@ impl Client {
         Ok(calendars)
     }
 
+    /// The repeating series (master events) of a calendar that have an occurrence
+    /// at or after `time_min` (RFC 3339), every page. Cancelled masters are left out.
+    pub async fn list_series(
+        &self,
+        calendar_id: &str,
+        time_min: &str,
+    ) -> Result<Vec<SeriesInfo>, Error> {
+        let mut series = Vec::new();
+        let mut page_token: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut url = self.calendar_url(calendar_id, &["events"])?;
+            {
+                let mut q = url.query_pairs_mut();
+                q.append_pair("singleEvents", "false")
+                    .append_pair("showDeleted", "false")
+                    .append_pair("timeMin", time_min)
+                    .append_pair("maxResults", "250")
+                    .append_pair(
+                        "fields",
+                        "items(id,status,summary,recurrence,recurringEventId),nextPageToken",
+                    );
+                if let Some(t) = &page_token {
+                    q.append_pair("pageToken", t);
+                }
+            }
+            let body = self.call(Method::GET, url.as_str(), None).await?;
+            let page = google::parse_series_list(&body).map_err(Error::Message)?;
+            series.extend(page.series);
+            match page.next_page_token {
+                Some(t) => page_token = Some(t),
+                None => break,
+            }
+        }
+        Ok(series)
+    }
+
     /// All timed events of the local day `date` of the primary calendar.
     pub async fn list_day(&self, date: &str, tz: &TimeZone) -> Result<DayEvents, Error> {
         self.list_day_in("primary", date, tz).await
@@ -434,7 +481,7 @@ impl Client {
                     .append_pair("maxResults", "250")
                     .append_pair(
                         "fields",
-                        "summary,nextPageToken,items(id,status,summary,start,end,htmlLink)",
+                        "summary,nextPageToken,items(id,status,summary,start,end,htmlLink,recurringEventId)",
                     );
                 if let Some(t) = &page_token {
                     q.append_pair("pageToken", t);
@@ -497,21 +544,15 @@ impl Client {
         Ok(event)
     }
 
-    /// Moves the event to another calendar (`events.move`); the result lives in `to`.
-    pub async fn move_event(
-        &self,
-        from: &str,
-        to: &str,
-        event_id: &str,
-        date: &str,
-        tz: &TimeZone,
-    ) -> Result<CalEvent, Error> {
-        let mut url = self.calendar_url(from, &["events", event_id, "move"])?;
-        url.query_pairs_mut().append_pair("destination", to);
-        let body = self.call(Method::POST, url.as_str(), None).await?;
-        let mut event = google::parse_event(&body, date, tz).map_err(Error::Message)?;
-        event.calendar_id = to.to_string();
-        Ok(event)
+    /// Deletes the event (for an instance id of a repeating series: only that occurrence).
+    /// An event that is already gone (404/410) counts as deleted.
+    pub async fn delete_event(&self, calendar_id: &str, event_id: &str) -> Result<(), Error> {
+        let url = self.calendar_url(calendar_id, &["events", event_id])?;
+        let (status, text) = self.send(Method::DELETE, url.as_str(), None).await?;
+        if (200..300).contains(&status) || status == 404 || status == 410 {
+            return Ok(());
+        }
+        Err(Error::Message(api_message(status, &text)))
     }
 
     /// Best-effort revoke at Google, then forget everything locally.
@@ -821,6 +862,47 @@ mod tests {
     }
 
     #[test]
+    fn delete_sends_a_delete_with_an_encoded_id_on_the_given_calendar() {
+        let (base, seen) = fake_server(vec![tok("a"), (204, String::new())]);
+        let c = client(&base, connected_store());
+        run(c.delete_event("mest@group.calendar.google.com", "abc_20261021T120000Z/x")).unwrap();
+        let reqs = seen.lock().unwrap();
+        assert!(
+            reqs[1].starts_with(
+                "DELETE /calendar/v3/calendars/mest@group.calendar.google.com/events/abc_20261021T120000Z%2Fx "
+            ),
+            "{}",
+            reqs[1]
+        );
+    }
+
+    #[test]
+    fn delete_treats_404_and_410_as_already_gone() {
+        for status in [404u16, 410] {
+            let (base, _) = fake_server(vec![
+                tok("a"),
+                (
+                    status,
+                    r#"{"error":{"message":"Resource has been deleted"}}"#.into(),
+                ),
+            ]);
+            let c = client(&base, connected_store());
+            run(c.delete_event("primary", "e1")).unwrap();
+        }
+    }
+
+    #[test]
+    fn delete_reports_other_errors() {
+        let (base, _) = fake_server(vec![
+            tok("a"),
+            (403, r#"{"error":{"message":"Forbidden"}}"#.into()),
+        ]);
+        let c = client(&base, connected_store());
+        let err = run(c.delete_event("primary", "e1")).unwrap_err();
+        assert_eq!(err.to_string(), "Forbidden");
+    }
+
+    #[test]
     fn api_errors_carry_googles_message() {
         let (base, _) = fake_server(vec![
             tok("a"),
@@ -949,37 +1031,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn move_posts_to_the_source_with_the_destination_query() {
-        let (base, seen) = fake_server(vec![tok("a"), (200, EVENT.to_string())]);
-        let c = client(&base, connected_store());
-        let e = run(c.move_event(
-            "me@x.com",
-            "mest@group.calendar.google.com",
-            "e1",
-            "2026-10-21",
-            &tz(),
-        ))
-        .unwrap();
-        assert_eq!(
-            (e.id.as_str(), e.calendar_id.as_str()),
-            ("e1", "mest@group.calendar.google.com")
-        );
-        let reqs = seen.lock().unwrap();
-        assert!(
-            reqs[1].starts_with(
-                "POST /calendar/v3/calendars/me@x.com/events/e1/move?destination=mest%40group.calendar.google.com "
-            ),
-            "{}",
-            reqs[1]
-        );
-    }
-
     fn cal_page(items: &str, next: Option<&str>) -> (u16, String) {
         let next = next
             .map(|t| format!(r#","nextPageToken":"{t}""#))
             .unwrap_or_default();
         (200, format!(r#"{{"items":[{items}]{next}}}"#))
+    }
+
+    #[test]
+    fn list_series_asks_for_masters_follows_pages_and_keeps_only_recurring_ones() {
+        let (base, seen) = fake_server(vec![
+            tok("a"),
+            cal_page(
+                r#"{"id":"s1","summary":"Learn Rust","recurrence":["RRULE:FREQ=DAILY"]},{"id":"one","summary":"Dentist"}"#,
+                Some("P2"),
+            ),
+            cal_page(
+                r#"{"id":"s2","summary":"Gym","recurrence":["RRULE:FREQ=WEEKLY"]},{"id":"x","status":"cancelled","recurrence":["RRULE:FREQ=DAILY"]}"#,
+                None,
+            ),
+        ]);
+        let c = client(&base, connected_store());
+        let series = run(c.list_series("mest@x", "2026-07-23T00:00:00-03:00")).unwrap();
+        let got: Vec<_> = series
+            .iter()
+            .map(|s| (s.id.as_str(), s.name.as_str()))
+            .collect();
+        assert_eq!(got, [("s1", "Learn Rust"), ("s2", "Gym")]);
+        let reqs = seen.lock().unwrap();
+        assert!(
+            reqs[1].starts_with("GET /calendar/v3/calendars/mest@x/events?"),
+            "{}",
+            reqs[1]
+        );
+        assert!(reqs[1].contains("singleEvents=false"));
+        assert!(reqs[1].contains("showDeleted=false"));
+        assert!(reqs[1].contains("timeMin=2026-07-23T00%3A00%3A00-03%3A00"));
+        assert!(reqs[1].contains("maxResults=250"));
+        assert!(
+            reqs[1].contains("recurrence"),
+            "asks for the recurrence field"
+        );
+        assert!(reqs[2].contains("pageToken=P2"));
+    }
+
+    #[test]
+    fn list_day_asks_for_the_recurring_event_id() {
+        let (base, seen) = fake_server(vec![
+            tok("a"),
+            page(
+                r#"{"id":"s1_20261021","recurringEventId":"s1","summary":"Learn Rust","start":{"dateTime":"2026-10-21T09:00:00-03:00"},"end":{"dateTime":"2026-10-21T10:00:00-03:00"}}"#,
+                None,
+            ),
+        ]);
+        let c = client(&base, connected_store());
+        let day = run(c.list_day("2026-10-21", &tz())).unwrap();
+        assert_eq!(day.events[0].recurring_event_id.as_deref(), Some("s1"));
+        assert!(seen.lock().unwrap()[1].contains("recurringEventId"));
     }
 
     #[test]

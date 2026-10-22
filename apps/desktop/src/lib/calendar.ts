@@ -56,3 +56,27 @@ export function calendarOps<B extends CalBlock>(prev: B[], next: B[], events: Ca
   }
   return ops;
 }
+
+/** An occurrence of a repeating series: deleting it removes only that occurrence in Google. */
+export const isSeriesInstance = (e: CalEvent): boolean => e.projectKey?.startsWith("series:") ?? false;
+
+export type BlockDeletePlan =
+  | { kind: "delete" }
+  | { kind: "confirm"; event: CalEvent }
+  | { kind: "refuse"; reason: "sessions" | "notes"; event: CalEvent | null };
+
+/**
+ * What deleting a block does (`docs/plans/M8e-play-delete.md` §1.4). A block with sessions or a note is never deleted
+ * (`event` then says whether the Google event can be offered for deletion instead); an empty one backed by an event asks.
+ */
+export function blockDeletePlan(p: {
+  hasSessions: boolean;
+  hasNote: boolean;
+  event: CalEvent | undefined;
+  canDeleteEvent: boolean;
+}): BlockDeletePlan {
+  const event = p.canDeleteEvent && p.event ? p.event : null;
+  if (p.hasSessions) return { kind: "refuse", reason: "sessions", event };
+  if (p.hasNote) return { kind: "refuse", reason: "notes", event };
+  return event ? { kind: "confirm", event } : { kind: "delete" };
+}

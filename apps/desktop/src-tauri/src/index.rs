@@ -19,7 +19,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
 /// Bump when the schema changes; a mismatch resets the database (it is only a cache).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +78,7 @@ CREATE TABLE calendar_events(date TEXT NOT NULL, event_id TEXT NOT NULL, ord INT
                              start INTEGER NOT NULL, \"end\" INTEGER NOT NULL,
                              title TEXT NOT NULL, html_link TEXT,
                              calendar_id TEXT NOT NULL DEFAULT '',
+                             recurring_event_id TEXT,
                              PRIMARY KEY(date, event_id));
 CREATE TABLE calendar_days(date TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL);
 CREATE TABLE sidecars(date TEXT PRIMARY KEY, path TEXT NOT NULL, size INTEGER NOT NULL,
@@ -777,8 +778,8 @@ impl Index {
         let write = |tx: &Transaction| -> rusqlite::Result<()> {
             tx.execute("DELETE FROM calendar_events WHERE date = ?1", [date])?;
             let mut insert = tx.prepare(
-                "INSERT OR REPLACE INTO calendar_events(date, event_id, ord, start, \"end\", title, html_link, calendar_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR REPLACE INTO calendar_events(date, event_id, ord, start, \"end\", title, html_link, calendar_id, recurring_event_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for (ord, e) in events.iter().enumerate() {
                 insert.execute(params![
@@ -789,7 +790,8 @@ impl Index {
                     e.end,
                     e.title,
                     e.html_link,
-                    e.calendar_id
+                    e.calendar_id,
+                    e.recurring_event_id
                 ])?;
             }
             drop(insert);
@@ -822,7 +824,7 @@ impl Index {
                 return Ok(None);
             };
             let mut stmt = conn.prepare(
-                "SELECT event_id, start, \"end\", title, html_link, calendar_id FROM calendar_events
+                "SELECT event_id, start, \"end\", title, html_link, calendar_id, recurring_event_id FROM calendar_events
                  WHERE date = ?1 ORDER BY ord",
             )?;
             let events = stmt
@@ -834,6 +836,8 @@ impl Index {
                         title: r.get(3)?,
                         html_link: r.get(4)?,
                         calendar_id: r.get(5)?,
+                        recurring_event_id: r.get(6)?,
+                        project_key: None,
                         project_id: None,
                         color: String::new(),
                     })
@@ -921,6 +925,8 @@ mod tests {
             title: title.into(),
             calendar_id: String::new(),
             html_link: Some(format!("https://l/{id}")),
+            recurring_event_id: None,
+            project_key: None,
             project_id: None,
             color: String::new(),
         }
@@ -999,7 +1005,7 @@ mod tests {
         }
         let idx = env.open();
         assert_eq!(user_version(&env.db), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
         assert_eq!(idx.calendar_day("2026-10-21").unwrap(), None);
     }
 
@@ -1914,16 +1920,19 @@ mod tests {
     }
 
     #[test]
-    fn sessions_index_their_project_calendar_id() {
+    fn sessions_index_their_project_key() {
         let env = Env::new();
         let mut with = sess(S0, Some(S1), "A", &[]);
-        with.block.project = Some("mest@x".into());
+        with.block.project = Some("series:s1".into());
         put(&env, D, with);
         let idx = env.open();
         idx.sync_all();
         let r = idx.reader().unwrap();
         assert_eq!(
-            count(&r, "SELECT count(*) FROM sessions WHERE project = 'mest@x'"),
+            count(
+                &r,
+                "SELECT count(*) FROM sessions WHERE project = 'series:s1'"
+            ),
             1
         );
         let mut none = sess(
@@ -1954,6 +1963,45 @@ mod tests {
         let (events, _) = idx.calendar_day("2026-10-21").unwrap().unwrap();
         let ids: Vec<_> = events.iter().map(|e| e.calendar_id.as_str()).collect();
         assert_eq!(ids, ["mest@x", "me@x"]);
+    }
+
+    #[test]
+    fn calendar_events_keep_their_recurring_event_id() {
+        let env = Env::new();
+        let idx = env.open();
+        let mut a = ev("a", 540, 600, "A");
+        a.recurring_event_id = Some("series1".into());
+        let b = ev("b", 600, 660, "B");
+        idx.replace_calendar_day("2026-10-21", &[a, b], 1).unwrap();
+        let (events, _) = idx.calendar_day("2026-10-21").unwrap().unwrap();
+        let got: Vec<_> = events
+            .iter()
+            .map(|e| e.recurring_event_id.as_deref())
+            .collect();
+        assert_eq!(got, [Some("series1"), None]);
+        assert!(
+            events
+                .iter()
+                .all(|e| e.project_key.is_none() && e.project_id.is_none())
+        );
+    }
+
+    #[test]
+    fn an_index_from_schema_v4_is_rebuilt_with_the_recurring_column() {
+        let env = Env::new();
+        fs::create_dir_all(env.db.parent().unwrap()).unwrap();
+        {
+            let c = Connection::open(&env.db).unwrap();
+            c.execute_batch("CREATE TABLE meta(key TEXT, value TEXT); PRAGMA user_version = 4;")
+                .unwrap();
+        }
+        let idx = env.open();
+        assert_eq!(user_version(&env.db), SCHEMA_VERSION);
+        let r = idx.reader().unwrap();
+        assert!(
+            r.prepare("SELECT recurring_event_id FROM calendar_events")
+                .is_ok()
+        );
     }
 
     #[test]

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   calendarCreate,
+  calendarDelete,
   calendarDay,
-  calendarMove,
   calendarRefresh,
   calendarUpdate,
   onCalendarChanged,
   onCalendarError,
+  onCalendarsChanged,
   onProjectsChanged,
   type CalEvent,
 } from "../api";
@@ -101,11 +102,13 @@ export function useCalendar(
     );
     // A calendar shown/hidden or newly listed: hidden ones drop out on re-read, shown ones need a fetch.
     keep(
-      onProjectsChanged(() => {
+      onCalendarsChanged(() => {
         const day = dateRef.current;
         void read(day).then(() => calendarRefresh(day).catch(() => {}));
       }),
     );
+    // A project created or archived changes the events' project keys: the cache is enough (no network, no loop).
+    keep(onProjectsChanged(() => void read(dateRef.current)));
     keep(
       onCalendarError(({ date: failed, message: text }) => {
         failedRef.current();
@@ -141,7 +144,7 @@ export function useCalendar(
           try {
             const event =
               op.kind === "create"
-                ? await calendarCreate(forDate, op.block.start, op.block.end, op.block.title.trim(), null)
+                ? await calendarCreate(forDate, op.block.start, op.block.end, op.block.title.trim())
                 : await calendarUpdate(forDate, op.eventId, op.block.start, op.block.end, op.block.title.trim());
             setEvents(forDate, upsert(eventsRef.current, event));
           } catch (e) {
@@ -155,43 +158,33 @@ export function useCalendar(
     [read, setEvents],
   );
 
-  /** Moves an event to another project's calendar. Resolves to an error text or null. */
-  const move = useCallback(
-    (eventId: string, projectId: number): Promise<string | null> => {
+  /** Deletes an event in Google (after the pending writes); the timeline drops it right away. False on failure (with a notice). */
+  const remove = useCallback(
+    (eventId: string): Promise<boolean> => {
       const forDate = dateRef.current;
       const run = chain.current.then(async () => {
         try {
-          const event = await calendarMove(forDate, eventId, projectId);
-          setEvents(forDate, upsert(eventsRef.current, event));
-          return null;
+          await calendarDelete(forDate, eventId);
+          setEvents(
+            forDate,
+            eventsRef.current.filter((e) => e.id !== eventId),
+          );
+          return true;
         } catch (e) {
-          return message(e);
+          noticeRef.current(`Couldn't delete the event: ${message(e)}`);
+          return false;
         }
       });
-      chain.current = run.then(() => {});
+      chain.current = run.then(() => undefined);
       return run;
     },
     [setEvents],
   );
 
-  /** Creates the event of an unmatched block in a project's calendar; the block then matches it. */
-  const addToProject = useCallback(
-    (block: CalBlock, projectId: number): Promise<string | null> => {
-      const forDate = dateRef.current;
-      const run = chain.current.then(async () => {
-        try {
-          const event = await calendarCreate(forDate, block.start, block.end, block.title.trim(), projectId);
-          setEvents(forDate, upsert(eventsRef.current, event));
-          return null;
-        } catch (e) {
-          return message(e);
-        }
-      });
-      chain.current = run.then(() => {});
-      return run;
-    },
-    [setEvents],
-  );
+  /** Re-reads the visible day from the cache (e.g. after an event became a project). */
+  const reload = useCallback(() => read(dateRef.current), [read]);
 
-  return { events: enabled && state?.date === date ? state.events : [], sync, move, addToProject };
+  /** False until the cached events of `date` are read (always true when Google Calendar is off). */
+  const loaded = !enabled || state?.date === date;
+  return { events: enabled && state?.date === date ? state.events : [], loaded, sync, remove, reload };
 }
