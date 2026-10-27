@@ -1,62 +1,129 @@
+/* Timer card in the notes panel */
 .timer {
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--color-line);
-  font-size: 13px;
+  margin: 0 var(--space-5);
+  padding: var(--space-3) 14px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
 }
 
-.timer__row {
+.timer__top,
+.timer__main {
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  gap: var(--space-3);
 }
 
-.timer__modes {
-  display: inline-flex;
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-
-.timer__mode {
-  font: inherit;
-  font-size: 12px;
+.timer__focus {
   color: var(--color-ink-muted);
-  background: var(--color-surface-raised);
-  border: 0;
-  padding: 3px 10px;
-  cursor: pointer;
-}
-
-.timer__mode--on {
-  color: var(--color-ink);
-  background: color-mix(in srgb, var(--color-sun) 28%, var(--color-surface-raised));
-}
-
-.timer__mode:disabled {
-  cursor: default;
 }
 
 .timer__clock {
-  flex: 1;
-  font-family: var(--font-display);
-  font-size: 24px;
+  font: 600 var(--text-3xl) / 1 var(--font-display);
   font-variant-numeric: tabular-nums;
-  text-align: right;
+  letter-spacing: -0.01em;
+  color: var(--color-ink);
 }
 
-.timer__phase {
-  font-size: 12px;
+.timer__plan {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 20px;
+  font-size: var(--text-xs);
   color: var(--color-ink-muted);
 }
 
-.timer__btn--start {
-  background: var(--color-sun);
-  border-color: var(--color-sun);
+.timer__dots {
+  display: flex;
+  gap: 4px;
+  flex: none;
 }
 
+.timer__dot {
+  width: 8px;
+  height: 8px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-line-strong);
+}
+
+.timer__dot--current {
+  border-color: var(--color-sun-ink);
+  background: var(--color-sun);
+}
+
+.timer__dot--done {
+  border-color: var(--color-sun-ink);
+  background: var(--color-sun-ink);
+}
+
+.timer__phase {
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.timer__link {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: 500 var(--text-xs) var(--font-body);
+  color: var(--color-sun-ink);
+  cursor: pointer;
+}
+
+.timer__link--end {
+  margin-left: auto;
+}
+
+.timer__link:hover {
+  text-decoration: underline;
+}
+
+.timer__link:focus-visible {
+  outline: none;
+  border-radius: 4px;
+  box-shadow: var(--focus-ring);
+}
+
+.timer__plan-edit .plan {
+  margin-top: 0;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.timer__plan-edit .stepper {
+  height: 30px;
+  box-sizing: border-box;
+}
+
+/* Sessions summary in the notes panel footer */
 .timer__sessions {
+  min-width: 0;
+}
+
+.timer__summary {
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
   list-style: none;
-  margin: 8px 0 0;
+}
+
+.timer__summary::-webkit-details-marker {
+  display: none;
+}
+
+.timer__summary:hover {
+  color: var(--color-ink);
+}
+
+.timer__list {
+  list-style: none;
+  margin: var(--space-2) 0 0;
   padding: 0;
 }
 
@@ -64,9 +131,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-2);
   padding: 2px 0;
-  color: var(--color-ink-muted);
   font-variant-numeric: tabular-nums;
 }
 
@@ -76,81 +142,12 @@
   background: none;
   border: 0;
   padding: 2px;
+  border-radius: 4px;
   cursor: pointer;
 }
 
 .timer__delete:hover {
-  color: var(--color-tag-clay);
-}
-
-.timer__total {
-  margin: 4px 0 0;
-  color: var(--color-ink);
-  font-weight: 500;
-}
-
-.chip {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: stretch;
-  border: 1px solid var(--color-sun);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--color-sun) 18%, var(--color-surface-raised));
-  overflow: hidden;
-}
-
-.chip__open,
-.chip__stop {
-  font: inherit;
-  font-size: 14px;
-  color: var(--color-ink);
-  background: none;
-  border: 0;
-  padding: 4px 10px;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.chip__stop {
-  border-left: 1px solid var(--color-sun);
-}
-
-.chip__open:hover,
-.chip__stop:hover {
-  background: color-mix(in srgb, var(--color-sun) 25%, transparent);
-}
-
-.chip__title {
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 500;
-}
-
-.chip__phase {
-  color: var(--color-ink-muted);
-  font-size: 12px;
-}
-
-.chip__time {
-  font-variant-numeric: tabular-nums;
-}
-
-.chip + .app__gear {
-  margin-left: 12px;
-}
-
-.app__banner--timer {
-  background: color-mix(in srgb, var(--color-sun) 22%, var(--color-surface-raised));
-  border-bottom-color: var(--color-sun);
-}
-
-.banner__actions {
-  display: flex;
-  gap: 6px;
+  color: var(--color-danger);
 }
 
 /* Timeline: sessions in a narrow gutter, and the block being timed */
@@ -171,21 +168,7 @@
   border-radius: 2px;
 }
 
-.block--timing {
-  box-shadow: 0 0 0 2px var(--color-sun);
-}
-
-/* Pomodoro plan row: [4] × [25] min focus · [5] min break */
-.timer__focus {
-  padding: 4px 8px;
-}
-
-.timer__cycle {
-  margin: 8px 0 0;
-  color: var(--color-ink-muted);
-  font-variant-numeric: tabular-nums;
-}
-
+/* Pomodoro plan row: [4] × [25] min + [5] min break */
 .plan {
   display: flex;
   flex-wrap: wrap;
@@ -220,7 +203,7 @@
 
 .stepper__btn:hover:not(:disabled) {
   color: var(--color-ink);
-  background: color-mix(in srgb, var(--color-sun) 22%, transparent);
+  background: var(--color-hover);
 }
 
 .stepper__btn:disabled {
@@ -234,8 +217,9 @@
 }
 
 .stepper__input {
-  width: 2.4em;
+  width: 2em;
   font: inherit;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--color-ink);
   text-align: center;
@@ -246,7 +230,7 @@
 
 .stepper__input:focus {
   outline: none;
-  background: color-mix(in srgb, var(--color-sun) 14%, transparent);
+  background: var(--color-sun-tint);
 }
 
 .plan--large {

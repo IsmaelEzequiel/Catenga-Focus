@@ -1,8 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowsPointingInIcon, ForwardIcon, PlayIcon, StopIcon } from "@heroicons/react/20/solid";
+import {
+  ArrowsPointingInIcon,
+  ForwardIcon,
+  PlayIcon,
+  StopIcon,
+} from "@heroicons/react/20/solid";
 import type { PomodoroPlan, TimerMode, TimerStatus } from "../api";
 import type { Conflict, SaveState, UiBlock } from "../hooks/useDay";
-import { cycleDots, digitDiff, finishedMessage, ringProgress } from "../lib/focus";
+import {
+  cycleDots,
+  digitDiff,
+  finishedMessage,
+  ringProgress,
+} from "../lib/focus";
 import { bodyToNote } from "../lib/note";
 import { tagColorVar } from "../lib/tags";
 import { fmtMinutes } from "../lib/time";
@@ -10,6 +20,7 @@ import { sameBlock } from "../lib/timer";
 import { NoteEditor } from "./NotesPanel";
 import { PlanRow } from "./PlanRow";
 import { timerReadout } from "./TimerBar";
+import { Button } from "./ui/Button";
 import "../focus.css";
 
 const LEAVE_MS = 250;
@@ -17,7 +28,8 @@ const LEAVE_MS = 250;
 const IS_MAC = navigator.userAgent.includes("Mac");
 
 const reducedMotion = () =>
-  typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  typeof window.matchMedia === "function" &&
+  window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const SAVE_TEXT: Partial<Record<SaveState, string>> = {
   saving: "Saving…",
@@ -37,8 +49,19 @@ function Ring({ progress, active }: { progress: number; active: boolean }) {
     previous.current = progress;
   });
   return (
-    <svg className={jump ? "ring ring--jump" : "ring"} viewBox="0 0 200 200" aria-hidden="true">
-      <circle className="ring__ticks" cx="100" cy="100" r="82" strokeDasharray={`1 ${(2 * Math.PI * 82) / 60 - 1}`} />
+    <svg
+      className={jump ? "ring ring--jump" : "ring"}
+      viewBox="0 0 200 200"
+      aria-hidden="true"
+    >
+      <circle className="ring__disc" cx="100" cy="100" r={R - 4} />
+      <circle
+        className="ring__ticks"
+        cx="100"
+        cy="100"
+        r="82"
+        strokeDasharray={`1 ${(2 * Math.PI * 82) / 4 - 1}`}
+      />
       <circle className="ring__track" cx="100" cy="100" r={R} />
       <circle
         className="ring__arc"
@@ -49,7 +72,10 @@ function Ring({ progress, active }: { progress: number; active: boolean }) {
         strokeDashoffset={CIRCUMFERENCE * (1 - progress)}
       />
       {active && (
-        <g className="ring__tip" style={{ transform: `rotate(${progress * 360}deg)` }}>
+        <g
+          className="ring__tip"
+          style={{ transform: `rotate(${progress * 360}deg)` }}
+        >
           <circle cx="100" cy="8" r="5" />
         </g>
       )}
@@ -67,7 +93,10 @@ function Digits({ value }: { value: string }) {
   return (
     <span className="digits" aria-hidden="true">
       {[...value].map((ch, i) => (
-        <span key={`${i}:${ch}`} className={`digits__cell${ch === ":" ? " digits__cell--colon" : ""}${changed[i] ? " digits__cell--tick" : ""}`}>
+        <span
+          key={`${i}:${ch}`}
+          className={`digits__cell${ch === ":" ? " digits__cell--colon" : ""}${changed[i] ? " digits__cell--tick" : ""}`}
+        >
           {ch}
         </span>
       ))}
@@ -76,7 +105,8 @@ function Digits({ value }: { value: string }) {
 }
 
 /** Width of the readout in em, to size the digits so they always fit inside the ring. */
-const widthEm = (value: string) => [...value].reduce((sum, ch) => sum + (ch === ":" ? 0.3 : 0.6), 0);
+const widthEm = (value: string) =>
+  [...value].reduce((sum, ch) => sum + (ch === ":" ? 0.3 : 0.6), 0);
 
 interface Props {
   block: UiBlock;
@@ -112,6 +142,7 @@ interface Props {
 export function FocusScreen(p: Props) {
   const { block, status } = p;
   const [leaving, setLeaving] = useState(false);
+  const [editingPlan, setEditingPlan] = useState(false);
   const leavingRef = useRef(false);
   const flushRef = useRef(p.onFlush);
   flushRef.current = p.onFlush;
@@ -149,21 +180,38 @@ export function FocusScreen(p: Props) {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, []);
 
-  const mine = status.state === "running" && status.date === p.date && sameBlock(status.block, block);
+  const mine =
+    status.state === "running" &&
+    status.date === p.date &&
+    sameBlock(status.block, block);
   const live = mine && status.state === "running" ? status : null;
   const readout = live ? timerReadout(live, p.nowMs) : null;
   const pomodoro = live ? live.mode === "pomodoro" : p.mode === "pomodoro";
   const inBreak = live?.phase === "break";
-  const idleTime = pomodoro ? `${String(p.plan.focusMinutes).padStart(2, "0")}:00` : "0:00:00";
+  const idleTime = pomodoro
+    ? `${String(p.plan.focusMinutes).padStart(2, "0")}:00`
+    : "0:00:00";
   const time = readout?.time ?? idleTime;
   const done = !live && p.finished ? finishedMessage(p.finished.cycles) : null;
-  const label = done ?? (live ? (pomodoro ? (inBreak ? "Break" : "Focus") : "Tracking") : "Ready");
-  const dots = live ? cycleDots(live) : pomodoro ? cycleDots({ state: "idle" }, p.plan.cycles) : [];
+  const phase = live && pomodoro ? (inBreak ? "Break" : "Focus") : null;
+  const label =
+    done ??
+    (live
+      ? phase
+        ? live.cycle !== null && live.cycles !== null
+          ? `${phase} ${live.cycle} of ${live.cycles}`
+          : phase
+        : "Tracking"
+      : "Ready");
+  const dots = live
+    ? cycleDots(live)
+    : pomodoro
+      ? cycleDots({ state: "idle" }, p.plan.cycles)
+      : [];
   const state = live ? (inBreak ? "break" : "run") : "idle";
   const em = widthEm(time);
   const canStart = p.isToday;
-  const saveText =
-    p.saveState === "error" ? null : SAVE_TEXT[p.saveState];
+  const saveText = p.saveState === "error" ? null : SAVE_TEXT[p.saveState];
 
   return (
     <div
@@ -172,8 +220,16 @@ export function FocusScreen(p: Props) {
       aria-modal="true"
       aria-label="Focus screen"
     >
-      <button className="focus__close" aria-label="Leave the focus screen" title={`Leave (Esc, ${IS_MAC ? "⌘" : "Ctrl+"}⇧F)`} onClick={() => requestExit.current()}>
-        <ArrowsPointingInIcon className="focus__close-icon" aria-hidden="true" />
+      <button
+        className="focus__close"
+        aria-label="Leave the focus screen"
+        title={`Leave (Esc, ${IS_MAC ? "⌘" : "Ctrl+"}⇧F)`}
+        onClick={() => requestExit.current()}
+      >
+        <ArrowsPointingInIcon
+          className="focus__close-icon"
+          aria-hidden="true"
+        />
       </button>
       {p.banner && (
         <div className="focus__toast" role="alert">
@@ -183,8 +239,8 @@ export function FocusScreen(p: Props) {
           </button>
         </div>
       )}
-      <div className="focus__scroll">
-        <div className="focus__column">
+      <div className="focus__layout">
+        <div className="focus__main">
           <header className="focus__head focus__rise">
             <h1 className="focus__title">{block.title || "Untitled"}</h1>
             <p className="focus__meta">
@@ -193,7 +249,14 @@ export function FocusScreen(p: Props) {
               </span>
               {block.tags.map((tag) => (
                 <span key={tag} className="focus__tag">
-                  <span className="focus__tag-dot" style={{ background: tagColorVar([tag], p.tagColors) ?? "var(--color-line)" }} />#{tag}
+                  <span
+                    className="focus__tag-dot"
+                    style={{
+                      background:
+                        tagColorVar([tag], p.tagColors) ?? "var(--color-line)",
+                    }}
+                  />
+                  #{tag}
                 </span>
               ))}
             </p>
@@ -201,17 +264,44 @@ export function FocusScreen(p: Props) {
 
           <section className="focus__stage focus__rise" aria-label="Timer">
             <div className="focus__ring">
-              <span className="focus__glow" aria-hidden="true" />
-              {done && <span key={p.finished?.id} className="focus__burst" aria-hidden="true" />}
-              <Ring progress={live ? ringProgress(live, p.nowMs) : 0} active={live !== null} />
-              <div className="focus__inner" style={{ ["--em" as string]: String(Math.min(0.3, 0.76 / em)) }}>
-                <span key={label} className={done ? "focus__label focus__label--done" : "focus__label"}>
+              {done && (
+                <span
+                  key={p.finished?.id}
+                  className="focus__burst"
+                  aria-hidden="true"
+                />
+              )}
+              <Ring
+                progress={live ? ringProgress(live, p.nowMs) : 0}
+                active={live !== null}
+              />
+              <div
+                className="focus__inner"
+                style={{ ["--em" as string]: String(Math.min(0.3, 0.76 / em)) }}
+              >
+                <span
+                  key={label}
+                  className={
+                    done ? "focus__label focus__label--done" : "focus__label"
+                  }
+                >
                   {label}
                 </span>
-                <span className={live ? "focus__clock" : "focus__clock focus__clock--idle"} role="timer" aria-label={`Timer ${time}`}>
+                <span
+                  className="focus__clock"
+                  role="timer"
+                  aria-label={`Timer ${time}`}
+                >
                   <Digits value={time} />
                 </span>
-                <span className="focus__dots" aria-label={live && live.cycle !== null ? `Pomodoro ${live.cycle} of ${live.cycles}` : undefined}>
+                <span
+                  className="focus__dots"
+                  aria-label={
+                    live && live.cycle !== null
+                      ? `Pomodoro ${live.cycle} of ${live.cycles}`
+                      : undefined
+                  }
+                >
                   {dots.map((d, i) => (
                     <span key={i} className={`dot dot--${d}`} />
                   ))}
@@ -220,89 +310,154 @@ export function FocusScreen(p: Props) {
             </div>
 
             <div className="focus__controls" key={state}>
-              {!live && (
-                <>
-                  <div className="focus__modes" role="group" aria-label="Timer mode">
-                    {(["free", "pomodoro"] as const).map((m) => (
-                      <button key={m} className={p.mode === m ? "focus__mode focus__mode--on" : "focus__mode"} aria-pressed={p.mode === m} onClick={() => p.onMode(m)}>
-                        {m === "free" ? "Free" : "Pomodoro"}
+              {!live &&
+                (p.mode === "pomodoro" ? (
+                  editingPlan ? (
+                    <div
+                      className="focus__plan-edit"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === "Escape") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setEditingPlan(false);
+                        }
+                      }}
+                      onBlur={(e) => {
+                        if (
+                          !e.currentTarget.contains(
+                            e.relatedTarget as Node | null,
+                          )
+                        )
+                          setEditingPlan(false);
+                      }}
+                    >
+                      <PlanRow
+                        plan={p.plan}
+                        onChange={p.onPlan}
+                        large
+                        autoFocus
+                      />
+                    </div>
+                  ) : (
+                    <p className="focus__plan">
+                      <span>
+                        Pomodoro · {p.plan.cycles} × {p.plan.focusMinutes} +{" "}
+                        {p.plan.breakMinutes}
+                      </span>
+                      <button
+                        type="button"
+                        className="focus__textbtn"
+                        onClick={() => setEditingPlan(true)}
+                      >
+                        Edit plan
                       </button>
-                    ))}
-                  </div>
-                  {p.mode === "pomodoro" && <PlanRow plan={p.plan} onChange={p.onPlan} large />}
-                </>
-              )}
-              {live && pomodoro && live.cycle !== null && (
-                <p className="focus__cycle">
-                  {inBreak ? "Break" : "Focus"} {live.cycle} of {live.cycles}
-                </p>
-              )}
+                      <button
+                        type="button"
+                        className="focus__textbtn"
+                        onClick={() => p.onMode("free")}
+                      >
+                        Switch to free
+                      </button>
+                    </p>
+                  )
+                ) : (
+                  <p className="focus__plan">
+                    <span>Free-running</span>
+                    <button
+                      type="button"
+                      className="focus__textbtn"
+                      onClick={() => p.onMode("pomodoro")}
+                    >
+                      Switch to Pomodoro
+                    </button>
+                  </p>
+                ))}
               <div className="focus__buttons">
                 {live ? (
                   <>
                     {inBreak && (
-                      <button className="pill" onClick={p.onSkipBreak}>
-                        <ForwardIcon className="pill__icon" aria-hidden="true" />
+                      <Button
+                        size="lg"
+                        icon={ForwardIcon}
+                        onClick={p.onSkipBreak}
+                      >
                         Skip break
-                      </button>
+                      </Button>
                     )}
-                    <button className="pill pill--stop" onClick={p.onStop}>
-                      <StopIcon className="pill__icon" aria-hidden="true" />
+                    <Button size="lg" icon={StopIcon} onClick={p.onStop}>
                       Stop
-                    </button>
+                    </Button>
                   </>
                 ) : (
-                  <button className="pill pill--start" disabled={!canStart} onClick={p.onStart}>
-                    <PlayIcon className="pill__icon" aria-hidden="true" />
+                  <Button
+                    variant="primary"
+                    size="lg"
+                    icon={PlayIcon}
+                    disabled={!canStart}
+                    onClick={p.onStart}
+                  >
                     Start
-                  </button>
+                  </Button>
                 )}
               </div>
-              {!live && !canStart && <p className="focus__hint">Timers run on today's blocks.</p>}
+              {!live && !canStart && (
+                <p className="focus__hint">Timers run on today's blocks.</p>
+              )}
             </div>
-          </section>
-
-          <section className="focus__card focus__rise" aria-label="Note">
-            <div className="focus__card-top">
-              <span className="focus__status" role="status" aria-live="polite">
-                {p.saveState === "error" ? (
-                  <>
-                    Not saved ·{" "}
-                    <button className="focus__link" onClick={p.onRetry}>
-                      Retry
-                    </button>
-                  </>
-                ) : (
-                  <span key={p.saveState} className={p.saveState === "saved" ? "focus__saved" : undefined}>
-                    {saveText}
-                  </span>
-                )}
-              </span>
-            </div>
-            {p.conflict && (
-              <div className="focus__conflict" role="alert">
-                <span>This note changed on disk.</span>
-                <span className="focus__conflict-actions">
-                  <button className="focus__toast-btn" onClick={() => p.onResolve(block.key, "mine")}>
-                    Keep mine
-                  </button>
-                  <button className="focus__toast-btn" onClick={() => p.onResolve(block.key, "file")}>
-                    Use file's
-                  </button>
-                </span>
-              </div>
-            )}
-            <NoteEditor
-              key={`${block.key}:${p.noteVersion}`}
-              initial={bodyToNote(p.conflict ? p.conflict.mine.body : block.body)}
-              focusToken={0}
-              onChange={(text) => p.onNote(block.key, text)}
-              onBlur={p.onFlush}
-              className="focus__editor"
-              autoGrow
-            />
           </section>
         </div>
+
+        <section className="focus__card focus__rise" aria-label="Note">
+          <div className="focus__card-top">
+            <span className="focus__status" role="status" aria-live="polite">
+              {p.saveState === "error" ? (
+                <>
+                  Not saved ·{" "}
+                  <button className="focus__link" onClick={p.onRetry}>
+                    Retry
+                  </button>
+                </>
+              ) : (
+                <span
+                  key={p.saveState}
+                  className={
+                    p.saveState === "saved" ? "focus__saved" : undefined
+                  }
+                >
+                  {saveText}
+                </span>
+              )}
+            </span>
+          </div>
+          {p.conflict && (
+            <div className="focus__conflict" role="alert">
+              <span>This note changed on disk.</span>
+              <span className="focus__conflict-actions">
+                <button
+                  className="focus__toast-btn"
+                  onClick={() => p.onResolve(block.key, "mine")}
+                >
+                  Keep mine
+                </button>
+                <button
+                  className="focus__toast-btn"
+                  onClick={() => p.onResolve(block.key, "file")}
+                >
+                  Use file's
+                </button>
+              </span>
+            </div>
+          )}
+          <NoteEditor
+            key={`${block.key}:${p.noteVersion}`}
+            initial={bodyToNote(p.conflict ? p.conflict.mine.body : block.body)}
+            focusToken={0}
+            onChange={(text) => p.onNote(block.key, text)}
+            onBlur={p.onFlush}
+            className="focus__editor"
+            autoGrow
+          />
+        </section>
       </div>
     </div>
   );

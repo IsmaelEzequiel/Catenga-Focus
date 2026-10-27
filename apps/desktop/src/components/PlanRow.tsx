@@ -5,6 +5,7 @@ import { PLAN_LIMITS, parseCount } from "../lib/focus";
 
 interface StepperProps {
   label: string;
+  autoFocus?: boolean;
   value: number;
   min: number;
   max: number;
@@ -12,7 +13,7 @@ interface StepperProps {
 }
 
 /** − [n] +, typable; the typed text is only normalised on blur so partial input isn't fought. */
-function Stepper({ label, value, min, max, onChange }: StepperProps) {
+function Stepper({ label, autoFocus, value, min, max, onChange }: StepperProps) {
   const [draft, setDraft] = useState<string | null>(null);
   const clamp = (n: number) => Math.min(max, Math.max(min, n));
   const commit = (text: string) => {
@@ -28,6 +29,7 @@ function Stepper({ label, value, min, max, onChange }: StepperProps) {
         className="stepper__input"
         inputMode="numeric"
         aria-label={label}
+        autoFocus={autoFocus}
         value={draft ?? String(value)}
         onChange={(e) => {
           setDraft(e.target.value);
@@ -55,13 +57,15 @@ interface Props {
   onChange: (plan: PomodoroPlan) => void;
   /** Larger type, for the focus screen. */
   large?: boolean;
+  /** Puts the cursor in the first stepper (the timer card's inline "Edit plan"). */
+  autoFocus?: boolean;
 }
 
-/** `[4] × [25] min focus · [5] min break` */
-export function PlanRow({ plan, onChange, large }: Props) {
+/** `[4] × [25] min + [5] min break` */
+export function PlanRow({ plan, onChange, large, autoFocus }: Props) {
   return (
     <div className={large ? "plan plan--large" : "plan"} aria-label="Pomodoro plan">
-      <Stepper label="pomodoros" value={plan.cycles} {...PLAN_LIMITS.cycles} onChange={(cycles) => onChange({ ...plan, cycles })} />
+      <Stepper label="pomodoros" autoFocus={autoFocus} value={plan.cycles} {...PLAN_LIMITS.cycles} onChange={(cycles) => onChange({ ...plan, cycles })} />
       <span className="plan__text">×</span>
       <Stepper
         label="focus minutes"
@@ -69,7 +73,7 @@ export function PlanRow({ plan, onChange, large }: Props) {
         {...PLAN_LIMITS.focusMinutes}
         onChange={(focusMinutes) => onChange({ ...plan, focusMinutes })}
       />
-      <span className="plan__text">min focus ·</span>
+      <span className="plan__text">min +</span>
       <Stepper
         label="break minutes"
         value={plan.breakMinutes}

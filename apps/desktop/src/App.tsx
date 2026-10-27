@@ -1,19 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChartBarIcon, CheckCircleIcon, ChevronLeftIcon, ChevronRightIcon, Cog6ToothIcon, FlagIcon, PlayIcon, PlusIcon } from "@heroicons/react/20/solid";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { appCancelQuit, appExit, appHide, appRestart, appShow, setNotesDir, loadConfig, onOpenBlock, onQuitRequested, onStartNow, onTagsChanged, timerRelink, type GoalProgress, type HistoryEntry, type HistoryKind, type SearchHit } from "./api";
 import { CommandPalette } from "./components/CommandPalette";
 import { DashboardView } from "./components/DashboardView";
 import { DayView } from "./components/DayView";
 import { FocusScreen } from "./components/FocusScreen";
+import { Header, type Page } from "./components/Header";
 import { GoalsView } from "./components/GoalsView";
 import { HistoryView } from "./components/HistoryView";
 import { NotesPanel } from "./components/NotesPanel";
 import { RecapView } from "./components/RecapView";
 import { QuickAdd } from "./components/QuickAdd";
 import { ShortcutsHelp } from "./components/ShortcutsHelp";
-import { TimerChip } from "./components/TimerChip";
 import { Settings } from "./components/Settings";
+import { timerReadout } from "./components/TimerBar";
+import { Banner } from "./components/ui/Banner";
+import { Button } from "./components/ui/Button";
 import { useAccount } from "./hooks/useAccount";
 import { useSync } from "./hooks/useSync";
 import { useCalendar } from "./hooks/useCalendar";
@@ -38,7 +40,7 @@ import type { QuickAdd as QuickAddBlock } from "./lib/quickAdd";
 import { blockProject, blockProjectKey, canMakeProject } from "./lib/projects";
 import { resolveBlockKey, type BlockTarget } from "./lib/search";
 import { sameBlock, sessionRelinks, toBlockRef } from "./lib/timer";
-import { addDays, fmtDateLabel, fmtMinutes, toDateString } from "./lib/time";
+import { addDays, fmtMinutes, toDateString } from "./lib/time";
 
 const IS_MAC = navigator.userAgent.includes("Mac");
 
@@ -63,6 +65,8 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [quickAddOpen, setQuickAddOpen] = useState(false);
+  /** The slot quick-add's text parses to, drawn as a ghost on the grid. */
+  const [quickPreview, setQuickPreview] = useState<{ start: number; end: number } | null>(null);
   const account = useAccount();
   const sync = useSync(account.state);
   const google = useGoogle();
@@ -215,7 +219,17 @@ function App() {
   }, []);
   const openDashboard = useCallback(() => openPage("dashboard"), [openPage]);
   const openGoals = useCallback(() => openPage("goals"), [openPage]);
-  const openRecap = useCallback(() => openPage("recap"), [openPage]);
+  const navigate = useCallback(
+    (page: Page) => {
+      if (page === "day") setView(DAY_VIEW);
+      else void openPage(page);
+    },
+    [openPage],
+  );
+  const openSearch = useCallback(() => {
+    dayRef.current.flush();
+    setPaletteOpen(true);
+  }, []);
 
   useEffect(() => {
     if (!pending || pending.date !== date) return;
@@ -521,14 +535,32 @@ function App() {
     void timerRef.current.start(date, toBlockRef(block, project), setup.mode, plan);
   }, [startReq, date, day.loaded, day.blocks, calendar.loaded, calendar.events]);
 
-  /** The header button's target: today's current block/event, else the next one. */
-  const startTarget = useMemo(() => {
-    if (running || date !== toDateString(now) || !day.loaded) return null;
-    const target = startNowTarget(day.blocks, calendar.events, now.getHours() * 60 + now.getMinutes());
+  /** Today's current block/event, else the next one: the header's Start target and the empty notes panel's pointer. */
+  const nowItem = useMemo(() => {
+    if (date !== toDateString(now) || !day.loaded) return null;
+    const minute = now.getHours() * 60 + now.getMinutes();
+    const target = startNowTarget(day.blocks, calendar.events, minute);
     if (!target) return null;
     const item = target.kind === "block" ? day.blocks.find((b) => b.key === target.key) : target.event;
-    return item ? { title: item.title.trim() || "Untitled", start: item.start, end: item.end } : null;
-  }, [running, date, now, day.loaded, day.blocks, calendar.events]);
+    return item ? { target, title: item.title.trim() || "Untitled", start: item.start, end: item.end, upcoming: item.start > minute } : null;
+  }, [date, now, day.loaded, day.blocks, calendar.events]);
+  const startTarget = running ? null : nowItem;
+
+  /** Empty notes panel / Enter with nothing selected: opens the note of what's happening now (an event becomes its block). */
+  const openNow = () => {
+    if (!nowItem || !day.loaded) return;
+    const { target } = nowItem;
+    let key: string;
+    if (target.kind === "block") {
+      key = target.key;
+    } else {
+      // Same as clicking a ghost: the block takes the existing event, so no new Google event is made.
+      key = crypto.randomUUID();
+      commitBlocks([...day.blocks, { key, start: target.event.start, end: target.event.end, title: target.event.title, tags: [], body: "" }]);
+    }
+    onSelect(key, { focusNote: true });
+    setReveal((r) => ({ minute: nowItem.start, token: (r?.token ?? 0) + 1 }));
+  };
 
   useEffect(() => {
     if (!playReq || playReq.date !== date || !day.loaded || !calendar.loaded || relinkPending.current > 0) return;
@@ -640,6 +672,7 @@ function App() {
     },
     openNote: () => {
       if (selectedBlock && day.loaded) onSelect(selectedBlock.key, { focusNote: true });
+      else if (!selectedBlock) openNow();
     },
     toggleTimer,
     prevBlock: () => stepSelection(-1),
@@ -695,99 +728,69 @@ function App() {
 
   return (
     <div className="app">
-      <header className="app__header" inert={focusOpen}>
-        <h1 className="app__brand">
-          <img src="/mark.svg" width={24} height={24} alt="" />
-          <span>
-            <b>Catenga</b> Focus
-          </span>
-        </h1>
-        <div className="app__nav">
-          <button className="app__btn" aria-label="Previous day" onClick={() => goTo((d) => addDays(d, -1))}>
-            <ChevronLeftIcon className="app__icon" aria-hidden="true" />
-          </button>
-          <button className="app__btn" onClick={() => goTo(() => toDateString(new Date()))}>
-            Today
-          </button>
-          <button className="app__btn" aria-label="Next day" onClick={() => goTo((d) => addDays(d, 1))}>
-            <ChevronRightIcon className="app__icon" aria-hidden="true" />
-          </button>
-        </div>
-        <span className="app__date">{fmtDateLabel(date)}</span>
-        <button className="app__btn" aria-label="Quick-add a block" title={`Quick-add (N, ${IS_MAC ? "⌘" : "Ctrl+"}N)`} onClick={openQuickAdd}>
-          <PlusIcon className="app__icon" aria-hidden="true" />
-          Add
-        </button>
-        {startTarget && (
-          <button
-            className="app__btn app__btn--start"
-            title={`Start now: ${startTarget.title}, ${fmtMinutes(startTarget.start)}–${fmtMinutes(startTarget.end)}`}
-            onClick={startNow}
-          >
-            <PlayIcon className="app__icon" aria-hidden="true" />
-            Start now
-          </button>
-        )}
-        <TimerChip status={timer.status} nowMs={timer.nowMs} onOpen={openTimerBlock} onStop={timer.stop} onFocus={enterFocus} />
-        <button className="app__btn" aria-label="Done" title="What got done on this day" onClick={() => void openRecap()}>
-          <CheckCircleIcon className="app__icon" aria-hidden="true" />
-          Done
-        </button>
-        <button className="app__btn" aria-label="Goals" title="Goals" onClick={() => void openGoals()}>
-          <FlagIcon className="app__icon" aria-hidden="true" />
-          Goals
-        </button>
-        <button className="app__btn" aria-label="Dashboard" title="Dashboard" onClick={() => void openDashboard()}>
-          <ChartBarIcon className="app__icon" aria-hidden="true" />
-          Dashboard
-        </button>
-        <button className="app__btn app__gear" aria-label="Settings" onClick={() => setSettingsOpen(true)}>
-          <Cog6ToothIcon className="app__icon" aria-hidden="true" />
-        </button>
-      </header>
+      <Header
+        inert={focusOpen}
+        page={view.kind === "history" ? null : view.kind}
+        date={date}
+        today={toDateString(now)}
+        startTarget={startTarget}
+        nothingToStart={!running && date === toDateString(now) && day.loaded && startTarget === null}
+        status={timer.status}
+        nowMs={timer.nowMs}
+        tagColors={tagColors}
+        onPrevDay={() => goTo((d) => addDays(d, -1))}
+        onNextDay={() => goTo((d) => addDays(d, 1))}
+        onToday={() => goTo(() => toDateString(new Date()))}
+        onStartNow={startNow}
+        onOpenTimer={openTimerBlock}
+        onStopTimer={timer.stop}
+        onNav={navigate}
+        onQuickAdd={openQuickAdd}
+        onSearch={openSearch}
+        onSettings={() => setSettingsOpen(true)}
+      />
       {banner && (
-        <div className="app__banner" role="alert">
-          <span>{banner}</span>
-          <button className="app__btn" onClick={dismiss}>
-            Dismiss
-          </button>
-        </div>
+        <Banner onDismiss={dismiss}>{banner}</Banner>
       )}
       {recoveryBanner && (
-        <div className="app__banner" role="alert">
-          <span>{recoveryBanner}</span>
-          <span className="banner__actions">
-            {recoveryTarget && (
-              <button className="app__btn" onClick={() => goTo(() => recoveryTarget)}>
-                Open day
-              </button>
-            )}
-            <button className="app__btn" onClick={retryRecovery}>
-              Retry
-            </button>
-          </span>
-        </div>
+        <Banner
+          actions={
+            <>
+              {recoveryTarget && (
+                <Button size="sm" onClick={() => goTo(() => recoveryTarget)}>
+                  Open day
+                </Button>
+              )}
+              <Button size="sm" onClick={retryRecovery}>
+                Try again
+              </Button>
+            </>
+          }
+        >
+          {recoveryBanner}
+        </Banner>
       )}
       {stale && (
-        <div className="app__banner app__banner--timer" role="alert">
-          <span>
-            A timer was running when Catenga Focus closed ({stale.block.title || "Untitled"}, since {staleTime(stale.sessionStart)}).
-          </span>
-          <span className="banner__actions">
-            <button className="app__btn" onClick={() => timer.resolveStale(false)}>
-              Stop at {staleTime(stale.lastSeen)}
-            </button>
-            <button className="app__btn" onClick={() => timer.resolveStale(true)}>
-              Keep running
-            </button>
-          </span>
-        </div>
+        <Banner
+          tone="timer"
+          actions={
+            <>
+              <Button size="sm" onClick={() => timer.resolveStale(false)}>
+                Stop at {staleTime(stale.lastSeen)}
+              </Button>
+              <Button size="sm" onClick={() => timer.resolveStale(true)}>
+                Keep running
+              </Button>
+            </>
+          }
+        >
+          A timer was running when Catenga Focus closed ({stale.block.title || "Untitled"}, since {staleTime(stale.sessionStart)}).
+        </Banner>
       )}
       <div className="app__main" inert={focusOpen}>
         {view.kind === "dashboard" ? (
           <DashboardView
             tagColors={tagColors}
-            onBack={() => setView(DAY_VIEW)}
             onOpenDay={(d) => goTo(() => d)}
             onOpenHistory={openHistory}
           />
@@ -796,7 +799,6 @@ function App() {
             projects={projects}
             google={google.status}
             onConnect={google.connect}
-            onBack={() => setView(DAY_VIEW)}
             timerStatus={timer.status}
             nowMs={timer.nowMs}
             onPlay={playGoal}
@@ -811,7 +813,6 @@ function App() {
             status={timer.status}
             nowMs={timer.nowMs}
             tagColors={tagColors}
-            onBack={() => setView(DAY_VIEW)}
             onOpenBlock={(b) => void openBlock({ date, start: b.start, end: b.end, title: b.title, ord: -1 })}
           />
         ) : view.kind === "history" ? (
@@ -838,10 +839,20 @@ function App() {
               runningStart={runningStart}
               renameToken={renameToken}
               clockMs={timer.nowMs}
+              preview={quickAddOpen ? quickPreview : null}
+              liveTime={running && running.date === date ? timerReadout(running, timer.nowMs).time : null}
               shortcutsOff={focusOpen || settingsOpen || helpOpen}
               top={
                 quickAddOpen ? (
-                  <QuickAdd date={date} isToday={date === toDateString(now)} loaded={day.loaded} onAdd={addQuickBlock} onClose={() => setQuickAddOpen(false)} />
+                  <QuickAdd
+                    date={date}
+                    isToday={date === toDateString(now)}
+                    loaded={day.loaded}
+                    knownTags={Object.keys(tagColors)}
+                    onPreview={setQuickPreview}
+                    onAdd={addQuickBlock}
+                    onClose={() => setQuickAddOpen(false)}
+                  />
                 ) : undefined
               }
               dragActive={dragActive}
@@ -892,6 +903,10 @@ function App() {
                   onFocus: enterFocus,
                   onDeleteSession: sessions.remove,
                 }}
+                tagColors={tagColors}
+                fromCalendar={selectedEvent !== undefined}
+                nowTarget={nowItem}
+                onOpenNow={openNow}
                 project={{
                   connected: google.status?.connected ?? false,
                   current: selectedBlock ? blockProject(selectedBlock.key, matched, projects.list) : null,

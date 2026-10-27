@@ -3,7 +3,7 @@ import type { BlockRef, CalEvent, Session } from "../api";
 import type { UiBlock } from "../hooks/useDay";
 import { blockDeletePlan, ghostEvents, isSeriesInstance, matchBlocks } from "../lib/calendar";
 import { layoutLanes } from "../lib/layout";
-import { blockHasSessions, sameBlock, sessionBars } from "../lib/timer";
+import { blockHasSessions, blockTotalMinutes, sameBlock, sessionBars, sessionsForBlock } from "../lib/timer";
 import { parseTitleInput, tagColorVar } from "../lib/tags";
 import {
   DAY_MINUTES,
@@ -21,12 +21,12 @@ import {
 import { blockMenu, ghostMenu } from "../lib/contextMenu";
 import { popupMenu } from "../lib/nativeMenu";
 import { TimelineBlock } from "./TimelineBlock";
+import { Button } from "./ui/Button";
 import "../day.css";
 import "../timer.css";
 
 const DRAG_THRESHOLD_PX = 4;
 const HOURS = Array.from({ length: 24 }, (_, h) => h);
-const QUARTERS = Array.from({ length: 96 }, (_, q) => q);
 
 type DragMode = "create" | "move" | "resize-start" | "resize-end";
 
@@ -50,6 +50,10 @@ interface Props {
   runningStart: string | null;
   /** Wall clock (ms) ticking every second while a timer runs, to grow the running session. */
   clockMs: number;
+  /** The running timer's reading for the live pill on its block. */
+  liveTime: string | null;
+  /** Quick-add's parsed slot, shown as a ghost block. */
+  preview?: Range | null;
   /** True while the focus screen covers the app: Enter/Delete must not touch blocks. */
   shortcutsOff?: boolean;
   /** Set while a pointer drag is active so global shortcuts can stand down. */
@@ -82,7 +86,7 @@ type Ask =
 const isTypingTarget = (t: EventTarget | null) =>
   t instanceof HTMLElement && (t.closest("input, textarea, select, [contenteditable]") !== null);
 
-export function DayView({ date, blocks, events, loaded, tagColors, now, sessions, timing, runningStart, clockMs, shortcutsOff, dragActive, selected, renameToken, reveal, onSelect, onCommit, onNotice, canDeleteEvents, onDeleteEvent, onStartTimer, onStopTimer, top }: Props) {
+export function DayView({ date, blocks, events, loaded, tagColors, now, sessions, timing, runningStart, clockMs, liveTime, preview, shortcutsOff, dragActive, selected, renameToken, reveal, onSelect, onCommit, onNotice, canDeleteEvents, onDeleteEvent, onStartTimer, onStopTimer, top }: Props) {
   const scroller = useRef<HTMLDivElement>(null);
   const grid = useRef<HTMLDivElement>(null);
   const [editing, setEditing] = useState<string | null>(null);
@@ -354,12 +358,12 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
             {text.hint && <span className="dayask__hint">{text.hint}</span>}
           </span>
           <span className="dayask__actions">
-            <button className="app__btn dayask__danger" disabled={asking} onClick={() => void confirmAsk(ask.kind === "both")}>
+            <Button size="sm" variant="danger" disabled={asking} onClick={() => void confirmAsk(ask.kind === "both")}>
               {ask.kind === "both" ? "Delete both" : ask.kind === "refused" ? "Delete the event from Google Calendar" : "Delete"}
-            </button>
+            </Button>
             {ask.kind === "both" && (
-              <button
-                className="app__btn"
+              <Button
+                size="sm"
                 disabled={asking}
                 onClick={() => {
                   const key = ask.key;
@@ -369,11 +373,11 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
                 }}
               >
                 Only the block
-              </button>
+              </Button>
             )}
-            <button className="app__btn" disabled={asking} onClick={() => setAsk(null)}>
+            <Button size="sm" variant="ghost" disabled={asking} onClick={() => setAsk(null)}>
               Cancel
-            </button>
+            </Button>
           </span>
         </div>
       )}
@@ -386,8 +390,12 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
           startDrag(e, "create", "new");
         }}
       >
-        {QUARTERS.map((q) => (
-          <div key={q} className={q % 4 === 0 ? "day__line day__line--hour" : "day__line"} style={{ top: q * 15 * PX_PER_MIN }} />
+        {/* Hour lines and a faint half-hour line; the 15-min snap is math, not markup. */}
+        {HOURS.map((h) => (
+          <div key={h} className="day__line" style={{ top: h * PX_PER_HOUR }} />
+        ))}
+        {HOURS.map((h) => (
+          <div key={`half-${h}`} className="day__line day__line--half" style={{ top: h * PX_PER_HOUR + PX_PER_HOUR / 2 }} />
         ))}
         {HOURS.map((h) => (
           <span key={h} className="day__label" style={{ top: h * PX_PER_HOUR }}>
@@ -413,6 +421,9 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
               lanes={lanes[i].lanes}
               selected={selected === b.key}
               timing={timing !== null && sameBlock(timing, b)}
+              live={timing !== null && sameBlock(timing, b) ? liveTime : null}
+              logged={blockTotalMinutes(sessionsForBlock(sessions, b).filter((s) => s.end !== null))}
+              done={b.body.trim() !== "" || blockHasSessions(sessions, b)}
               editing={editing === b.key}
               calendar={matched.has(b.key) ? "synced" : undefined}
               onBodyPointerDown={(e) => startDrag(e, "move", b.key)}
@@ -442,6 +453,9 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
               onEventDelete={canDeleteEvents ? () => setAsk({ kind: "event", event: ev }) : undefined}
             />
           ))}
+          {preview && !draft && (
+            <TimelineBlock start={preview.start} end={preview.end} title="" tags={[]} color={null} lane={0} lanes={1} selected={false} editing={false} ghost />
+          )}
           {draft && draft.key === "new" && (
             <TimelineBlock start={draft.start} end={draft.end} title="" tags={[]} color={null} lane={0} lanes={1} selected={false} editing={false} ghost />
           )}

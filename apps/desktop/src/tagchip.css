@@ -1,0 +1,42 @@
+/* Tag pill: a colour dot + the name in ink (tag colours are fills, never text). */
+.tagchip {
+  height: 22px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  background: none;
+  font: 400 var(--text-xs) var(--font-body);
+  color: var(--color-ink);
+  white-space: nowrap;
+}
+
+button.tagchip {
+  cursor: pointer;
+}
+
+button.tagchip:hover {
+  background: var(--color-hover);
+}
+
+button.tagchip:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.tagchip__dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--tag, var(--color-tag-none));
+}
+
+.tagchip--muted {
+  border-color: transparent;
+  background: var(--color-bg);
+  color: var(--color-ink-muted);
+}

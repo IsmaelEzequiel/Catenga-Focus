@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeftIcon, ChevronRightIcon, FireIcon } from "@heroicons/react/20/solid";
+import { ChevronRightIcon } from "@heroicons/react/20/solid";
 import {
   dashboard,
   onIndexStatus,
@@ -22,6 +22,11 @@ import {
   RANGES,
 } from "../lib/dashboard";
 import { tagColorVar } from "../lib/tags";
+import { Banner } from "./ui/Banner";
+import { Button } from "./ui/Button";
+import { StatTile } from "./ui/StatTile";
+import "../card.css";
+import "../segmented.css";
 import "../dashboard.css";
 
 const RANGE_KEY = "catenga.dashboardRange";
@@ -38,7 +43,6 @@ function loadRange(): DashRange {
 
 interface Props {
   tagColors: Record<string, string>;
-  onBack: () => void;
   onOpenDay: (date: string) => void;
   onOpenHistory: (by: HistoryKind, value: string) => void;
 }
@@ -46,7 +50,7 @@ interface Props {
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 /** Hours per title and tag, streaks and the habit tracker. */
-export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: Props) {
+export function DashboardView({ tagColors, onOpenDay, onOpenHistory }: Props) {
   const [range, setRange] = useState<DashRange>(loadRange);
   const [data, setData] = useState<Dashboard | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -113,16 +117,13 @@ export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: P
       <div className="dash__scroll">
         <div className="dash__inner">
           <header className="dash__header">
-            <button className="app__btn" onClick={onBack}>
-              <ChevronLeftIcon className="app__icon" aria-hidden="true" />
-              Day
-            </button>
             <h2 className="dash__title">Dashboard</h2>
-            <div className="dash__range" role="group" aria-label="Range">
+            <div className="seg" role="group" aria-label="Range">
               {RANGES.map((r) => (
                 <button
                   key={r.value}
-                  className="dash__seg"
+                  type="button"
+                  className="seg__item"
                   aria-pressed={range === r.value}
                   onClick={() => pick(r.value)}
                 >
@@ -136,7 +137,19 @@ export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: P
             {data === null && !error && <span>Loading…</span>}
             {data?.indexing && <span>Indexing… numbers may be incomplete</span>}
           </div>
-          {error && <p className="dash__error">{error}</p>}
+          {error && (
+            <Banner
+              tone="error"
+              variant="inline"
+              actions={
+                <Button size="sm" onClick={() => setTick((t) => t + 1)}>
+                  Try again
+                </Button>
+              }
+            >
+              Couldn't load your stats.
+            </Banner>
+          )}
 
           {data && empty && (
             <div className="dash__empty">
@@ -148,20 +161,18 @@ export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: P
           {data && !empty && (
             <>
               <div className="dash__tiles">
-                <Tile label="Total time" value={fmtDuration(data.totals.minutes)} />
-                <Tile label="Sessions" value={String(data.totals.sessions)} />
-                <Tile label="Active days" value={String(data.totals.activeDays)} />
-                <Tile
-                  label="Current streak"
-                  value={plural(data.totals.currentStreak, "day", "days")}
-                  icon={<FireIcon className="dash__fire" aria-hidden="true" />}
-                  hot={data.totals.currentStreak > 0}
-                />
-                <Tile label="Best streak" value={plural(data.totals.longestStreak, "day", "days")} />
+                <StatTile label="Total time" value={fmtDuration(data.totals.minutes)} />
+                <StatTile label="Sessions" value={String(data.totals.sessions)} />
+                <StatTile label="Active days" value={String(data.totals.activeDays)} />
+                <StatTile label="Current streak" value={plural(data.totals.currentStreak, "day", "days")} />
+                <StatTile label="Best streak" value={plural(data.totals.longestStreak, "day", "days")} />
               </div>
 
-              <section className="dash__card" aria-label="Year">
-                <h3 className="dash__h">Last 12 months</h3>
+              <section className="card dash__card" aria-label="Year">
+                <div className="card__head">
+                  <h3 className="card__title">Last 12 months</h3>
+                </div>
+                <div className="card__body">
                 <div className="heat">
                   <div className="heat__scroll">
                     <div className="heat__grid" style={{ ["--cols" as string]: layout.columns.length }}>
@@ -214,12 +225,16 @@ export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: P
                     </span>
                   </div>
                 </div>
+                </div>
               </section>
 
-              <section className="dash__card" aria-label="Habits">
-                <h3 className="dash__h">
-                  Habits <span className="dash__hint">last 30 days</span>
-                </h3>
+              <section className="card dash__card" aria-label="Habits">
+                <div className="card__head">
+                  <h3 className="card__title">
+                    Habits <span className="dash__hint">last 30 days</span>
+                  </h3>
+                </div>
+                <div className="card__body">
                 {data.habits.length === 0 ? (
                   <p className="dash__none">No habits yet — they appear after a few days of timers or notes.</p>
                 ) : (
@@ -242,9 +257,7 @@ export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: P
                           ))}
                         </span>
                         <span className="habit__streak">
-                          <FireIcon className="habit__fire" data-hot={h.currentStreak > 0} aria-hidden="true" />
-                          <b>{h.currentStreak}</b>
-                          <span className="habit__best">best {h.longestStreak}</span>
+                          <b>{h.currentStreak}</b> · best {h.longestStreak}
                         </span>
                       </li>
                     ))}
@@ -255,10 +268,14 @@ export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: P
                   <i className="habit__cell" data-state="note" /> note only
                   <i className="habit__cell" data-state="none" /> nothing
                 </p>
+                </div>
               </section>
 
-              <section className="dash__card" aria-label="Time by tag">
-                <h3 className="dash__h">Time by tag</h3>
+              <section className="card dash__card" aria-label="Time by tag">
+                <div className="card__head">
+                  <h3 className="card__title">Time by tag</h3>
+                </div>
+                <div className="card__body">
                 {data.tags.length === 0 ? (
                   <p className="dash__none">No timer sessions in this range.</p>
                 ) : (
@@ -325,7 +342,15 @@ export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: P
                                   )}
                                   <span className="subbar__value">{fmtDuration(ti.minutes)}</span>
                                   <span className="subbar__track">
-                                    <span className="subbar__fill" style={{ width: `${barPercent(ti.minutes, t.minutes)}%` }} />
+                                    <span
+                                      className="subbar__fill"
+                                      style={{
+                                        width: `${barPercent(ti.minutes, t.minutes)}%`,
+                                        background: untagged
+                                          ? "var(--color-ink-muted)"
+                                          : `color-mix(in srgb, ${tagColorVar([t.label], tagColors) ?? "var(--color-sun)"} 45%, var(--color-surface))`,
+                                      }}
+                                    />
                                   </span>
                                   <span className="subbar__meta">{plural(ti.sessions, "session", "sessions")}</span>
                                 </li>
@@ -338,23 +363,12 @@ export function DashboardView({ tagColors, onBack, onOpenDay, onOpenHistory }: P
                   </ul>
                 )}
                 {twice && <p className="dash__note">Sessions with several tags count under each tag.</p>}
+                </div>
               </section>
             </>
           )}
         </div>
       </div>
     </section>
-  );
-}
-
-function Tile({ label, value, icon, hot }: { label: string; value: string; icon?: React.ReactNode; hot?: boolean }) {
-  return (
-    <div className={`tile${hot ? " tile--hot" : ""}`}>
-      <span className="tile__label">
-        {icon}
-        {label}
-      </span>
-      <span className="tile__value">{value}</span>
-    </div>
   );
 }

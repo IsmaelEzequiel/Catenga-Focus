@@ -1,9 +1,14 @@
 import { useState, type FormEvent } from "react";
 import { ArchiveBoxIcon, ArchiveBoxXMarkIcon, ArrowPathIcon, PlusIcon, TrashIcon } from "@heroicons/react/20/solid";
 import type { Calendar, GoogleStatus, Project, Tag, TagColor } from "../api";
-import { canReconnect, listProjects, projectHint, projectStyle, reconnectHint } from "../lib/projects";
+import { canReconnect, listProjects, projectStyle, reconnectHint } from "../lib/projects";
 import { isValidTagName, TAG_PALETTE, tagVar } from "../lib/tags";
 import { ProjectDot } from "./ProjectPicker";
+import { Banner } from "./ui/Banner";
+import { Button } from "./ui/Button";
+import { ListRow } from "./ui/ListRow";
+import "../card.css";
+import "../field.css";
 import "../projects.css";
 
 interface Props {
@@ -22,93 +27,127 @@ interface Props {
   onDeleteTag: (id: number) => Promise<string | null>;
 }
 
-/** Projects (repeating events), the calendars that feed the timeline, and the tag list with colors. */
+/** Projects (repeating events) grouped by account, the calendars that feed the timeline, and the tag list with colors. */
 export function ProjectsTags(p: Props) {
   const hint = reconnectHint(p.google);
   const projects = listProjects(p.projects);
   const calendars = p.calendars.filter((c) => !c.archived);
+  // One header per account (the calendar the series lives in), so the email shows once.
+  const groups = new Map<string, Project[]>();
+  for (const x of projects) groups.set(x.calendarName, [...(groups.get(x.calendarName) ?? []), x]);
   return (
     <section className="projtags" aria-label="Projects, calendars and tags">
-      <h3 className="dash__h projtags__h">Projects, calendars &amp; tags</h3>
+      <h3 className="projtags__h">Projects, calendars and tags</h3>
 
-      <div className="projtags__card">
-        <header className="projtags__head">
-          <h4 className="projtags__sub">Projects</h4>
+      <div className="card card--flush">
+        <header className="card__head projtags__head">
+          <div className="projtags__headtext">
+            <h4 className="card__title">Projects</h4>
+            <p className="card__desc">
+              A repeating event is a project. Its occurrences, blocks and sessions belong to it.
+            </p>
+          </div>
           {p.google?.connected && !canReconnect(p.google) && (
-            <button className="app__btn" onClick={p.onRefresh} disabled={p.refreshing}>
-              <ArrowPathIcon className={`app__icon${p.refreshing ? " projtags__spin" : ""}`} aria-hidden="true" />
+            <Button
+              size="sm"
+              icon={ArrowPathIcon}
+              className={p.refreshing ? "projtags__spin" : undefined}
+              onClick={p.onRefresh}
+              disabled={p.refreshing}
+            >
               Refresh
-            </button>
+            </Button>
           )}
         </header>
-        <p className="projtags__text">
-          A repeating event is a project: all its occurrences, and the blocks and timer sessions made from them, belong to it.
-        </p>
         {hint && (
-          <p className="projtags__hint" role="status">
-            {hint}
-            {p.google?.configured && (
-              <button className="app__btn projtags__hintbtn" onClick={p.onConnect}>
-                {p.google.connected ? "Reconnect" : "Connect Google Calendar"}
-              </button>
-            )}
-          </p>
+          <div className="projtags__notice">
+            <Banner
+              tone="info"
+              variant="inline"
+              actions={
+                p.google?.configured ? (
+                  <Button size="sm" onClick={p.onConnect}>
+                    {p.google.connected ? "Reconnect" : "Connect Google Calendar"}
+                  </Button>
+                ) : undefined
+              }
+            >
+              {hint}
+            </Banner>
+          </div>
         )}
-        {p.projectsError && <p className="dash__error">{p.projectsError}</p>}
-        {projects.length === 0 && !hint && <p className="projtags__text">Repeating events from your calendar show up here.</p>}
-        {projects.length > 0 && (
-          <ul className="projtags__list">
-            {projects.map((x) => (
-              <li key={x.id} className="projtags__row" style={projectStyle(x.color)}>
-                <ProjectDot color={x.color} />
-                <span className={`projtags__name${x.archived ? " projtags__name--off" : ""}`}>{x.name}</span>
-                <span className="projtags__hintnote">{projectHint(x)}</span>
-                {x.archived && <span className="projtags__badge">archived</span>}
-                <button
-                  type="button"
-                  className="app__btn projtags__archive"
-                  onClick={() => p.onSetArchived(x.id, !x.archived)}
-                  aria-label={`${x.archived ? "Restore" : "Archive"} ${x.name}`}
-                >
-                  {x.archived ? (
-                    <ArchiveBoxXMarkIcon className="app__icon" aria-hidden="true" />
-                  ) : (
-                    <ArchiveBoxIcon className="app__icon" aria-hidden="true" />
-                  )}
-                  {x.archived ? "Restore" : "Archive"}
-                </button>
-              </li>
+        {p.projectsError && (
+          <div className="projtags__notice">
+            <Banner
+              tone="error"
+              variant="inline"
+              actions={
+                <Button size="sm" onClick={p.onRefresh} disabled={p.refreshing}>
+                  Try again
+                </Button>
+              }
+            >
+              {p.projectsError}
+            </Banner>
+          </div>
+        )}
+        {projects.length === 0 && !hint && <p className="projtags__empty">Repeating events from your calendar show up here.</p>}
+        {[...groups.entries()].map(([account, list]) => (
+          <div key={account}>
+            <div className="projtags__group">{account}</div>
+            {list.map((x) => (
+              <div key={x.id} className="projtags__item" style={projectStyle(x.color)}>
+                <ListRow
+                  lead={<ProjectDot color={x.color} />}
+                  title={<span className={x.archived ? "projtags__off" : undefined}>{x.name}</span>}
+                  meta={[x.kind === "event" ? "one-off" : null, x.archived ? "archived" : null].filter(Boolean).join(" · ") || null}
+                  actions={
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon={x.archived ? ArchiveBoxXMarkIcon : ArchiveBoxIcon}
+                      onClick={() => p.onSetArchived(x.id, !x.archived)}
+                      aria-label={`${x.archived ? "Restore" : "Archive"} ${x.name}`}
+                    >
+                      {x.archived ? "Restore" : "Archive"}
+                    </Button>
+                  }
+                />
+              </div>
             ))}
-          </ul>
-        )}
+          </div>
+        ))}
       </div>
 
-      <div className="projtags__card">
-        <header className="projtags__head">
-          <h4 className="projtags__sub">Calendars</h4>
+      <div className="card card--flush">
+        <header className="card__head">
+          <h4 className="card__title">Calendars</h4>
+          <p className="card__desc">Calendars only decide what shows on the timeline.</p>
         </header>
-        <p className="projtags__text">Calendars only decide what shows on the timeline.</p>
         {calendars.length === 0 ? (
-          <p className="projtags__text">No calendars yet.</p>
+          <p className="projtags__empty">No calendars yet.</p>
         ) : (
-          <ul className="projtags__list">
-            {calendars.map((c) => (
-              <li key={c.id} className="projtags__row" style={projectStyle(c.color)}>
-                <ProjectDot color={c.color} />
-                <span className="projtags__name">{c.name}</span>
-                {c.isPrimary && <span className="projtags__badge">primary</span>}
-                <label className="projtags__toggle" title={c.isPrimary ? "The primary calendar is always shown" : undefined}>
-                  <input
-                    type="checkbox"
-                    checked={c.showOnTimeline || c.isPrimary}
-                    disabled={c.isPrimary}
-                    onChange={(e) => p.onSetShown(c.id, e.target.checked)}
-                  />
-                  Show on timeline
-                </label>
-              </li>
-            ))}
-          </ul>
+          calendars.map((c) => (
+            <div key={c.id} className="projtags__item" style={projectStyle(c.color)}>
+              <ListRow
+                className="projtags__row--always"
+                lead={<ProjectDot color={c.color} />}
+                title={c.name}
+                meta={c.isPrimary ? "primary" : null}
+                actions={
+                  <label className="projtags__toggle" title={c.isPrimary ? "The primary calendar is always shown" : undefined}>
+                    <input
+                      type="checkbox"
+                      checked={c.showOnTimeline || c.isPrimary}
+                      disabled={c.isPrimary}
+                      onChange={(e) => p.onSetShown(c.id, e.target.checked)}
+                    />
+                    Show on timeline
+                  </label>
+                }
+              />
+            </div>
+          ))
         )}
       </div>
 
@@ -138,33 +177,35 @@ function TagsCard(props: {
     if (!failed) setName("");
   };
 
+  const message = err ?? props.error;
   return (
-    <div className="projtags__card">
-      <header className="projtags__head">
-        <h4 className="projtags__sub">Tags</h4>
+    <div className="card card--flush">
+      <header className="card__head">
+        <h4 className="card__title">Tags</h4>
       </header>
       <form className="projtags__new" onSubmit={add} aria-label="New tag">
         <input
-          className="projtags__input"
+          className="field__input projtags__input"
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="New tag"
           aria-label="New tag name"
         />
-        <button type="submit" className="app__btn" disabled={name.trim() === ""}>
-          <PlusIcon className="app__icon" aria-hidden="true" />
+        <Button type="submit" icon={PlusIcon} disabled={name.trim() === ""}>
           Add
-        </button>
+        </Button>
       </form>
-      {(err || props.error) && <p className="dash__error">{err ?? props.error}</p>}
+      {message && (
+        <div className="projtags__notice">
+          <Banner tone="error" variant="inline">
+            {message}
+          </Banner>
+        </div>
+      )}
       {props.tags.length === 0 ? (
-        <p className="projtags__text">Tags you use in block titles (#tag) show up here.</p>
+        <p className="projtags__empty">Tags you use in block titles (#tag) show up here.</p>
       ) : (
-        <ul className="projtags__list">
-          {props.tags.map((t) => (
-            <TagRow key={t.name.toLowerCase()} tag={t} onSave={props.onSave} onDelete={props.onDelete} />
-          ))}
-        </ul>
+        props.tags.map((t) => <TagRow key={t.name.toLowerCase()} tag={t} onSave={props.onSave} onDelete={props.onDelete} />)
       )}
     </div>
   );
@@ -180,39 +221,66 @@ function TagRow({
   onDelete: (id: number) => Promise<string | null>;
 }) {
   const [err, setErr] = useState<string | null>(null);
+  const [picking, setPicking] = useState(false);
   const used = tag.goalCount > 0;
   return (
-    <li className="projtags__row" style={{ ["--chip" as string]: tagVar(tag.color) }}>
-      <span className="projtags__tag">#{tag.name}</span>
-      {!tag.saved && <span className="projtags__badge">from notes</span>}
-      <span className="projtags__swatches" role="group" aria-label={`Color of ${tag.name}`}>
-        {TAG_PALETTE.map((c) => (
+    <div className="projtags__item">
+      <ListRow
+        className={picking ? "projtags__row--open" : undefined}
+        lead={
           <button
-            key={c}
             type="button"
-            className="projtags__swatch"
-            style={{ ["--swatch" as string]: tagVar(c) }}
-            aria-label={c}
-            aria-pressed={tag.color === c && tag.saved}
-            onClick={async () => setErr(await onSave(tag.name, c))}
+            className="projtags__dot"
+            style={{ ["--tag" as string]: tagVar(tag.color) }}
+            aria-label={`Color of ${tag.name}`}
+            aria-expanded={picking}
+            onClick={() => setPicking((v) => !v)}
           />
-        ))}
-      </span>
-      {tag.saved && tag.id !== null ? (
-        <button
-          type="button"
-          className="projtags__delete"
-          aria-label={`Delete tag ${tag.name}`}
-          disabled={used}
-          title={used ? `Used by ${tag.goalCount} ${tag.goalCount === 1 ? "goal" : "goals"}` : "Delete tag"}
-          onClick={async () => setErr(await onDelete(tag.id as number))}
-        >
-          <TrashIcon aria-hidden="true" />
-        </button>
-      ) : (
-        <span className="projtags__delete projtags__delete--none" aria-hidden="true" />
+        }
+        title={`#${tag.name}`}
+        meta={
+          <>
+            {!tag.saved && "from notes"}
+            {picking && (
+              <span className="projtags__swatches" role="group" aria-label={`Color of ${tag.name}`}>
+                {TAG_PALETTE.map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    className="projtags__swatch"
+                    style={{ ["--swatch" as string]: tagVar(c) }}
+                    aria-label={c}
+                    aria-pressed={tag.color === c && tag.saved}
+                    onClick={async () => {
+                      setErr(await onSave(tag.name, c));
+                      setPicking(false);
+                    }}
+                  />
+                ))}
+              </span>
+            )}
+          </>
+        }
+        actions={
+          tag.saved && tag.id !== null ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="button--icon"
+              icon={TrashIcon}
+              aria-label={`Delete tag ${tag.name}`}
+              disabled={used}
+              title={used ? `Used by ${tag.goalCount} ${tag.goalCount === 1 ? "goal" : "goals"}` : "Delete tag"}
+              onClick={async () => setErr(await onDelete(tag.id as number))}
+            />
+          ) : undefined
+        }
+      />
+      {err && (
+        <Banner tone="error" variant="inline">
+          {err}
+        </Banner>
       )}
-      {err && <p className="dash__error projtags__err">{err}</p>}
-    </li>
+    </div>
   );
 }

@@ -4,7 +4,7 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--color-surface);
+  background: var(--color-bg);
 }
 
 .history__header {
@@ -12,15 +12,14 @@
   align-items: center;
   flex-wrap: wrap;
   gap: 12px;
-  padding: 12px 20px;
-  border-bottom: 1px solid var(--color-line);
+  padding: var(--space-5) var(--space-6) 0;
 }
 
 .history__title {
   flex: 1;
   min-width: 0;
   margin: 0;
-  font-size: 18px;
+  font: 600 var(--text-2xl) / 1.1 var(--font-display);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -28,7 +27,7 @@
 
 .history__kind {
   font-family: var(--font-body);
-  font-size: 12px;
+  font-size: var(--text-sm);
   font-weight: 500;
   letter-spacing: 0;
   color: var(--color-ink-muted);
@@ -52,7 +51,7 @@
   display: flex;
   gap: 16px;
   min-height: 1em;
-  padding: 8px 20px 0;
+  padding: var(--space-2) var(--space-6) 0;
   font-size: 12px;
   color: var(--color-ink-muted);
 }
@@ -61,7 +60,7 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 8px 20px 24px;
+  padding: var(--space-2) var(--space-6) var(--space-5);
 }
 
 .history__message {
@@ -69,10 +68,6 @@
   padding: 16px 0;
   font-size: 14px;
   color: var(--color-ink-muted);
-}
-
-.history__message--error {
-  color: var(--color-tag-clay);
 }
 
 .history__entry {
@@ -102,30 +97,6 @@
 
 .history__time {
   color: var(--color-ink-muted);
-}
-
-.history__chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font: inherit;
-  font-size: 12px;
-  color: var(--color-ink-muted);
-  background: var(--color-surface-raised);
-  border: 1px solid var(--color-line);
-  border-radius: var(--radius-sm);
-  padding: 1px 8px;
-  cursor: pointer;
-}
-
-.history__chip:hover {
-  border-color: var(--color-ink-muted);
-}
-
-.history__dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
 }
 
 .history__note {

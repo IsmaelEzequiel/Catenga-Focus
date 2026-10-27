@@ -35,6 +35,9 @@ export function tagColorVar(tags: string[], tagColors: Record<string, string>): 
   return `var(--color-tag-${PALETTE[hash(tags[0]) % PALETTE.length]})`;
 }
 
+/** The text-safe variant of a `tagColorVar` result (`var(--color-tag-sun)` → `var(--color-tag-sun-ink)`). */
+export const tagInkOf = (colorVar: string) => colorVar.replace(/^var\(--color-tag-([a-z]+)\)$/, "var(--color-tag-$1-ink)");
+
 const TAG_NAME = /^[\p{Alphabetic}\p{N}_-]+$/u;
 const MAX_SUGGESTIONS = 6;
 const normName = (s: string) => s.toLowerCase();
@@ -81,3 +84,6 @@ export function suggestTags(all: string[], chosen: string[], query: string, limi
 export const tagVar = (color: string) => `var(--color-tag-${(PALETTE as readonly string[]).includes(color) ? color : "sun"})`;
 
 export const TAG_PALETTE = PALETTE;
+
+/** CSS color for a saved tag's name as text: sun and clay use their darker, readable variant. */
+export const tagInkVar = (color: string) => `var(--color-tag-${(PALETTE as readonly string[]).includes(color) ? color : "sun"}-ink)`;

@@ -1,0 +1,47 @@
+/* Inputs and selects: height 36, radius 8, sun-ink focus with a soft sun-tint halo. */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field__label {
+  font-size: var(--text-xs);
+  color: var(--color-ink-muted);
+}
+
+.field__input {
+  height: var(--control-lg);
+  box-sizing: border-box;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+  color: var(--color-ink);
+  font: 400 var(--text-md) var(--font-body);
+}
+
+.field__input::placeholder {
+  color: var(--color-ink-muted);
+  opacity: 0.8;
+}
+
+.field__input:focus {
+  outline: none;
+  border-color: var(--color-sun-ink);
+  box-shadow: 0 0 0 3px var(--color-sun-tint);
+}
+
+.field--error .field__input {
+  border-color: var(--color-danger);
+}
+
+.field__hint {
+  font-size: var(--text-xs);
+  color: var(--color-ink-muted);
+}
+
+.field--error .field__hint,
+.field--error .field__label {
+  color: var(--color-danger);
+}

@@ -1,0 +1,57 @@
+/* Segmented control: sand track, the active option raised on white (page nav, timer mode, ranges). */
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--color-bg);
+  border-radius: 10px;
+}
+
+.seg__item {
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--color-ink-muted);
+  font: 500 var(--text-sm) var(--font-body);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.seg__item:hover:not(:disabled) {
+  color: var(--color-ink);
+  background: var(--color-hover);
+}
+
+.seg__item[aria-pressed="true"],
+.seg__item[aria-current="page"],
+.seg__item[aria-selected="true"] {
+  background: var(--color-surface-raised);
+  color: var(--color-ink);
+  font-weight: 600;
+  box-shadow: 0 0 0 1px var(--color-line);
+}
+
+.seg__item:disabled {
+  cursor: default;
+}
+
+.seg__item:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.seg--sm {
+  padding: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.seg--sm .seg__item {
+  height: 24px;
+  font-size: var(--text-xs);
+  border-radius: 6px;
+}

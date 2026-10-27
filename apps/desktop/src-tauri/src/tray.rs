@@ -34,6 +34,8 @@ struct Shown {
     date: String,
     next: Vec<Item>,
     model: Option<TrayModel>,
+    /// The menu's first line, re-labelled every second while a timer runs.
+    header: Option<MenuItem<tauri::Wry>>,
 }
 
 #[derive(Default)]
@@ -63,6 +65,8 @@ pub fn timer_in(status: &TimerStatus, now: Timestamp) -> TimerIn {
         session_start,
         phase_ends_at,
         mode,
+        cycle,
+        cycles,
         ..
     } = status
     else {
@@ -73,6 +77,7 @@ pub fn timer_in(status: &TimerStatus, now: Timestamp) -> TimerIn {
             .and_then(|s| s.parse::<Timestamp>().ok())
             .map_or(0, |t| t.as_second() - now.as_second())
     };
+    let cycle = cycle.zip(*cycles);
     match (mode, phase) {
         (crate::sessions::Mode::Free, _) => TimerIn::Free {
             title: block.title.clone(),
@@ -83,9 +88,12 @@ pub fn timer_in(status: &TimerStatus, now: Timestamp) -> TimerIn {
         (_, TimerPhase::Focus) => TimerIn::Focus {
             title: block.title.clone(),
             remaining_secs: secs_to(phase_ends_at),
+            cycle,
         },
         (_, TimerPhase::Break) => TimerIn::Break {
+            title: block.title.clone(),
             remaining_secs: secs_to(phase_ends_at),
+            cycle,
         },
     }
 }
@@ -127,10 +135,15 @@ fn collect(app: &AppHandle) -> (String, TrayModel) {
     (date, tray_model::build(minute, &blocks, &events, &timer))
 }
 
-fn build_menu(app: &AppHandle, model: &TrayModel) -> tauri::Result<Menu<tauri::Wry>> {
+/// The menu and its first line (kept so the live timer text can change in place).
+fn build_menu(
+    app: &AppHandle,
+    model: &TrayModel,
+) -> tauri::Result<(Menu<tauri::Wry>, MenuItem<tauri::Wry>)> {
     let menu = Menu::new(app)?;
     let disabled = |id: &str, text: String| MenuItem::with_id(app, id, text, false, None::<&str>);
-    menu.append(&disabled("header", model.header())?)?;
+    let header = disabled("header", model.header())?;
+    menu.append(&header)?;
     if let Some(label) = model.start_now_label() {
         menu.append(&MenuItem::with_id(
             app,
@@ -140,22 +153,6 @@ fn build_menu(app: &AppHandle, model: &TrayModel) -> tauri::Result<Menu<tauri::W
             None::<&str>,
         )?)?;
     }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&disabled("next-label", "Next today".to_string())?)?;
-    if model.next.is_empty() {
-        menu.append(&disabled("none", "Nothing else today".to_string())?)?;
-    }
-    for (i, item) in model.next.iter().enumerate() {
-        let id = format!("item:{i}");
-        menu.append(&MenuItem::with_id(
-            app,
-            id,
-            item.label(),
-            true,
-            None::<&str>,
-        )?)?;
-    }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
     if model.timer_running {
         menu.append(&MenuItem::with_id(
             app,
@@ -164,22 +161,47 @@ fn build_menu(app: &AppHandle, model: &TrayModel) -> tauri::Result<Menu<tauri::W
             true,
             None::<&str>,
         )?)?;
+        if model.on_break {
+            menu.append(&MenuItem::with_id(
+                app,
+                "skip-break",
+                "Skip break",
+                true,
+                None::<&str>,
+            )?)?;
+        }
     }
+    let next = model.listed_next();
+    if !next.is_empty() {
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        menu.append(&disabled("next-label", "Next today".to_string())?)?;
+        for (i, item) in next.iter().enumerate() {
+            let id = format!("item:{i}");
+            menu.append(&MenuItem::with_id(
+                app,
+                id,
+                item.label(),
+                true,
+                None::<&str>,
+            )?)?;
+        }
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(
         app,
         "open",
         "Open Catenga Focus",
         true,
-        None::<&str>,
+        Some("CmdOrCtrl+O"),
     )?)?;
     menu.append(&MenuItem::with_id(
         app,
         "quit",
-        "Quit Catenga Focus",
+        "Quit",
         true,
-        None::<&str>,
+        Some("CmdOrCtrl+Q"),
     )?)?;
-    Ok(menu)
+    Ok((menu, header))
 }
 
 /// Pushes `model` to the tray: title and tooltip when they changed, the menu when
@@ -201,15 +223,26 @@ fn apply(app: &AppHandle, tray: &TrayIcon, date: String, model: TrayModel) {
         {
             let mut shown = state.lock();
             shown.date.clone_from(&date);
-            shown.next.clone_from(&model.next);
+            shown.next = model.listed_next().to_vec();
         }
         match build_menu(app, &model) {
-            Ok(menu) => {
+            Ok((menu, header)) => {
                 if let Err(e) = tray.set_menu(Some(menu)) {
                     eprintln!("tray menu: {e}");
                 }
+                state.lock().header = Some(header);
             }
             Err(e) => eprintln!("tray menu: {e}"),
+        }
+    } else if previous
+        .as_ref()
+        .is_some_and(|p| p.header() != model.header())
+    {
+        let header = state.lock().header.clone();
+        if let Some(header) = header
+            && let Err(e) = header.set_text(model.header())
+        {
+            eprintln!("tray header: {e}");
         }
     }
     state.lock().model = Some(model);
@@ -229,6 +262,11 @@ fn on_menu(app: &AppHandle, event: MenuEvent) {
         "stop" => {
             if let Err(e) = app.state::<TimerService>().stop() {
                 eprintln!("tray: stopping the timer: {e}");
+            }
+        }
+        "skip-break" => {
+            if let Err(e) = app.state::<TimerService>().skip_break() {
+                eprintln!("tray: skipping the break: {e}");
             }
         }
         _ => {
@@ -402,13 +440,16 @@ mod tests {
             timer_in(&running(Mode::Pomodoro, TimerPhase::Focus, ends), now),
             TimerIn::Focus {
                 title: "Rust".to_string(),
-                remaining_secs: 300
+                remaining_secs: 300,
+                cycle: None
             }
         );
         assert_eq!(
             timer_in(&running(Mode::Pomodoro, TimerPhase::Break, ends), now),
             TimerIn::Break {
-                remaining_secs: 300
+                title: "Rust".to_string(),
+                remaining_secs: 300,
+                cycle: None
             }
         );
     }

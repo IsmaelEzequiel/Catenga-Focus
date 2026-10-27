@@ -2,6 +2,7 @@ import { useState, type KeyboardEvent } from "react";
 import { XMarkIcon } from "@heroicons/react/20/solid";
 import type { Tag } from "../api";
 import { addTagChips, suggestTags, tagVar } from "../lib/tags";
+import "../tagchip.css";
 import "../projects.css";
 
 interface Props {
@@ -49,7 +50,8 @@ export function TagInput({ value, onChange, known, label, placeholder }: Props) 
     <div className="taginput">
       <div className="taginput__box">
         {value.map((name) => (
-          <span key={name.toLowerCase()} className="taginput__chip" style={{ ["--chip" as string]: colorOf(name) }}>
+          <span key={name.toLowerCase()} className="tagchip taginput__chip" style={{ ["--tag" as string]: colorOf(name) }}>
+            <i className="tagchip__dot" aria-hidden="true" />
             #{name}
             <button
               type="button"
@@ -84,7 +86,7 @@ export function TagInput({ value, onChange, known, label, placeholder }: Props) 
                 role="option"
                 aria-selected="false"
                 className="taginput__option"
-                style={{ ["--chip" as string]: colorOf(name) }}
+                style={{ ["--tag" as string]: colorOf(name) }}
                 // mousedown, so the pick lands before the input's blur commits the half-typed text
                 onMouseDown={(e) => {
                   e.preventDefault();
@@ -92,7 +94,7 @@ export function TagInput({ value, onChange, known, label, placeholder }: Props) 
                   setText("");
                 }}
               >
-                #{name}
+                <i className="tagchip__dot" aria-hidden="true" />#{name}
               </button>
             </li>
           ))}

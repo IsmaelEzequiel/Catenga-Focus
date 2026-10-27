@@ -6,6 +6,10 @@ import { bodyToNote } from "../lib/note";
 import { fmtRange } from "../lib/search";
 import { tagColorVar } from "../lib/tags";
 import { fmtDateShort } from "../lib/time";
+import { Banner } from "./ui/Banner";
+import { Button } from "./ui/Button";
+import "../segmented.css";
+import "../tagchip.css";
 import "../history.css";
 
 interface Props {
@@ -68,10 +72,9 @@ export function HistoryView({ by, value, tagColors, onBack, onOpenBlock, onOpenH
   return (
     <section className="history" aria-label="History">
       <header className="history__header">
-        <button className="app__btn" onClick={onBack}>
-          <ChevronLeftIcon className="app__icon" aria-hidden="true" />
+        <Button variant="ghost" size="sm" icon={ChevronLeftIcon} onClick={onBack}>
           Day
-        </button>
+        </Button>
         <h2 className="history__title">
           <span className="history__kind">{by === "tag" ? "Tag" : "Title"}</span> {by === "tag" ? `#${label}` : label}
         </h2>
@@ -80,9 +83,14 @@ export function HistoryView({ by, value, tagColors, onBack, onOpenBlock, onOpenH
             <input type="checkbox" checked={onlyWithNotes} onChange={(e) => setOnlyWithNotes(e.target.checked)} />
             Only blocks with notes
           </label>
-          <button className="app__btn" onClick={() => setOrder((o) => (o === "newest" ? "oldest" : "newest"))}>
-            {order === "newest" ? "Newest first" : "Oldest first"}
-          </button>
+          <div className="seg seg--sm" role="group" aria-label="Order">
+            <button type="button" className="seg__item" aria-pressed={order === "newest"} onClick={() => setOrder("newest")}>
+              Newest first
+            </button>
+            <button type="button" className="seg__item" aria-pressed={order === "oldest"} onClick={() => setOrder("oldest")}>
+              Oldest first
+            </button>
+          </div>
         </div>
       </header>
       <div className="history__status" role="status" aria-live="polite">
@@ -91,7 +99,19 @@ export function HistoryView({ by, value, tagColors, onBack, onOpenBlock, onOpenH
         {result?.indexing && <span>Indexing… the list may be incomplete</span>}
       </div>
       <div className="history__list">
-        {error && <p className="history__message history__message--error">{error}</p>}
+        {error && (
+          <Banner
+            tone="error"
+            variant="inline"
+            actions={
+              <Button size="sm" onClick={() => setReadyTick((t) => t + 1)}>
+                Try again
+              </Button>
+            }
+          >
+            Couldn't load this history.
+          </Banner>
+        )}
         {result && entries.length === 0 && (
           <p className="history__message">
             {result.entries.length === 0 ? "No blocks found." : "No blocks with notes. Turn off the filter to see them all."}
@@ -105,13 +125,19 @@ export function HistoryView({ by, value, tagColors, onBack, onOpenBlock, onOpenH
               </button>
               <span className="history__time">{fmtRange(e.start, e.end)}</span>
               {by === "tag" && e.title !== "" && (
-                <button className="history__chip" onClick={() => onOpenHistory("title", e.title)}>
+                <button type="button" className="tagchip tagchip--muted" onClick={() => onOpenHistory("title", e.title)}>
                   {e.title}
                 </button>
               )}
               {e.tags.map((tag) => (
-                <button key={tag} className="history__chip" onClick={() => onOpenHistory("tag", tag)}>
-                  <span className="history__dot" style={{ background: tagColorVar([tag], tagColors) ?? "var(--color-line)" }} />#{tag}
+                <button
+                  key={tag}
+                  type="button"
+                  className="tagchip"
+                  style={{ ["--tag" as string]: tagColorVar([tag], tagColors) ?? "var(--color-tag-none)" }}
+                  onClick={() => onOpenHistory("tag", tag)}
+                >
+                  <span className="tagchip__dot" />#{tag}
                 </button>
               ))}
             </div>

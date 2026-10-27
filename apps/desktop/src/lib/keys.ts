@@ -48,7 +48,16 @@ export interface KeyContext {
   isMac: boolean;
 }
 
-export type ShortcutAction = "quickAdd" | "today" | "openNote" | "toggleTimer" | "prevBlock" | "nextBlock" | "focus" | "rename" | "help";
+export type ShortcutAction =
+  | "quickAdd"
+  | "today"
+  | "openNote"
+  | "toggleTimer"
+  | "prevBlock"
+  | "nextBlock"
+  | "focus"
+  | "rename"
+  | "help";
 
 const PLAIN: Record<string, ShortcutAction> = {
   n: "quickAdd",
@@ -61,7 +70,14 @@ const PLAIN: Record<string, ShortcutAction> = {
   r: "rename",
   "?": "help",
 };
-const DAY_ONLY: ReadonlySet<ShortcutAction> = new Set(["openNote", "toggleTimer", "prevBlock", "nextBlock", "focus", "rename"]);
+const DAY_ONLY: ReadonlySet<ShortcutAction> = new Set([
+  "openNote",
+  "toggleTimer",
+  "prevBlock",
+  "nextBlock",
+  "focus",
+  "rename",
+]);
 
 /**
  * The M10 shortcuts (`docs/plans/M10-speed.md` §2). Cmd/Ctrl+K, D, G and Cmd/Ctrl+Shift+F keep their own predicates
@@ -70,19 +86,26 @@ const DAY_ONLY: ReadonlySet<ShortcutAction> = new Set(["openNote", "toggleTimer"
 export function shortcutFor(e: KeyLike, c: KeyContext): ShortcutAction | null {
   if (c.dragging || c.paletteOpen || c.modalOpen) return null;
   const mod = c.isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
-  if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n") return c.focusOpen || e.repeat ? null : "quickAdd";
+  if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n")
+    return c.focusOpen || e.repeat ? null : "quickAdd";
   if (e.metaKey || e.ctrlKey || e.altKey || c.typing || e.repeat) return null;
   if (e.shiftKey && e.key !== "?") return null;
   const action = PLAIN[e.key.length === 1 ? e.key.toLowerCase() : e.key];
   if (!action) return null;
-  if (c.focusOpen) return action === "toggleTimer" && !c.onControl ? action : null;
-  if ((action === "openNote" || action === "toggleTimer") && c.onControl) return null;
+  if (c.focusOpen)
+    return action === "toggleTimer" && !c.onControl ? action : null;
+  if ((action === "openNote" || action === "toggleTimer") && c.onControl)
+    return null;
   if (DAY_ONLY.has(action) && c.view !== "day") return null;
   return action;
 }
 
 /** The block to select when stepping up/down by start time; stays at the ends, starts from an edge with no selection. */
-export function stepBlock(blocks: { key: string; start: number; end: number }[], selected: string | null, dir: 1 | -1): string | null {
+export function stepBlock(
+  blocks: { key: string; start: number; end: number }[],
+  selected: string | null,
+  dir: 1 | -1,
+): string | null {
   if (blocks.length === 0) return null;
   const order = blocks
     .map((b, i) => ({ ...b, i }))
@@ -97,26 +120,54 @@ export interface ShortcutRow {
   label: string;
 }
 
-/** Everything the help overlay lists; `Cmd` is shown as ⌘ on macOS and Ctrl elsewhere. */
-export function shortcutRows(isMac: boolean): ShortcutRow[] {
+export interface ShortcutGroup {
+  name: string;
+  rows: ShortcutRow[];
+}
+
+/** What the help overlay lists, by context; `Cmd` is shown as ⌘ on macOS and Ctrl elsewhere. */
+export function shortcutGroups(isMac: boolean): ShortcutGroup[] {
   const mod = isMac ? "⌘" : "Ctrl";
   return [
-    { keys: ["N"], label: "Quick-add a block" },
-    { keys: [mod, "N"], label: "Quick-add (also while typing)" },
-    { keys: ["T"], label: "Go to today" },
-    { keys: ["←", "→"], label: "Previous / next day" },
-    { keys: ["↑", "↓"], label: "Select previous / next block" },
-    { keys: ["Enter"], label: "Open the selected block's note" },
-    { keys: ["Space"], label: "Start / stop the timer (today)" },
-    { keys: ["R"], label: "Rename the selected block" },
-    { keys: ["F"], label: "Focus screen for the selected block" },
-    { keys: [mod, "⇧", "F"], label: "Focus screen, anywhere" },
-    { keys: ["Delete"], label: "Delete the selected block" },
-    { keys: [mod, "K"], label: "Search" },
-    { keys: [mod, "D"], label: "Dashboard" },
-    { keys: [mod, "G"], label: "Goals" },
-    { keys: ["Done"], label: "Recap of the day shown (header button)" },
-    { keys: ["Esc"], label: "Close / go back" },
-    { keys: ["?"], label: "Show the keyboard shortcuts" },
+    {
+      name: "Day",
+      rows: [
+        { keys: ["N"], label: "Quick-add a block" },
+        { keys: [mod, "N"], label: "Quick-add (also while typing)" },
+        { keys: ["T"], label: "Go to today" },
+        { keys: ["←", "→"], label: "Previous / next day" },
+      ],
+    },
+    {
+      name: "Block",
+      rows: [
+        { keys: ["↑", "↓"], label: "Select previous / next block" },
+        { keys: ["Enter"], label: "Open the selected block's note" },
+        { keys: ["R"], label: "Rename the selected block" },
+        { keys: ["Delete"], label: "Delete the selected block" },
+      ],
+    },
+    {
+      name: "Timer",
+      rows: [
+        { keys: ["Space"], label: "Start / stop the timer (today)" },
+        { keys: ["F"], label: "Focus screen for the selected block" },
+        { keys: [mod, "⇧", "F"], label: "Focus screen, anywhere" },
+      ],
+    },
+    {
+      name: "Go to",
+      rows: [
+        { keys: [mod, "K"], label: "Search" },
+        { keys: [mod, "D"], label: "Dashboard" },
+        { keys: [mod, "G"], label: "Goals" },
+        { keys: ["Esc"], label: "Close / go back" },
+        { keys: ["?"], label: "Show the keyboard shortcuts" },
+      ],
+    },
   ];
 }
+
+/** Every row of every group, flat. */
+export const shortcutRows = (isMac: boolean): ShortcutRow[] =>
+  shortcutGroups(isMac).flatMap((g) => g.rows);

@@ -1,0 +1,37 @@
+/* Paper card: radius 14, 1px line border. `card--flush` holds ListRow lists edge to edge. */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+}
+
+.card__head {
+  padding: var(--space-4) var(--space-4) var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.card__title {
+  margin: 0;
+  font: 600 var(--text-lg) / 1.3 var(--font-body);
+  letter-spacing: 0;
+}
+
+.card__desc {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-ink-muted);
+}
+
+.card__body {
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+.card--flush .card__body {
+  padding: 0 0 var(--space-1);
+}
+
+.card--raised {
+  background: var(--color-surface-raised);
+}

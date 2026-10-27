@@ -3,6 +3,7 @@ import { PlusIcon } from "@heroicons/react/20/solid";
 import type { Project } from "../api";
 import { projectStyle } from "../lib/projects";
 import { ProjectDot } from "./ProjectPicker";
+import { Button } from "./ui/Button";
 import "../projects.css";
 
 /** What the notes panel needs to show the selected block's project. */
@@ -25,34 +26,31 @@ export function ProjectChip({ panel }: { panel: ProjectPanel }) {
   if (panel.current) {
     const cur = panel.current;
     return (
-      <div className="projchip" style={projectStyle(cur.color)}>
-        <span className="projchip__label" title={`Project · calendar ${cur.calendarName}`}>
-          <span className="projchip__name">{cur.name}</span>
-          <ProjectDot color={cur.color} />
-        </span>
-      </div>
+      <span className="projchip" style={projectStyle(cur.color)} title={`Project · calendar ${cur.calendarName}`}>
+        <ProjectDot color={cur.color} />
+        Project · {cur.name}
+      </span>
     );
   }
 
   if (!panel.canMake) return null;
   return (
-    <div className="projchip">
-      <button
-        type="button"
-        className="app__btn projchip__make"
-        disabled={busy}
-        onClick={async () => {
-          setBusy(true);
-          try {
-            await panel.onMake();
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <PlusIcon className="app__icon" aria-hidden="true" />
-        Make this a project
-      </button>
-    </div>
+    <Button
+      size="sm"
+      variant="ghost"
+      icon={PlusIcon}
+      className="projchip__make"
+      disabled={busy}
+      onClick={async () => {
+        setBusy(true);
+        try {
+          await panel.onMake();
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      Make this a project
+    </Button>
   );
 }

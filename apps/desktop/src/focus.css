@@ -9,8 +9,7 @@
 
 .focus {
   --accent: var(--color-sun);
-  --ring: min(44vh, 400px, 84vw);
-  --breathe: 4s;
+  --ring: 200px;
   position: fixed;
   inset: 0;
   z-index: 50;
@@ -22,7 +21,6 @@
 
 .focus--break {
   --accent: var(--color-tag-leaf);
-  --breathe: 6s;
 }
 
 .focus--leaving {
@@ -30,21 +28,36 @@
   pointer-events: none;
 }
 
-.focus__scroll {
+/* Stacked below 1100px: ring on top, note fills the rest. Above: stage left, note in its own full-height column. */
+.focus__layout {
+  box-sizing: border-box;
   height: 100%;
-  overflow-y: auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: var(--space-5);
+  padding: var(--space-6) var(--space-5) var(--space-5);
 }
 
-.focus__column {
-  box-sizing: border-box;
-  max-width: 760px;
-  margin: 0 auto;
-  /* Fills the window exactly; it only scrolls when the note outgrows the space below the timer. */
-  min-height: 100%;
-  padding: clamp(20px, 4vh, 48px) 24px clamp(16px, 3vh, 32px);
+.focus__main {
   display: flex;
   flex-direction: column;
-  gap: clamp(16px, 3vh, 32px);
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+@media (min-width: 1100px) {
+  .focus {
+    --ring: clamp(240px, 28vw, 320px);
+  }
+  .focus__layout {
+    grid-template-columns: minmax(360px, 1fr) minmax(0, 1.1fr);
+    grid-template-rows: minmax(0, 1fr);
+    gap: var(--space-7);
+    padding: var(--space-6);
+  }
 }
 
 /* Stagger: title -> timer -> editor, 60 ms apart; leaving reverses it. */
@@ -129,9 +142,11 @@
 }
 .focus__title {
   margin: 0;
-  font-size: clamp(28px, 5vw, 40px);
-  font-weight: 700;
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
+  font-weight: 600;
   line-height: 1.1;
+  text-wrap: balance;
   overflow-wrap: anywhere;
 }
 .focus__meta {
@@ -169,7 +184,7 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: clamp(16px, 3vh, 28px);
+  gap: var(--space-4);
 }
 
 .focus__ring {
@@ -177,31 +192,6 @@
   width: var(--ring);
   height: var(--ring);
   flex: none;
-}
-
-.focus__glow {
-  position: absolute;
-  inset: 8%;
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--accent) 28%, transparent);
-  filter: blur(36px);
-  opacity: 0.45;
-}
-.focus--run .focus__glow,
-.focus--break .focus__glow {
-  animation: breathe var(--breathe) ease-in-out infinite;
-}
-
-@keyframes breathe {
-  0%,
-  100% {
-    transform: scale(1);
-    opacity: 0.4;
-  }
-  50% {
-    transform: scale(1.04);
-    opacity: 0.7;
-  }
 }
 
 .ring {
@@ -218,10 +208,13 @@
   stroke: var(--color-line);
   stroke-width: 5;
 }
+.ring .ring__disc {
+  fill: var(--color-sun-tint);
+  stroke: none;
+}
 .ring__ticks {
-  stroke: var(--color-line);
-  stroke-width: 3;
-  opacity: 0.7;
+  stroke: var(--color-line-strong);
+  stroke-width: 6;
 }
 .ring__arc {
   stroke: var(--accent);
@@ -257,16 +250,15 @@
 }
 
 .focus__label {
-  font-size: clamp(11px, calc(var(--ring) * 0.04), 16px);
+  font-size: var(--text-sm);
   font-weight: 600;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--accent);
+  color: var(--color-sun-ink);
   animation: label-in 600ms ease both;
 }
+.focus--break .focus__label {
+  color: var(--color-tag-leaf-ink);
+}
 .focus__label--done {
-  letter-spacing: 0.08em;
-  text-transform: none;
   font-family: var(--font-display);
   font-size: clamp(16px, calc(var(--ring) * 0.055), 24px);
 }
@@ -278,15 +270,12 @@
 
 .focus__clock {
   font-family: var(--font-display);
-  font-weight: 700;
+  font-weight: 600;
   font-size: calc(var(--ring) * var(--em));
   line-height: 1;
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
-  transition: opacity 400ms;
-}
-.focus__clock--idle {
-  opacity: 0.4;
+  color: var(--color-ink);
 }
 
 .digits {
@@ -374,7 +363,6 @@
   gap: 16px;
   animation: label-in 400ms ease both;
 }
-.focus__cycle,
 .focus__hint {
   margin: 0;
   font-size: 14px;
@@ -383,72 +371,28 @@
 }
 .focus__buttons {
   display: flex;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font: inherit;
-  font-size: 17px;
-  font-weight: 600;
-  color: var(--color-ink);
-  background: var(--color-surface);
-  border: 1px solid var(--color-line);
-  border-radius: 999px;
-  padding: 12px 28px;
-  cursor: pointer;
-  transition: transform 150ms, border-color 150ms, background-color 150ms;
-}
-.pill:hover:not(:disabled) {
-  border-color: var(--color-ink-muted);
-  transform: translateY(-1px);
-}
-.pill:active:not(:disabled) {
-  transform: scale(0.97);
-}
-.pill:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-.pill__icon {
-  width: 20px;
-  height: 20px;
-}
-.pill--start {
-  min-width: 160px;
+.focus__plan {
+  display: flex;
+  flex-wrap: wrap;
   justify-content: center;
-  background: var(--color-sun);
-  border-color: var(--color-sun);
-}
-.pill--stop {
-  background: var(--color-ink);
-  border-color: var(--color-ink);
-  color: var(--color-bg);
-}
-
-.focus__modes {
-  display: inline-flex;
-  padding: 3px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-line);
-  border-radius: 999px;
-}
-.focus__mode {
-  font: inherit;
-  font-size: 14px;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  font-size: var(--text-sm);
   color: var(--color-ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+.focus__textbtn {
+  font: inherit;
+  color: var(--color-sun-ink);
   background: none;
   border: 0;
-  border-radius: 999px;
-  padding: 6px 18px;
+  padding: 0;
+  text-decoration: underline;
   cursor: pointer;
-  transition: background-color 200ms, color 200ms;
-}
-.focus__mode--on {
-  color: var(--color-ink);
-  background: color-mix(in srgb, var(--color-sun) 30%, var(--color-surface-raised));
 }
 
 /* Note card */
@@ -456,8 +400,9 @@
   background: var(--color-surface);
   border: 1px solid var(--color-line);
   border-radius: var(--radius-lg);
-  padding: 20px clamp(18px, 4vw, 36px) 28px;
-  flex: 1 0 auto;
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
 }
@@ -473,7 +418,7 @@
 }
 .focus__link {
   font: inherit;
-  color: var(--color-tag-clay);
+  color: var(--color-clay-ink);
   background: none;
   border: 0;
   padding: 0;
@@ -555,14 +500,6 @@
   outline-offset: 2px;
 }
 
-/* Small windows (min 800x500): keep it tight */
-@media (max-height: 560px) {
-  .focus__column {
-    gap: 16px;
-    padding-top: 20px;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .focus,
   .focus *,
@@ -574,8 +511,6 @@
   .ring__tip,
   .focus__clock,
   .dot,
-  .pill,
-  .focus__mode,
   .focus__close {
     transition: none;
   }

@@ -33,14 +33,17 @@ pub enum TimerIn {
         title: String,
         elapsed_secs: i64,
     },
-    /// Pomodoro focus: seconds left in the phase.
+    /// Pomodoro focus: seconds left in the phase; `cycle` is (current, of).
     Focus {
         title: String,
         remaining_secs: i64,
+        cycle: Option<(u32, u32)>,
     },
     /// Pomodoro break: seconds left in the phase.
     Break {
+        title: String,
         remaining_secs: i64,
+        cycle: Option<(u32, u32)>,
     },
 }
 
@@ -68,17 +71,24 @@ impl Item {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayModel {
-    /// Menu bar text; `None` shows the icon only.
+    /// Menu bar text; `None` (no timer) shows the icon only.
     pub title: Option<String>,
     pub tooltip: String,
     pub now_item: Option<Item>,
     pub next: Vec<Item>,
     pub timer_running: bool,
+    /// The running timer's live state, the menu's first line: `Rust · Focus 1 of 4 · 24:56 left`.
+    pub live: Option<String>,
+    /// A Pomodoro break is running (the menu offers Skip break).
+    pub on_break: bool,
 }
 
 impl TrayModel {
-    /// The menu header: `Now: Title · until HH:MM`.
+    /// The menu's first line: the live timer, else `Now: Title · until HH:MM`.
     pub fn header(&self) -> String {
+        if let Some(live) = &self.live {
+            return live.clone();
+        }
         match &self.now_item {
             Some(i) => format!("Now: {} \u{b7} until {}", i.title, hhmm(i.end)),
             None => "Nothing scheduled now".to_string(),
@@ -93,17 +103,32 @@ impl TrayModel {
         self.now_item.as_ref().or_else(|| self.next.first())
     }
 
-    /// The menu row for `start_now`.
+    /// The menu row for `start_now`, saying what it starts: `Start Rust`, or
+    /// `Start Rust early (12:30)` when it hasn't begun yet.
     pub fn start_now_label(&self) -> Option<String> {
-        self.start_now()
-            .map(|i| format!("Start now \u{b7} {}", truncate(&i.title)))
+        let item = self.start_now()?;
+        let title = truncate(&item.title);
+        Some(if self.now_item.is_some() {
+            format!("Start {title}")
+        } else {
+            format!("Start {title} early ({})", hhmm(item.start))
+        })
     }
 
-    /// Whether the menu (not just the title) differs from `other`'s.
+    /// Upcoming items to list, without the one "Start" already offers.
+    pub fn listed_next(&self) -> &[Item] {
+        let offered = self.now_item.is_none() && self.start_now().is_some();
+        if offered { &self.next[1..] } else { &self.next }
+    }
+
+    /// Whether the menu's structure differs from `other`'s; the live line and the
+    /// title change every second and are updated in place.
     pub fn same_menu(&self, other: &TrayModel) -> bool {
         self.now_item == other.now_item
             && self.next == other.next
             && self.timer_running == other.timer_running
+            && self.on_break == other.on_break
+            && self.live.is_some() == other.live.is_some()
     }
 }
 
@@ -127,18 +152,18 @@ pub fn truncate(title: &str) -> String {
     cut
 }
 
+/// Always `MM:SS` (minutes keep counting past an hour), padded with figure spaces
+/// (U+2007, as wide as a digit) so the menu bar text doesn't change width.
 fn mmss(secs: i64) -> String {
     let s = secs.max(0);
-    format!("{:02}:{:02}", s / 60, s % 60)
+    format!("{:\u{2007}>2}:{:02}", s / 60, s % 60)
 }
 
-/// `H:MM:SS` from one hour on, else `MM:SS`.
-fn elapsed(secs: i64) -> String {
-    let s = secs.max(0);
-    if s >= 3600 {
-        format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
-    } else {
-        mmss(s)
+/// `Focus 1 of 4 · ` (empty without a cycle).
+fn cycle_part(phase: &str, cycle: Option<(u32, u32)>) -> String {
+    match cycle {
+        Some((n, of)) => format!("{phase} {n} of {of} \u{b7} "),
+        None => format!("{phase} \u{b7} "),
     }
 }
 
@@ -188,25 +213,49 @@ pub fn build(minute: u16, blocks: &[BlockIn], events: &[EventIn], timer: &TimerI
         .filter(|i| i.start > minute)
         .take(MAX_NEXT)
         .collect();
-    let title = match timer {
-        TimerIn::Idle => now_item.as_ref().map(|i| truncate(&i.title)),
+    let (title, live) = match timer {
+        TimerIn::Idle => (None, None),
         TimerIn::Free {
             title,
             elapsed_secs,
-        } => Some(format!(
-            "{} {}",
-            truncate(&title_or_untitled(title)),
-            elapsed(*elapsed_secs)
-        )),
+        } => {
+            let name = truncate(&title_or_untitled(title));
+            let clock = mmss(*elapsed_secs);
+            (
+                Some(format!("{name} {clock}")),
+                Some(format!("{name} \u{b7} {clock}")),
+            )
+        }
         TimerIn::Focus {
             title,
             remaining_secs,
-        } => Some(format!(
-            "{} {}",
-            truncate(&title_or_untitled(title)),
-            mmss(*remaining_secs)
-        )),
-        TimerIn::Break { remaining_secs } => Some(format!("Break {}", mmss(*remaining_secs))),
+            cycle,
+        } => {
+            let name = truncate(&title_or_untitled(title));
+            let clock = mmss(*remaining_secs);
+            (
+                Some(format!("{name} {clock}")),
+                Some(format!(
+                    "{name} \u{b7} {}{clock} left",
+                    cycle_part("Focus", *cycle)
+                )),
+            )
+        }
+        TimerIn::Break {
+            title,
+            remaining_secs,
+            cycle,
+        } => {
+            let name = truncate(&title_or_untitled(title));
+            let clock = mmss(*remaining_secs);
+            (
+                Some(format!("Break {clock}")),
+                Some(format!(
+                    "{name} \u{b7} {}{clock} left",
+                    cycle_part("Break", *cycle)
+                )),
+            )
+        }
     };
     TrayModel {
         tooltip: title.clone().unwrap_or_else(|| APP_NAME.to_string()),
@@ -214,6 +263,8 @@ pub fn build(minute: u16, blocks: &[BlockIn], events: &[EventIn], timer: &TimerI
         now_item,
         next,
         timer_running: *timer != TimerIn::Idle,
+        live,
+        on_break: matches!(timer, TimerIn::Break { .. }),
     }
 }
 
@@ -245,59 +296,79 @@ mod tests {
         }
     }
 
+    const FS: char = '\u{2007}';
+
+    fn brk(remaining_secs: i64) -> TimerIn {
+        TimerIn::Break {
+            title: "Rust".to_string(),
+            remaining_secs,
+            cycle: Some((2, 4)),
+        }
+    }
+
     #[test]
     fn free_timer_title_is_elapsed_time() {
         let m = build(600, &[], &[], &free(754));
         assert_eq!(m.title.as_deref(), Some("Rust 12:34"));
         assert!(m.timer_running);
+        assert_eq!(m.header(), "Rust \u{b7} 12:34");
     }
 
     #[test]
-    fn free_timer_over_an_hour_has_hours() {
+    fn free_timer_keeps_counting_minutes_past_an_hour() {
         let m = build(600, &[], &[], &free(3600 + 5 * 60 + 7));
-        assert_eq!(m.title.as_deref(), Some("Rust 1:05:07"));
+        assert_eq!(m.title.as_deref(), Some("Rust 65:07"));
         let m = build(600, &[], &[], &free(3599));
         assert_eq!(m.title.as_deref(), Some("Rust 59:59"));
     }
 
     #[test]
-    fn pomodoro_focus_shows_remaining_and_break_has_no_title() {
+    fn single_digit_minutes_are_padded_with_a_figure_space() {
+        let m = build(600, &[], &[], &free(65));
+        assert_eq!(m.title, Some(format!("Rust {FS}1:05")));
+    }
+
+    #[test]
+    fn pomodoro_focus_shows_remaining_and_the_live_line_has_the_cycle() {
         let focus = TimerIn::Focus {
             title: "Rust".to_string(),
-            remaining_secs: 25 * 60,
+            remaining_secs: 24 * 60 + 56,
+            cycle: Some((1, 4)),
         };
+        let m = build(600, &[], &[], &focus);
+        assert_eq!(m.title.as_deref(), Some("Rust 24:56"));
+        assert_eq!(m.header(), "Rust \u{b7} Focus 1 of 4 \u{b7} 24:56 left");
+        assert!(!m.on_break);
+        let m = build(600, &[], &[], &brk(61));
+        assert_eq!(m.title, Some(format!("Break {FS}1:01")));
         assert_eq!(
-            build(600, &[], &[], &focus).title.as_deref(),
-            Some("Rust 25:00")
+            m.header(),
+            format!("Rust \u{b7} Break 2 of 4 \u{b7} {FS}1:01 left")
         );
-        let brk = TimerIn::Break { remaining_secs: 61 };
-        assert_eq!(
-            build(600, &[], &[], &brk).title.as_deref(),
-            Some("Break 01:01")
-        );
+        assert!(m.on_break);
     }
 
     #[test]
     fn negative_remaining_clamps_to_zero() {
-        let brk = TimerIn::Break { remaining_secs: -3 };
         assert_eq!(
-            build(600, &[], &[], &brk).title.as_deref(),
-            Some("Break 00:00")
+            build(600, &[], &[], &brk(-3)).title,
+            Some(format!("Break {FS}0:00"))
         );
     }
 
     #[test]
     fn running_timer_wins_over_current_item() {
         let m = build(600, &[block(540, 660, "Other")], &[], &free(60));
-        assert_eq!(m.title.as_deref(), Some("Rust 01:00"));
+        assert_eq!(m.title, Some(format!("Rust {FS}1:00")));
         assert_eq!(m.now_item.unwrap().title, "Other");
     }
 
     #[test]
-    fn current_item_is_the_title_without_a_timer() {
+    fn idle_shows_the_icon_only_even_during_a_block() {
         let m = build(600, &[block(540, 660, "Deep work")], &[], &TimerIn::Idle);
-        assert_eq!(m.title.as_deref(), Some("Deep work"));
-        assert_eq!(m.tooltip, "Deep work");
+        assert_eq!(m.title, None);
+        assert_eq!(m.tooltip, "Catenga Focus");
+        assert_eq!(m.header(), "Now: Deep work \u{b7} until 11:00");
         assert!(!m.timer_running);
     }
 
@@ -321,8 +392,7 @@ mod tests {
     #[test]
     fn long_titles_are_truncated_with_an_ellipsis() {
         let long = "Teoria da Computacao e Linguagens Formais";
-        let m = build(600, &[block(540, 660, long)], &[], &TimerIn::Idle);
-        let t = m.title.unwrap();
+        let t = truncate(long);
         assert_eq!(t.chars().count(), 24);
         assert!(t.ends_with('\u{2026}'));
         assert_eq!(t, "Teoria da Computacao e \u{2026}");
@@ -337,7 +407,7 @@ mod tests {
             elapsed_secs: 5,
         };
         let title = build(0, &[], &[], &timer).title.unwrap();
-        assert_eq!(title, format!("{}\u{2026} 00:05", "b".repeat(23)));
+        assert_eq!(title, format!("{}\u{2026} {FS}0:05", "b".repeat(23)));
     }
 
     #[test]
@@ -400,7 +470,7 @@ mod tests {
     #[test]
     fn a_ghost_can_be_the_current_item() {
         let m = build(600, &[], &[event("e1", 590, 650, "Aula")], &TimerIn::Idle);
-        assert_eq!(m.title.as_deref(), Some("Aula"));
+        assert_eq!(m.header(), "Now: Aula \u{b7} until 10:50");
         assert!(m.now_item.unwrap().ghost);
     }
 
@@ -424,7 +494,7 @@ mod tests {
     fn midnight_edges() {
         let b = [block(1380, 1440, "Night")];
         let at_2359 = build(1439, &b, &[], &TimerIn::Idle);
-        assert_eq!(at_2359.title.as_deref(), Some("Night"));
+        assert_eq!(at_2359.now_item.as_ref().unwrap().title, "Night");
         assert_eq!(at_2359.header(), "Now: Night \u{b7} until 00:00");
         // 00:00 of the next day is minute 0 of a fresh model: nothing carries over.
         let at_0000 = build(0, &[], &[], &TimerIn::Idle);
@@ -433,12 +503,15 @@ mod tests {
     }
 
     #[test]
-    fn same_menu_ignores_the_title() {
+    fn same_menu_ignores_the_title_and_the_live_text() {
         let a = build(600, &[block(540, 660, "A")], &[], &free(1));
         let b = build(600, &[block(540, 660, "A")], &[], &free(2));
         assert!(a.same_menu(&b));
+        assert_ne!(a.header(), b.header());
         let c = build(600, &[block(540, 660, "A")], &[], &TimerIn::Idle);
         assert!(!a.same_menu(&c));
+        // Entering a break adds Skip break: a new menu.
+        assert!(!build(600, &[], &[], &brk(60)).same_menu(&build(600, &[], &[], &free(60))));
     }
 
     #[test]
@@ -446,12 +519,16 @@ mod tests {
         let blocks = [block(540, 600, "Rust"), block(660, 720, "Deep work")];
         let m = build(570, &blocks, &[], &TimerIn::Idle);
         assert_eq!(m.start_now().map(|i| i.title.as_str()), Some("Rust"));
-        assert_eq!(
-            m.start_now_label().as_deref(),
-            Some("Start now \u{b7} Rust")
-        );
+        assert_eq!(m.start_now_label().as_deref(), Some("Start Rust"));
+        assert_eq!(m.listed_next().len(), 1);
         let m = build(610, &blocks, &[], &TimerIn::Idle);
         assert_eq!(m.start_now().map(|i| i.title.as_str()), Some("Deep work"));
+        assert_eq!(
+            m.start_now_label().as_deref(),
+            Some("Start Deep work early (11:00)")
+        );
+        // The block Start offers isn't listed again under "Next today".
+        assert!(m.listed_next().is_empty());
         assert!(build(570, &blocks, &[], &free(10)).start_now().is_none());
         assert!(
             build(800, &blocks, &[], &TimerIn::Idle)
@@ -480,7 +557,7 @@ mod tests {
         );
         assert_eq!(
             m.start_now_label().as_deref(),
-            Some("Start now \u{b7} A very long calendar ev\u{2026}")
+            Some("Start A very long calendar ev\u{2026} early (09:00)")
         );
     }
 }

@@ -78,3 +78,14 @@ export function fmtDateShort(date: string): string {
     year: "numeric",
   });
 }
+
+/** Header date, short so it never wraps: "Tue, Oct 27" (the year only when it isn't this year). */
+export function fmtDateHeader(date: string, today: string): string {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: today.slice(0, 4) === date.slice(0, 4) ? undefined : "numeric",
+  });
+}

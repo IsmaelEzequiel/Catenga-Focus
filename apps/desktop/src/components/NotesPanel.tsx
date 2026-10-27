@@ -1,11 +1,16 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { CheckIcon } from "@heroicons/react/20/solid";
 import type { HistoryKind } from "../api";
 import type { Conflict, SaveState, UiBlock } from "../hooks/useDay";
 import { bodyToNote } from "../lib/note";
+import { tagColorVar } from "../lib/tags";
 import { fmtMinutes } from "../lib/time";
 import { ProjectChip, type ProjectPanel } from "./ProjectChip";
-import { TimerBar, type TimerPanel } from "./TimerBar";
+import { SessionsSummary, TimerBar, type TimerPanel } from "./TimerBar";
+import { Banner } from "./ui/Banner";
+import { Button } from "./ui/Button";
 import "../notes.css";
+import "../tagchip.css";
 
 interface Props {
   block: UiBlock | null;
@@ -26,12 +31,21 @@ interface Props {
   onOpenHistory: (by: HistoryKind, value: string) => void;
   timer: TimerPanel;
   project: ProjectPanel;
+  tagColors: Record<string, string>;
+  /** The block stands for a Google Calendar event. */
+  fromCalendar: boolean;
+  /** Nothing selected: today's current (or next) block or event, the same one "Start now" would use. */
+  nowTarget: { title: string; start: number; end: number; upcoming: boolean } | null;
+  onOpenNow: () => void;
 }
 
 /** Shown in an empty note editor only; never written into the file. */
 export const NOTE_PROMPT = "What does a good outcome for this block look like?";
 
+const IS_MAC = navigator.userAgent.includes("Mac");
+
 const STATUS: Partial<Record<SaveState, string>> = {
+  editing: "Editing…",
   saving: "Saving…",
   saved: "Saved",
   conflict: "File changed on disk",
@@ -42,68 +56,71 @@ export function NotesPanel(p: Props) {
   if (!block) {
     return (
       <aside className="notes notes--empty">
-        <p>Select a block to write its note.</p>
-        <OtherConflicts conflicts={p.otherConflicts} onSelect={p.onSelect} />
+        <div className="notes__empty">
+          {p.nowTarget && (
+            <>
+              <span className="notes__meta">{p.nowTarget.upcoming ? "Up next" : "Happening now"}</span>
+              <button className="notes__now" onClick={p.onOpenNow}>
+                <span className="notes__now-title">{p.nowTarget.title}</span>
+                <span className="notes__meta">
+                  {fmtMinutes(p.nowTarget.start)}–{fmtMinutes(p.nowTarget.end)} · Enter to open
+                </span>
+              </button>
+            </>
+          )}
+          <p className="notes__hint">
+            {p.nowTarget ? "Or click any block. " : "Click a block to write its note. "}
+            <kbd>N</kbd> adds one · <kbd>{IS_MAC ? "⌘K" : "Ctrl+K"}</kbd> searches notes.
+          </p>
+          <OtherConflicts conflicts={p.otherConflicts} onSelect={p.onSelect} />
+        </div>
       </aside>
     );
   }
+  const title = block.title.trim();
   return (
     <aside className="notes">
-      <header className="notes__header">
-        <h2 className="notes__title">
+      <header className="notes__head">
+        <span className="notes__meta">
           {fmtMinutes(block.start)}–{fmtMinutes(block.end)}
-          {block.title !== "" && (
-            <>
-              {" · "}
-              <button
-                className="notes__history"
-                title="Show the history of this title"
-                onClick={() => p.onOpenHistory("title", block.title)}
-              >
-                {block.title}
-              </button>
-            </>
-          )}
-          {block.tags.map((tag) => (
-            <button
-              key={tag}
-              className="notes__history"
-              title={`Show the history of #${tag}`}
-              onClick={() => p.onOpenHistory("tag", tag)}
-            >
-              {" "}
-              #{tag}
-            </button>
-          ))}
-        </h2>
-        <span className="notes__status" role="status" aria-live="polite">
-          {p.saveState === "error" ? (
-            <>
-              Not saved ·{" "}
-              <button className="notes__link" onClick={p.onRetry}>
-                Retry
-              </button>
-            </>
-          ) : (
-            <span key={p.saveState} className={p.saveState === "saved" ? "notes__saved" : undefined}>
-              {STATUS[p.saveState]}
-            </span>
-          )}
+          {p.fromCalendar && " · Google Calendar"}
         </span>
+        <h2 className={title ? "notes__title" : "notes__title notes__title--empty"}>{title || "Untitled"}</h2>
+        {(block.tags.length > 0 || p.project.current || p.project.canMake) && (
+          <div className="notes__chips">
+            {block.tags.map((tag) => (
+              <button
+                key={tag}
+                className="tagchip"
+                style={{ ["--tag" as string]: tagColorVar([tag], p.tagColors) ?? undefined }}
+                title={`All #${tag} notes`}
+                onClick={() => p.onOpenHistory("tag", tag)}
+              >
+                <span className="tagchip__dot" aria-hidden="true" />#{tag}
+              </button>
+            ))}
+            <ProjectChip panel={p.project} />
+          </div>
+        )}
       </header>
-      <ProjectChip panel={p.project} />
       <TimerBar block={block} timer={p.timer} />
       {conflict && (
-        <div className="notes__conflict" role="alert">
-          <span>This note changed on disk.</span>
-          <span className="notes__actions">
-            <button className="app__btn" onClick={() => p.onResolve(block.key, "mine")}>
-              Keep mine
-            </button>
-            <button className="app__btn" onClick={() => p.onResolve(block.key, "file")}>
-              Use file's
-            </button>
-          </span>
+        <div className="notes__banner">
+          <Banner
+            variant="inline"
+            actions={
+              <>
+                <Button size="sm" onClick={() => p.onResolve(block.key, "mine")}>
+                  Keep mine
+                </Button>
+                <Button size="sm" onClick={() => p.onResolve(block.key, "file")}>
+                  Use file's
+                </Button>
+              </>
+            }
+          >
+            This note changed on disk.
+          </Banner>
         </div>
       )}
       <NoteEditor
@@ -114,6 +131,31 @@ export function NotesPanel(p: Props) {
         onBlur={p.onBlur}
       />
       <OtherConflicts conflicts={p.otherConflicts.filter((c) => c.key !== block.key)} onSelect={p.onSelect} />
+      <footer className="notes__foot">
+        <span className="notes__status" role="status" aria-live="polite">
+          {p.saveState === "error" ? (
+            <span className="notes__error">
+              Not saved ·{" "}
+              <button className="notes__link" onClick={p.onRetry}>
+                Try again
+              </button>
+            </span>
+          ) : (
+            STATUS[p.saveState] && (
+              <span key={p.saveState} className="notes__state">
+                {p.saveState === "saved" && <CheckIcon className="notes__check" aria-hidden="true" />}
+                {STATUS[p.saveState]}
+              </span>
+            )
+          )}
+        </span>
+        <SessionsSummary block={block} timer={p.timer} />
+        {title && (
+          <button className="notes__link notes__history" onClick={() => p.onOpenHistory("title", block.title)}>
+            All “{title}” notes →
+          </button>
+        )}
+      </footer>
     </aside>
   );
 }
@@ -121,11 +163,17 @@ export function NotesPanel(p: Props) {
 function OtherConflicts({ conflicts, onSelect }: { conflicts: Conflict[]; onSelect: (key: string) => void }) {
   if (conflicts.length === 0) return null;
   return (
-    <div className="notes__conflict" role="alert">
-      <span>{conflicts.length === 1 ? "Another note changed on disk." : `${conflicts.length} other notes changed on disk.`}</span>
-      <button className="app__btn" onClick={() => onSelect(conflicts[0].key)}>
-        Review
-      </button>
+    <div className="notes__banner">
+      <Banner
+        variant="inline"
+        actions={
+          <Button size="sm" onClick={() => onSelect(conflicts[0].key)}>
+            Review
+          </Button>
+        }
+      >
+        {conflicts.length === 1 ? "Another note changed on disk." : `${conflicts.length} other notes changed on disk.`}
+      </Banner>
     </div>
   );
 }

@@ -22,14 +22,65 @@
   --color-tag-leaf: #4f7a4a;
   --color-tag-sky: #3d6fb6;
 
+  /* Text-safe variants: fills stay the brand colours, these are for type and icons */
+  --color-sun-ink: #9a5e0e; /* 5.1:1 on paper: links, active labels, focus ring */
+  --color-clay-ink: #a8432e; /* 5.8:1 on paper: clay tag text, errors, delete */
+  --color-danger: var(--color-clay-ink);
+  /* Tag name as text (leaf and sky already pass on paper) */
+  --color-tag-sun-ink: var(--color-sun-ink);
+  --color-tag-clay-ink: var(--color-clay-ink);
+  --color-tag-leaf-ink: var(--color-tag-leaf);
+  --color-tag-sky-ink: var(--color-tag-sky);
+  /* Untagged blocks: a neutral sand tint instead of white */
+  --color-tag-none: #8c7f66;
+
+  /* Interaction tints */
+  --color-sun-tint: #fbead0; /* selected segment, running chip, highlight */
+  --color-sun-line: #ebcb97; /* border on sun-tint surfaces */
+  --color-sun-strong: #dd9530; /* primary button hover */
+  --color-hover: #efe7d8; /* neutral hover on paper and sand */
+  --color-line-faint: #ece4d4; /* half-hour lines, inner dividers */
+  --color-line-strong: #cdbfa6; /* empty dots, hovered borders */
+
+  --focus-ring: 0 0 0 2px var(--color-surface), 0 0 0 4px var(--color-sun-ink);
+
   /* Type */
   --font-display: "Bricolage Grotesque Variable", system-ui, sans-serif;
   --font-body: "Inter Variable", system-ui, sans-serif;
+  --text-xs: 12px; /* meta, labels, timestamps (the floor) */
+  --text-sm: 13px; /* compact controls, secondary copy */
+  --text-md: 14px; /* UI default: rows, buttons, inputs */
+  --text-lg: 15px; /* note body text */
+  --text-xl: 22px; /* panel headlines */
+  --text-2xl: 28px; /* page titles, stat numbers */
+  --text-3xl: 44px; /* timer digits in the panel */
+  --text-4xl: 96px; /* focus screen timer */
+
+  /* Spacing (4px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
 
   /* Shape */
   --radius-sm: 8px;
   --radius-md: 14px;
   --radius-lg: 20px;
+  --control-sm: 28px;
+  --control-md: 32px;
+  --control-lg: 36px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+  }
 }
 
 html,

@@ -1,7 +1,12 @@
-import { ArrowsPointingOutIcon, ForwardIcon, PlayIcon, StopIcon, TrashIcon } from "@heroicons/react/20/solid";
+import { useState } from "react";
+import { ArrowsPointingOutIcon, PlayIcon, StopIcon, TrashIcon } from "@heroicons/react/20/solid";
 import type { PomodoroPlan, Session, TimerMode, TimerStatus } from "../api";
+import { fmtDuration } from "../lib/dashboard";
+import { cycleDots } from "../lib/focus";
 import { blockTotalMinutes, fmtElapsed, fmtRemaining, listedSessions, sameBlock, sessionLine, sessionsForBlock } from "../lib/timer";
 import { PlanRow } from "./PlanRow";
+import { Button } from "./ui/Button";
+import "../segmented.css";
 import "../timer.css";
 
 const IS_MAC = navigator.userAgent.includes("Mac");
@@ -43,97 +48,126 @@ export function timerReadout(status: Extract<TimerStatus, { state: "running" }>,
   return { time: fmtElapsed(nowMs - new Date(status.sessionStart).getTime()), phase: null };
 }
 
-/** "Focus 2 of 4" / "Break 2 of 4"; null for a free timer. */
-export function cycleLabel(status: Extract<TimerStatus, { state: "running" }>): string | null {
-  if (status.mode !== "pomodoro" || status.cycle === null || status.cycles === null) return null;
-  return `${status.phase === "focus" ? "Focus" : "Break"} ${status.cycle} of ${status.cycles}`;
-}
-
+/** The timer card: mode + focus screen on top, big digits + one primary button, then the Pomodoro plan line. */
 export function TimerBar({ block, timer }: Props) {
   const { status, mode } = timer;
+  const [editingPlan, setEditingPlan] = useState(false);
   const mine = status.state === "running" && status.date === timer.date && sameBlock(status.block, block);
+  if (!timer.isToday && !mine) return null;
+  const running = mine && status.state === "running" ? status : null;
+  const readout = running ? timerReadout(running, timer.nowMs) : null;
+  const pomodoro = running ? running.mode === "pomodoro" : mode === "pomodoro";
+  const idleTime = mode === "free" ? "0:00:00" : `${String(timer.plan.focusMinutes).padStart(2, "0")}:00`;
+  const dots = running ? cycleDots(running) : pomodoro ? cycleDots({ state: "idle" }, timer.plan.cycles) : [];
+  const onBreak = running?.phase === "break";
+
+  return (
+    <section className="timer" aria-label="Timer">
+      <div className="timer__top">
+        <div className="seg seg--sm" role="group" aria-label="Timer mode">
+          {(["free", "pomodoro"] as const).map((m) => (
+            <button key={m} className="seg__item" aria-pressed={(running ? running.mode : mode) === m} disabled={mine} onClick={() => timer.onMode(m)}>
+              {m === "free" ? "Free" : "Pomodoro"}
+            </button>
+          ))}
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon={ArrowsPointingOutIcon}
+          className="button--icon timer__focus"
+          aria-label="Open the focus screen"
+          title={`Focus screen (F, ${IS_MAC ? "⌘" : "Ctrl+"}⇧F)`}
+          onClick={timer.onFocus}
+        />
+      </div>
+      <div className="timer__main">
+        <span className="timer__clock" role="timer" aria-label="Timer reading">
+          {readout ? readout.time : idleTime}
+        </span>
+        {mine ? (
+          <Button size="lg" icon={StopIcon} onClick={timer.onStop}>
+            Stop
+          </Button>
+        ) : (
+          <Button variant="primary" size="lg" icon={PlayIcon} onClick={timer.onStart}>
+            Start
+          </Button>
+        )}
+      </div>
+      {pomodoro &&
+        (editingPlan && !running ? (
+          <div
+            className="timer__plan-edit"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === "Escape") {
+                e.preventDefault();
+                setEditingPlan(false);
+              }
+            }}
+            onBlur={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setEditingPlan(false);
+            }}
+          >
+            <PlanRow plan={timer.plan} onChange={timer.onPlan} autoFocus />
+          </div>
+        ) : (
+          <div className="timer__plan">
+            <span className="timer__dots" aria-hidden="true">
+              {dots.map((d, i) => (
+                <i key={i} className={`timer__dot timer__dot--${d}`} />
+              ))}
+            </span>
+            <span className="timer__phase">
+              {running && running.cycle !== null && running.cycles !== null
+                ? `${onBreak ? "Break" : "Focus"} ${running.cycle} of ${running.cycles} · ${running.focusMinutes} + ${running.breakMinutes}`
+                : `${timer.plan.cycles} × ${timer.plan.focusMinutes} min + ${timer.plan.breakMinutes} min break`}
+            </span>
+            {onBreak && (
+              <button className="timer__link" onClick={timer.onSkipBreak}>
+                Skip break
+              </button>
+            )}
+            {!running && (
+              <button className="timer__link timer__link--end" onClick={() => setEditingPlan(true)}>
+                Edit plan
+              </button>
+            )}
+          </div>
+        ))}
+    </section>
+  );
+}
+
+/** Footer summary of the block's finished sessions ("2 sessions · 48m"); opens to list them, each deletable. */
+export function SessionsSummary({ block, timer }: Props) {
+  const { status } = timer;
   // The live (or stale, handled by its banner) session is not listed; other open ones are crash leftovers.
   const runningStart =
     (status.state === "running" && status.phase === "focus") || status.state === "stale" ? status.sessionStart : null;
   const listed = listedSessions(sessionsForBlock(timer.sessions, block), runningStart);
+  if (listed.length === 0) return null;
   const total = blockTotalMinutes(listed);
-  const readout = mine && status.state === "running" ? timerReadout(status, timer.nowMs) : null;
-
   return (
-    <section className="timer" aria-label="Timer">
-      {(timer.isToday || mine) && (
-        <div className="timer__row">
-          <div className="timer__modes" role="group" aria-label="Timer mode">
-            {(["free", "pomodoro"] as const).map((m) => (
-              <button
-                key={m}
-                className={mode === m ? "timer__mode timer__mode--on" : "timer__mode"}
-                aria-pressed={mode === m}
-                disabled={mine}
-                onClick={() => timer.onMode(m)}
-              >
-                {m === "free" ? "Free" : "Pomodoro"}
-              </button>
-            ))}
-          </div>
-          <span className="timer__clock" role="timer" aria-label="Timer reading">
-            {readout ? readout.time : mode === "free" ? "0:00:00" : "--:--"}
-          </span>
-          {readout?.phase && <span className="timer__phase">{readout.phase}</span>}
-          {mine && status.state === "running" && status.phase === "break" && (
-            <button className="app__btn timer__btn" onClick={timer.onSkipBreak}>
-              <ForwardIcon className="app__icon" aria-hidden="true" />
-              Skip break
+    <details className="timer__sessions">
+      <summary className="timer__summary">
+        {listed.length === 1 ? "1 session" : `${listed.length} sessions`} · {fmtDuration(total)}
+      </summary>
+      <ul className="timer__list">
+        {listed.map((s) => (
+          <li key={s.start} className="timer__session">
+            <span>{sessionLine(s)}</span>
+            <button
+              className="timer__delete"
+              aria-label={`Delete session ${sessionLine(s)}`}
+              title="Delete this session"
+              onClick={() => timer.onDeleteSession(s.start)}
+            >
+              <TrashIcon className="app__icon" aria-hidden="true" />
             </button>
-          )}
-          {mine ? (
-            <button className="app__btn timer__btn" onClick={timer.onStop}>
-              <StopIcon className="app__icon" aria-hidden="true" />
-              Stop
-            </button>
-          ) : (
-            <button className="app__btn timer__btn timer__btn--start" onClick={timer.onStart}>
-              <PlayIcon className="app__icon" aria-hidden="true" />
-              Start
-            </button>
-          )}
-          <button
-            className="app__btn timer__focus"
-            aria-label="Open the focus screen"
-            title={`Focus screen (${IS_MAC ? "⌘" : "Ctrl+"}⇧F)`}
-            onClick={timer.onFocus}
-          >
-            <ArrowsPointingOutIcon className="app__icon" aria-hidden="true" />
-          </button>
-        </div>
-      )}
-      {mine && status.state === "running" && cycleLabel(status) ? (
-        <p className="timer__cycle">
-          {cycleLabel(status)} · {status.focusMinutes} min focus · {status.breakMinutes} min break
-        </p>
-      ) : (
-        timer.isToday && mode === "pomodoro" && <PlanRow plan={timer.plan} onChange={timer.onPlan} />
-      )}
-      {listed.length > 0 && (
-        <>
-          <ul className="timer__sessions">
-            {listed.map((s) => (
-              <li key={s.start} className="timer__session">
-                <span>{sessionLine(s)}</span>
-                <button
-                  className="timer__delete"
-                  aria-label={`Delete session ${sessionLine(s)}`}
-                  title="Delete this session"
-                  onClick={() => timer.onDeleteSession(s.start)}
-                >
-                  <TrashIcon className="app__icon" aria-hidden="true" />
-                </button>
-              </li>
-            ))}
-          </ul>
-          <p className="timer__total">Total {total} min</p>
-        </>
-      )}
-    </section>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }

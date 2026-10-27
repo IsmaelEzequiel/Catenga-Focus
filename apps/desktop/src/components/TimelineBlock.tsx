@@ -1,7 +1,8 @@
 import { useRef, type CSSProperties, type PointerEvent } from "react";
-import { CalendarIcon, TrashIcon } from "@heroicons/react/20/solid";
+import { CheckCircleIcon, TrashIcon } from "@heroicons/react/20/solid";
+import { fmtDuration } from "../lib/dashboard";
 import { fmtMinutes, PX_PER_MIN } from "../lib/time";
-import { formatTitleInput } from "../lib/tags";
+import { formatTitleInput, tagInkOf } from "../lib/tags";
 import { projectStyle } from "../lib/projects";
 
 export interface TimelineBlockProps {
@@ -19,6 +20,12 @@ export interface TimelineBlockProps {
   ghost?: boolean;
   /** A timer is running on this block. */
   timing?: boolean;
+  /** The running timer's reading, shown as a small live pill. */
+  live?: string | null;
+  /** Minutes of finished sessions on this block. */
+  logged?: number;
+  /** Has a session or a note (the dashboard's "done"). */
+  done?: boolean;
   /** "event": a Google Calendar event with no block yet (dashed, click to make a block); "synced": a block standing for one. */
   calendar?: "event" | "synced";
   onEventClick?: () => void;
@@ -42,16 +49,15 @@ export function TimelineBlock(p: TimelineBlockProps) {
     left: `${(p.lane / p.lanes) * 100}%`,
     width: `${100 / p.lanes}%`,
     "--block-color": p.color ?? undefined,
+    "--tag-ink": p.color ? tagInkOf(p.color) : undefined,
     ...projectStyle(p.projectColor ?? null),
   } as CSSProperties;
   const classes = [
     "block",
-    p.color ? "" : "block--untagged",
     p.selected ? "block--selected" : "",
     p.ghost ? "block--ghost" : "",
-    p.timing ? "block--timing" : "",
     p.calendar === "event" ? "block--event" : "",
-    height < 32 ? "block--compact" : "",
+    height < 32 ? "block--compact" : height < 44 ? "block--short" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -98,10 +104,6 @@ export function TimelineBlock(p: TimelineBlockProps) {
           <div className="block__handle block__handle--bottom" onPointerDown={(e) => p.onHandlePointerDown?.(e, "end")} />
         </>
       )}
-      <span className="block__time">
-        {p.calendar && <CalendarIcon className="block__cal" aria-hidden="true" />}
-        {fmtMinutes(p.start)}–{fmtMinutes(p.end)}
-      </span>
       {p.calendar === "event" && p.onEventDelete && (
         <button
           type="button"
@@ -133,7 +135,27 @@ export function TimelineBlock(p: TimelineBlockProps) {
           onBlur={(e) => finish(true, e.currentTarget.value)}
         />
       ) : (
-        <span className={p.title ? "block__title" : "block__title block__title--empty"}>{p.title || "Untitled"}</span>
+        <span className="block__head">
+          <span className={p.title ? "block__title" : "block__title block__title--empty"}>{p.title || "Untitled"}</span>
+          {p.done && !p.live && <CheckCircleIcon className="block__done" aria-label="Done" />}
+          {p.live && (
+            <span className="block__live" role="timer" aria-live="off">
+              <i className="block__live-dot" aria-hidden="true" />
+              {p.live}
+            </span>
+          )}
+        </span>
+      )}
+      {!p.ghost && (
+        <span className="block__meta">
+          {[
+            `${fmtMinutes(p.start)}–${fmtMinutes(p.end)}`,
+            p.tags.length > 0 ? p.tags.map((t) => `#${t}`).join(" ") : p.calendar ? "Google Calendar" : null,
+            p.logged ? `${fmtDuration(p.logged)} logged` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </span>
       )}
     </div>
   );
