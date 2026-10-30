@@ -1,28 +1,24 @@
-import {
-  useEffect,
-  useRef,
-  useState,
-  type KeyboardEvent,
-  type ReactNode,
-} from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import {
-  ArrowPathIcon,
-  CalendarIcon,
-  FolderOpenIcon,
-} from "@heroicons/react/20/solid";
+import { ArrowPathIcon, FolderOpenIcon } from "@heroicons/react/20/solid";
 import {
   loadConfig,
   notesDirInfo,
   type Config,
-  GoogleStatus,
+  type GoogleStatus,
   type NotesDirInfo,
   type SyncStatus,
 } from "../api";
 import type { ApplyResult } from "../lib/notesFolder";
 import type { AccountState } from "../hooks/useAccount";
-import { canReconnect, reconnectHint } from "../lib/projects";
+import type { useProjects } from "../hooks/useProjects";
+import { useTags } from "../hooks/useTags";
+import { SETTINGS_TABS, moveTab, type SettingsTab } from "../lib/settingsTabs";
 import { notesLines, syncLine } from "../lib/sync";
+import { CalendarsPane } from "./CalendarsPane";
+import { ProjectsPane } from "./ProjectsPane";
+import { ErrorBanner, Row, Section } from "./settingsParts";
+import { TagsPane } from "./TagsPane";
 import { Banner } from "./ui/Banner";
 import { Button } from "./ui/Button";
 import "../settings.css";
@@ -41,7 +37,12 @@ interface Props {
   };
   onGoogleConnect: () => void;
   onGoogleCancel: () => void;
-  onGoogleDisconnect: () => void;
+  onGoogleDisconnect: (email: string) => void;
+  onGoogleSetNewEventCalendar: (googleCalendarId: string) => void;
+  /** Shared with the timeline and the Goals page. */
+  projects: ReturnType<typeof useProjects>;
+  /** The pane to open on; General when omitted. */
+  initialTab?: SettingsTab;
   /** Flushes the notes, saves the folder (`null` = default) and restarts the app. */
   onApplyNotesFolder: (path: string | null) => Promise<ApplyResult>;
   onClose: () => void;
@@ -59,11 +60,19 @@ export function Settings({
   onGoogleConnect,
   onGoogleCancel,
   onGoogleDisconnect,
+  onGoogleSetNewEventCalendar,
+  projects,
+  initialTab = "general",
   onApplyNotesFolder,
   onClose,
   onShowShortcuts,
 }: Props) {
   const panel = useRef<HTMLDivElement>(null);
+  const tabRefs = useRef(new Map<SettingsTab, HTMLButtonElement>());
+  const [tab, setTab] = useState<SettingsTab>(initialTab);
+  const tags = useTags();
+  const { refresh } = projects;
+  const canRead = !!google.status?.connected && !google.status.needsReconnect;
 
   useEffect(() => {
     const previous = document.activeElement;
@@ -72,6 +81,11 @@ export function Settings({
       if (previous instanceof HTMLElement) previous.focus();
     };
   }, []);
+
+  // Opening Calendars or Projects re-reads the calendar list, at most every 10 minutes.
+  useEffect(() => {
+    if (canRead && (tab === "calendars" || tab === "projects")) void refresh(false);
+  }, [canRead, tab, refresh]);
 
   const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
     if (e.key === "Escape") {
@@ -82,6 +96,14 @@ export function Settings({
       // Day navigation behind the dialog must not fire.
       e.stopPropagation();
     }
+  };
+
+  const onTabKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
+    const next = moveTab(tab, e.key);
+    if (!next) return;
+    e.preventDefault();
+    setTab(next);
+    tabRefs.current.get(next)?.focus();
   };
 
   return (
@@ -111,152 +133,126 @@ export function Settings({
             Esc
           </button>
         </header>
-        <Section id="settings-account" title="Account">
-          {account.kind === "signedOut" && (
-            <Row
-              label="Not signed in"
-              hint="Sign in to sync later. The app works fully without an account."
-            >
-              <Button size="sm" onClick={onSignIn}>
-                Sign in
-              </Button>
-            </Row>
-          )}
-          {account.kind === "signingIn" && (
-            <Row label="Signing in" hint="Check your browser and email…" status>
-              <Button size="sm" onClick={onCancel}>
-                Cancel
-              </Button>
-            </Row>
-          )}
-          {account.kind === "signedIn" && (
-            <>
-              <Row label={account.user.name} hint={account.user.email}>
-                <Button size="sm" onClick={onSignOut}>
-                  Sign out
-                </Button>
-              </Row>
-              <SyncRows sync={sync} onSyncNow={onSyncNow} />
-            </>
-          )}
-          {account.kind === "signedInOffline" && (
-            <Row label="Signed in (offline)" hint="The app keeps working.">
-              <Button size="sm" onClick={onSignOut}>
-                Sign out
-              </Button>
-            </Row>
-          )}
-          {account.kind === "error" && (
-            <ErrorBanner
-              text="Couldn't sign in."
-              detail={account.message}
-              action={
-                <Button size="sm" onClick={onSignIn}>
-                  Try again
-                </Button>
-              }
-            />
-          )}
-        </Section>
-        <Section id="settings-general" title="General">
-          {google.status && (
-            <GoogleRows
-              google={google}
-              onConnect={onGoogleConnect}
-              onCancel={onGoogleCancel}
-              onDisconnect={onGoogleDisconnect}
-            />
-          )}
-          <NotesFolder onApply={onApplyNotesFolder} />
-          <TimerDefaultsRow />
-          <Row label="Keyboard shortcuts" value="?">
-            <Button size="sm" onClick={onShowShortcuts}>
-              View
-            </Button>
-          </Row>
-        </Section>
+        <div className="settings__body">
+          <div className="settings__nav" role="tablist" aria-label="Settings" aria-orientation="vertical">
+            {SETTINGS_TABS.map((t) => (
+              <button
+                key={t.id}
+                ref={(el) => {
+                  if (el) tabRefs.current.set(t.id, el);
+                  else tabRefs.current.delete(t.id);
+                }}
+                type="button"
+                role="tab"
+                id={`settings-tab-${t.id}`}
+                aria-selected={tab === t.id}
+                aria-controls={`settings-pane-${t.id}`}
+                tabIndex={tab === t.id ? 0 : -1}
+                className="settings__navitem"
+                onClick={() => setTab(t.id)}
+                onKeyDown={onTabKeyDown}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <div
+            className="settings__pane"
+            role="tabpanel"
+            id={`settings-pane-${tab}`}
+            aria-labelledby={`settings-tab-${tab}`}
+          >
+            {tab === "general" && (
+              <>
+                <Section id="settings-account" title="Account">
+                  {account.kind === "signedOut" && (
+                    <Row
+                      label="Not signed in"
+                      hint="Sign in to sync later. The app works fully without an account."
+                    >
+                      <Button size="sm" onClick={onSignIn}>
+                        Sign in
+                      </Button>
+                    </Row>
+                  )}
+                  {account.kind === "signingIn" && (
+                    <Row label="Signing in" hint="Check your browser and email…" status>
+                      <Button size="sm" onClick={onCancel}>
+                        Cancel
+                      </Button>
+                    </Row>
+                  )}
+                  {account.kind === "signedIn" && (
+                    <>
+                      <Row label={account.user.name} hint={account.user.email}>
+                        <Button size="sm" onClick={onSignOut}>
+                          Sign out
+                        </Button>
+                      </Row>
+                      <SyncRows sync={sync} onSyncNow={onSyncNow} />
+                    </>
+                  )}
+                  {account.kind === "signedInOffline" && (
+                    <Row label="Signed in (offline)" hint="The app keeps working.">
+                      <Button size="sm" onClick={onSignOut}>
+                        Sign out
+                      </Button>
+                    </Row>
+                  )}
+                  {account.kind === "error" && (
+                    <ErrorBanner
+                      text="Couldn't sign in."
+                      detail={account.message}
+                      action={
+                        <Button size="sm" onClick={onSignIn}>
+                          Try again
+                        </Button>
+                      }
+                    />
+                  )}
+                </Section>
+                <Section id="settings-general" title="General">
+                  <NotesFolder onApply={onApplyNotesFolder} />
+                  <TimerDefaultsRow />
+                  <Row label="Keyboard shortcuts" value="?">
+                    <Button size="sm" onClick={onShowShortcuts}>
+                      View
+                    </Button>
+                  </Row>
+                </Section>
+              </>
+            )}
+            {tab === "calendars" && (
+              <CalendarsPane
+                status={google.status}
+                connecting={google.connecting}
+                error={google.error}
+                calendars={projects.calendars}
+                onConnect={onGoogleConnect}
+                onCancel={onGoogleCancel}
+                onDisconnect={onGoogleDisconnect}
+                onSetNewEventCalendar={onGoogleSetNewEventCalendar}
+                onSetShown={(id, shown) => void projects.setShown(id, shown)}
+              />
+            )}
+            {tab === "projects" && (
+              <ProjectsPane
+                projects={projects.list}
+                error={projects.error}
+                refreshing={projects.refreshing}
+                google={google.status}
+                onRefresh={() => void projects.refresh(true)}
+                onConnect={onGoogleConnect}
+                onSetArchived={(id, archived) => void projects.setArchived(id, archived)}
+              />
+            )}
+            {tab === "tags" && (
+              <TagsPane tags={tags.list} error={tags.error} onSave={tags.save} onDelete={tags.remove} />
+            )}
+          </div>
+        </div>
       </div>
     </div>
-  );
-}
-
-function GoogleRows({
-  google,
-  onConnect,
-  onCancel,
-  onDisconnect,
-}: {
-  google: Props["google"];
-  onConnect: () => void;
-  onCancel: () => void;
-  onDisconnect: () => void;
-}) {
-  const status = google.status;
-  if (!status) return null;
-  const retry = (
-    <Button size="sm" onClick={onConnect}>
-      Try again
-    </Button>
-  );
-  if (!status.configured)
-    return <Row label="Google Calendar" value="Not available in this build" />;
-  if (google.connecting) {
-    return (
-      <Row
-        label="Google Calendar"
-        value="Waiting for Google in your browser…"
-        status
-      >
-        <Button size="sm" onClick={onCancel}>
-          Cancel
-        </Button>
-      </Row>
-    );
-  }
-  return (
-    <>
-      <Row
-        label="Google Calendar"
-        value={
-          status.connected
-            ? `Connected${status.email ? ` · ${status.email}` : ""}`
-            : "Not connected"
-        }
-      >
-        {status.connected ? (
-          <>
-            {canReconnect(status) && (
-              <Button size="sm" icon={CalendarIcon} onClick={onConnect}>
-                Reconnect
-              </Button>
-            )}
-            <Button size="sm" onClick={onDisconnect}>
-              Disconnect
-            </Button>
-          </>
-        ) : (
-          <Button size="sm" icon={CalendarIcon} onClick={onConnect}>
-            Connect
-          </Button>
-        )}
-      </Row>
-      {status.connected && canReconnect(status) && (
-        <Banner tone="info" variant="inline">
-          {reconnectHint(status)}
-        </Banner>
-      )}
-      {google.error && (
-        <ErrorBanner
-          text={
-            status.connected
-              ? "Google Calendar had a problem."
-              : "Couldn't connect to Google Calendar."
-          }
-          detail={google.error}
-          action={retry}
-        />
-      )}
-    </>
   );
 }
 
@@ -272,83 +268,6 @@ function TimerDefaultsRow() {
       label="Timer defaults"
       value={`Pomodoro · ${config.pomodoroCycles} × ${config.pomodoroFocusMinutes} + ${config.pomodoroBreakMinutes}`}
     />
-  );
-}
-
-function Section({
-  id,
-  title,
-  children,
-}: {
-  id: string;
-  title: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className="settings__section" aria-labelledby={id}>
-      <h3 id={id} className="settings__heading">
-        {title}
-      </h3>
-      <div className="settings__rows">{children}</div>
-    </section>
-  );
-}
-
-/** label on the left; value and small actions on the right. */
-function Row({
-  label,
-  hint,
-  value,
-  status,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  value?: string;
-  status?: boolean;
-  children?: ReactNode;
-}) {
-  return (
-    <div className="settings__row">
-      <div className="settings__main">
-        <span className="settings__label">{label}</span>
-        {hint && (
-          <span className="settings__hint" role={status ? "status" : undefined}>
-            {hint}
-          </span>
-        )}
-      </div>
-      {(value || children) && (
-        <div className="settings__side">
-          {value && (
-            <span
-              className="settings__value"
-              role={status ? "status" : undefined}
-            >
-              {value}
-            </span>
-          )}
-          {children && <div className="settings__actions">{children}</div>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** A friendly sentence with the raw error kept as a tooltip, plus a retry action. */
-function ErrorBanner({
-  text,
-  detail,
-  action,
-}: {
-  text: string;
-  detail: string;
-  action: ReactNode;
-}) {
-  return (
-    <Banner tone="error" variant="inline" actions={action}>
-      <span title={detail}>{text}</span>
-    </Banner>
   );
 }
 

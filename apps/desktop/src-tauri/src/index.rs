@@ -19,7 +19,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
 /// Bump when the schema changes; a mismatch resets the database (it is only a cache).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +79,7 @@ CREATE TABLE calendar_events(date TEXT NOT NULL, event_id TEXT NOT NULL, ord INT
                              title TEXT NOT NULL, html_link TEXT,
                              calendar_id TEXT NOT NULL DEFAULT '',
                              recurring_event_id TEXT,
+                             tags TEXT NOT NULL DEFAULT '',
                              PRIMARY KEY(date, event_id));
 CREATE TABLE calendar_days(date TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL);
 CREATE TABLE sidecars(date TEXT PRIMARY KEY, path TEXT NOT NULL, size INTEGER NOT NULL,
@@ -778,8 +779,8 @@ impl Index {
         let write = |tx: &Transaction| -> rusqlite::Result<()> {
             tx.execute("DELETE FROM calendar_events WHERE date = ?1", [date])?;
             let mut insert = tx.prepare(
-                "INSERT OR REPLACE INTO calendar_events(date, event_id, ord, start, \"end\", title, html_link, calendar_id, recurring_event_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT OR REPLACE INTO calendar_events(date, event_id, ord, start, \"end\", title, html_link, calendar_id, recurring_event_id, tags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for (ord, e) in events.iter().enumerate() {
                 insert.execute(params![
@@ -791,7 +792,8 @@ impl Index {
                     e.title,
                     e.html_link,
                     e.calendar_id,
-                    e.recurring_event_id
+                    e.recurring_event_id,
+                    e.tags.join(" ")
                 ])?;
             }
             drop(insert);
@@ -824,7 +826,7 @@ impl Index {
                 return Ok(None);
             };
             let mut stmt = conn.prepare(
-                "SELECT event_id, start, \"end\", title, html_link, calendar_id, recurring_event_id FROM calendar_events
+                "SELECT event_id, start, \"end\", title, html_link, calendar_id, recurring_event_id, tags FROM calendar_events
                  WHERE date = ?1 ORDER BY ord",
             )?;
             let events = stmt
@@ -840,6 +842,11 @@ impl Index {
                         project_key: None,
                         project_id: None,
                         color: String::new(),
+                        tags: r
+                            .get::<_, String>(7)?
+                            .split_whitespace()
+                            .map(str::to_string)
+                            .collect(),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -929,6 +936,7 @@ mod tests {
             project_key: None,
             project_id: None,
             color: String::new(),
+            tags: vec![],
         }
     }
 
@@ -1005,7 +1013,7 @@ mod tests {
         }
         let idx = env.open();
         assert_eq!(user_version(&env.db), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         assert_eq!(idx.calendar_day("2026-10-21").unwrap(), None);
     }
 
@@ -1983,6 +1991,38 @@ mod tests {
             events
                 .iter()
                 .all(|e| e.project_key.is_none() && e.project_id.is_none())
+        );
+    }
+
+    #[test]
+    fn calendar_events_keep_their_tags() {
+        let env = Env::new();
+        let idx = env.open();
+        let mut a = ev("a", 540, 600, "A");
+        a.tags = vec!["rust".into(), "mestrado".into()];
+        let b = ev("b", 600, 660, "B");
+        idx.replace_calendar_day("2026-10-21", &[a, b], 1).unwrap();
+        let (events, _) = idx.calendar_day("2026-10-21").unwrap().unwrap();
+        assert_eq!(events[0].tags, ["rust", "mestrado"]);
+        assert!(events[1].tags.is_empty());
+    }
+
+    #[test]
+    fn an_index_from_schema_v5_is_rebuilt_with_the_tags_column() {
+        let env = Env::new();
+        fs::create_dir_all(env.db.parent().unwrap()).unwrap();
+        {
+            let c = Connection::open(&env.db).unwrap();
+            c.execute_batch("CREATE TABLE meta(key TEXT, value TEXT); PRAGMA user_version = 5;")
+                .unwrap();
+        }
+        let idx = env.open();
+        assert_eq!(user_version(&env.db), SCHEMA_VERSION);
+        assert!(
+            idx.reader()
+                .unwrap()
+                .prepare("SELECT tags FROM calendar_events")
+                .is_ok()
         );
     }
 

@@ -6,3 +6,4 @@ server/dev.sqlite*
 **/.env
 **/.env.*
 !**/.env.example
+server/dev-blobs/

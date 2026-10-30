@@ -143,8 +143,20 @@ CREATE TABLE file_sync (path TEXT PRIMARY KEY,
                         remote_seq INTEGER);
 ";
 
+/// v5 (M15): the Google account (its email) a calendar was listed by. `NULL` for rows
+/// from before several accounts; the next calendar refresh fills it.
+const V5: &str = "
+ALTER TABLE calendars ADD COLUMN account TEXT;
+";
+
 fn migrations() -> Vec<String> {
-    vec![V1.to_string(), V2.to_string(), v3(), V4.to_string()]
+    vec![
+        V1.to_string(),
+        V2.to_string(),
+        v3(),
+        V4.to_string(),
+        V5.to_string(),
+    ]
 }
 
 /// A Google calendar as the frontend sees it. It only decides what shows on the timeline.
@@ -157,8 +169,11 @@ pub struct Calendar {
     /// Google's `backgroundColor` (`#rrggbb`).
     pub color: String,
     pub show_on_timeline: bool,
+    /// Primary calendar of its account.
     pub is_primary: bool,
     pub archived: bool,
+    /// Email of the Google account that owns it; `None` until the next refresh fills it.
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -376,28 +391,50 @@ impl AppDb {
         self.with_conn("reading calendars", |conn| read_calendars(conn))
     }
 
-    /// Mirrors Google's calendar list: upserts every listed calendar and
-    /// archives the ones that are gone (never deleted).
-    /// A calendar seen for the first time is shown when Google has it selected.
+    /// Test shorthand: calendars of no account.
+    #[cfg(test)]
     pub fn upsert_calendars(&self, calendars: &[CalendarInfo], now: i64) -> Result<(), String> {
+        self.upsert_account_calendars(None, false, calendars, now)
+    }
+
+    /// Mirrors one Google account's calendar list: upserts every listed calendar and
+    /// archives that account's calendars that are gone (never deleted). A calendar
+    /// seen for the first time is shown when Google has it selected.
+    /// A calendar another live account already owns stays with that account (the
+    /// first one wins); one left over from a disconnected account is taken over.
+    /// `adopt_unowned` (the first account) also archives rows without an account
+    /// (from before several accounts) that the list no longer has.
+    pub fn upsert_account_calendars(
+        &self,
+        account: Option<&str>,
+        adopt_unowned: bool,
+        calendars: &[CalendarInfo],
+        now: i64,
+    ) -> Result<(), String> {
         self.with_conn("saving calendars", |conn| {
             let tx = conn.transaction()?;
             for c in calendars {
                 tx.execute(
                     "INSERT INTO calendars(google_calendar_id, name, color, show_on_timeline,
-                                           is_primary, archived, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                                           is_primary, archived, updated_at, account)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
                      ON CONFLICT(google_calendar_id) DO UPDATE SET
                        name = excluded.name, color = excluded.color,
                        is_primary = excluded.is_primary, archived = 0,
-                       updated_at = excluded.updated_at",
-                    params![c.id, c.name, c.color, c.selected, c.primary, now],
+                       updated_at = excluded.updated_at, account = excluded.account
+                     WHERE calendars.account IS NULL OR calendars.account IS excluded.account
+                        OR calendars.archived = 1",
+                    params![c.id, c.name, c.color, c.selected, c.primary, now, account],
                 )?;
             }
-            let mut stmt =
-                tx.prepare("SELECT id, google_calendar_id FROM calendars WHERE archived = 0")?;
+            let mut stmt = tx.prepare(
+                "SELECT id, google_calendar_id FROM calendars
+                 WHERE archived = 0 AND (account IS ?1 OR (account IS NULL AND ?2))",
+            )?;
             let live: Vec<(i64, String)> = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .query_map(params![account, adopt_unowned], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
                 .collect::<rusqlite::Result<_>>()?;
             drop(stmt);
             for (id, calendar_id) in live {
@@ -409,6 +446,54 @@ impl AppDb {
                 }
             }
             tx.commit()
+        })
+    }
+
+    /// Archives the calendars of every account that is not in `connected` (a
+    /// disconnected account). Never deleted: projects and goals still point at them,
+    /// and connecting the account again brings them back. Returns whether any changed.
+    pub fn archive_calendars_except(&self, connected: &[String], now: i64) -> Result<bool, String> {
+        self.with_conn("archiving calendars", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, account FROM calendars WHERE archived = 0 AND account IS NOT NULL",
+            )?;
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            let mut changed = false;
+            for (id, account) in rows {
+                if !connected.contains(&account) {
+                    conn.execute(
+                        "UPDATE calendars SET archived = 1, updated_at = ?2 WHERE id = ?1",
+                        params![id, now],
+                    )?;
+                    changed = true;
+                }
+            }
+            Ok(changed)
+        })
+    }
+
+    /// A local setting (not synced).
+    pub fn meta(&self, key: &str) -> Result<Option<String>, String> {
+        self.with_conn("reading meta", |conn| {
+            conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })
+        })
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        self.with_conn("saving meta", |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map(drop)
         })
     }
 
@@ -624,7 +709,7 @@ pub fn set_flag_in(conn: &Connection, key: &str) -> rusqlite::Result<()> {
 
 fn read_calendars(conn: &Connection) -> rusqlite::Result<Vec<Calendar>> {
     let mut stmt = conn.prepare(
-        "SELECT id, google_calendar_id, name, color, show_on_timeline, is_primary, archived
+        "SELECT id, google_calendar_id, name, color, show_on_timeline, is_primary, archived, account
          FROM calendars ORDER BY archived, is_primary DESC, name COLLATE NOCASE, id",
     )?;
     stmt.query_map([], |r| {
@@ -636,6 +721,7 @@ fn read_calendars(conn: &Connection) -> rusqlite::Result<Vec<Calendar>> {
             show_on_timeline: r.get(4)?,
             is_primary: r.get(5)?,
             archived: r.get(6)?,
+            account: r.get(7)?,
         })
     })?
     .collect()
@@ -755,7 +841,7 @@ mod tests {
     #[test]
     fn fresh_database_gets_the_latest_schema_and_no_backup() {
         let f = fixture();
-        assert_eq!(user_version(&f.path), 4);
+        assert_eq!(user_version(&f.path), 5);
         for table in [
             "meta",
             "calendars",
@@ -875,7 +961,7 @@ mod tests {
         let path = tmp.0.join("catenga.sqlite");
         build_v1(&path);
         let db = AppDb::open(&path).unwrap();
-        assert_eq!(user_version(&path), 4);
+        assert_eq!(user_version(&path), 5);
 
         // The old projects are the calendars, ids and choices intact.
         let cals = db.calendars().unwrap();
@@ -981,7 +1067,7 @@ mod tests {
         drop(AppDb::open(&path).unwrap());
         let db = AppDb::open(&path).unwrap();
         assert_eq!(db.calendars().unwrap().len(), 2);
-        assert_eq!(user_version(&path), 4);
+        assert_eq!(user_version(&path), 5);
     }
 
     /// A real v2 file with data of every kind the v3 migration touches.
@@ -1009,7 +1095,7 @@ mod tests {
         let path = tmp.0.join("catenga.sqlite");
         build_v2(&path);
         let db = AppDb::open(&path).unwrap();
-        assert_eq!(user_version(&path), 4);
+        assert_eq!(user_version(&path), 5);
         // Backup of v2, untouched, without the new columns.
         let bak = backup_path(&path, 2);
         assert_eq!(user_version(&bak), 2);
@@ -1140,7 +1226,7 @@ mod tests {
         let path = tmp.0.join("catenga.sqlite");
         build_v3(&path);
         let db = AppDb::open(&path).unwrap();
-        assert_eq!(user_version(&path), 4);
+        assert_eq!(user_version(&path), 5);
         let cols: Vec<String> = db
             .with_conn("t", |c| {
                 c.prepare("SELECT name FROM pragma_table_info('file_sync') ORDER BY cid")?
@@ -1280,6 +1366,7 @@ mod tests {
                     V2.to_string(),
                     v3(),
                     V4.to_string(),
+                    V5.to_string(),
                     "SELECT 1;".to_string(),
                 ],
             )
@@ -1289,7 +1376,7 @@ mod tests {
         let err = AppDb::open(&path).err().expect("must fail");
         assert!(err.contains("newer version"), "{err}");
         assert_eq!(fs::read(&path).unwrap(), before);
-        assert_eq!(user_version(&path), 5);
+        assert_eq!(user_version(&path), 6);
     }
 
     #[test]
@@ -1411,7 +1498,7 @@ mod tests {
         let p = f.db.calendars().unwrap();
         assert_eq!(
             serde_json::to_value(&p[0]).unwrap(),
-            serde_json::json!({"id":1,"googleCalendarId":"me@x","name":"Me","color":"#16a765","showOnTimeline":true,"isPrimary":true,"archived":false})
+            serde_json::json!({"id":1,"googleCalendarId":"me@x","name":"Me","color":"#16a765","showOnTimeline":true,"isPrimary":true,"archived":false,"account":null})
         );
     }
 
@@ -1615,6 +1702,233 @@ mod tests {
                 .map(|p| p.name)
                 .collect();
         assert_eq!(order, ["Alpha", "zeta", "AAA event", "Old"]);
+    }
+
+    /// A real v4 file with calendars, a project and a goal.
+    fn build_v4(path: &Path) {
+        let c = open_with(
+            path,
+            &[V1.to_string(), V2.to_string(), v3(), V4.to_string()],
+        )
+        .unwrap();
+        c.execute_batch(
+            "INSERT INTO calendars(id, google_calendar_id, name, color, show_on_timeline, is_primary, archived, updated_at)
+               VALUES (1, 'me@x', 'Me', '#111111', 1, 1, 0, 5), (2, 'hid@x', 'Hidden', '#222222', 0, 0, 0, 6);
+             INSERT INTO projects(id, kind, google_id, calendar_id, name, archived, updated_at)
+               VALUES (1, 'series', 's1', 'me@x', 'Learn Rust', 0, 7);
+             INSERT INTO goals(id, project_id, minutes_per_day, start, created_at, updated_at)
+               VALUES (1, 1, 60, '2026-10-01', 1, 2);
+             INSERT INTO meta(key, value) VALUES ('sync_cursor:u1', '42');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_to_v5_adds_the_account_column_keeps_every_row_and_backs_up() {
+        let tmp = TempDir::new();
+        let path = tmp.0.join("catenga.sqlite");
+        build_v4(&path);
+        let db = AppDb::open(&path).unwrap();
+        assert_eq!(user_version(&path), 5);
+        let cals = db.calendars().unwrap();
+        assert_eq!(cals.len(), 2);
+        assert!(cals.iter().all(|c| c.account.is_none()));
+        assert_eq!(
+            (
+                cals[0].name.as_str(),
+                cals[0].color.as_str(),
+                cals[0].is_primary
+            ),
+            ("Me", "#111111", true)
+        );
+        assert!(!cals[1].show_on_timeline);
+        assert_eq!(db.projects().unwrap().len(), 1);
+        assert_eq!(db.meta("sync_cursor:u1").unwrap().as_deref(), Some("42"));
+        let bak = backup_path(&path, 4);
+        assert!(bak.exists());
+        assert_eq!(user_version(&bak), 4);
+        assert!(
+            Connection::open(&bak)
+                .unwrap()
+                .prepare("SELECT account FROM calendars")
+                .is_err()
+        );
+        // Reopening is a no-op.
+        drop(db);
+        assert_eq!(AppDb::open(&path).unwrap().calendars().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_failing_v5_rolls_back_to_the_untouched_v4() {
+        let tmp = TempDir::new();
+        let path = tmp.0.join("catenga.sqlite");
+        build_v4(&path);
+        let err = open_with(
+            &path,
+            &[
+                V1.to_string(),
+                V2.to_string(),
+                v3(),
+                V4.to_string(),
+                format!("{V5} NOT SQL;"),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("to v5"), "{err}");
+        assert_eq!(user_version(&path), 4);
+        let c = Connection::open(&path).unwrap();
+        assert!(c.prepare("SELECT account FROM calendars").is_err());
+    }
+
+    fn account_of(db: &AppDb, google_id: &str) -> (Option<String>, bool, String) {
+        let c = db
+            .calendars()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.google_calendar_id == google_id)
+            .unwrap();
+        (c.account, c.archived, c.name)
+    }
+
+    #[test]
+    fn calendars_are_kept_per_account_and_a_shared_one_stays_with_the_first() {
+        let f = fixture();
+        let a = Some("a@x");
+        let b = Some("b@x");
+        f.db.upsert_account_calendars(
+            a,
+            true,
+            &[
+                cal("a@x", "A", true, true),
+                cal("shared@x", "Shared (A)", false, true),
+            ],
+            1,
+        )
+        .unwrap();
+        f.db.upsert_account_calendars(
+            b,
+            false,
+            &[
+                cal("b@x", "B", true, true),
+                cal("shared@x", "Shared (B)", false, true),
+            ],
+            2,
+        )
+        .unwrap();
+        assert_eq!(account_of(&f.db, "a@x").0.as_deref(), Some("a@x"));
+        assert_eq!(account_of(&f.db, "b@x").0.as_deref(), Some("b@x"));
+        assert_eq!(
+            account_of(&f.db, "shared@x"),
+            (Some("a@x".into()), false, "Shared (A)".into())
+        );
+        // B's refresh never archives A's calendars; each primary is its own account's.
+        f.db.upsert_account_calendars(b, false, &[cal("b@x", "B", true, true)], 3)
+            .unwrap();
+        assert!(!account_of(&f.db, "a@x").1 && !account_of(&f.db, "shared@x").1);
+        assert_eq!(
+            f.db.calendars()
+                .unwrap()
+                .iter()
+                .filter(|c| c.is_primary)
+                .count(),
+            2
+        );
+        // A drops the shared calendar: archived, then B can take it over.
+        f.db.upsert_account_calendars(a, true, &[cal("a@x", "A", true, true)], 4)
+            .unwrap();
+        assert!(account_of(&f.db, "shared@x").1);
+        f.db.upsert_account_calendars(
+            b,
+            false,
+            &[
+                cal("b@x", "B", true, true),
+                cal("shared@x", "Shared (B)", false, true),
+            ],
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            account_of(&f.db, "shared@x"),
+            (Some("b@x".into()), false, "Shared (B)".into())
+        );
+    }
+
+    #[test]
+    fn old_rows_without_an_account_get_one_and_are_archived_only_by_the_first_account() {
+        let f = fixture();
+        f.db.upsert_calendars(
+            &[
+                cal("me@x", "Me", true, true),
+                cal("gone@x", "Gone", false, true),
+            ],
+            1,
+        )
+        .unwrap();
+        // A second account's refresh leaves them alone.
+        f.db.upsert_account_calendars(Some("b@x"), false, &[cal("b@x", "B", true, true)], 2)
+            .unwrap();
+        assert!(!account_of(&f.db, "gone@x").1);
+        // The first account claims what it lists and archives what it no longer has.
+        f.db.upsert_account_calendars(Some("me@x"), true, &[cal("me@x", "Me", true, true)], 3)
+            .unwrap();
+        assert_eq!(account_of(&f.db, "me@x").0.as_deref(), Some("me@x"));
+        assert!(account_of(&f.db, "gone@x").1);
+    }
+
+    #[test]
+    fn calendars_of_a_disconnected_account_are_archived_and_come_back_on_refresh() {
+        let f = fixture();
+        f.db.upsert_account_calendars(Some("a@x"), true, &[cal("a@x", "A", true, true)], 1)
+            .unwrap();
+        f.db.upsert_account_calendars(
+            Some("b@x"),
+            false,
+            &[cal("b@x", "B", true, true), cal("b2@x", "B2", false, true)],
+            1,
+        )
+        .unwrap();
+        let hidden =
+            f.db.calendars()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.google_calendar_id == "b2@x")
+                .unwrap();
+        f.db.set_shown(hidden.id, false, 2).unwrap();
+        assert!(f.db.archive_calendars_except(&["a@x".into()], 3).unwrap());
+        assert!(!account_of(&f.db, "a@x").1);
+        assert!(account_of(&f.db, "b@x").1 && account_of(&f.db, "b2@x").1);
+        assert!(!f.db.archive_calendars_except(&["a@x".into()], 4).unwrap());
+        assert_eq!(f.db.calendars().unwrap().len(), 3, "never deleted");
+        // Connected again: the next refresh un-archives them, keeping the user's choices.
+        f.db.upsert_account_calendars(
+            Some("b@x"),
+            false,
+            &[cal("b@x", "B", true, true), cal("b2@x", "B2", false, true)],
+            5,
+        )
+        .unwrap();
+        assert!(!account_of(&f.db, "b@x").1 && !account_of(&f.db, "b2@x").1);
+        assert!(
+            !f.db
+                .calendars()
+                .unwrap()
+                .iter()
+                .find(|c| c.id == hidden.id)
+                .unwrap()
+                .show_on_timeline
+        );
+    }
+
+    #[test]
+    fn meta_values_round_trip() {
+        let f = fixture();
+        assert_eq!(f.db.meta("new_event_calendar").unwrap(), None);
+        f.db.set_meta("new_event_calendar", "a@x").unwrap();
+        f.db.set_meta("new_event_calendar", "b@x").unwrap();
+        assert_eq!(
+            f.db.meta("new_event_calendar").unwrap().as_deref(),
+            Some("b@x")
+        );
     }
 
     #[test]

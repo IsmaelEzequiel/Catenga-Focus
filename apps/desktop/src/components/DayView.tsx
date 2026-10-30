@@ -318,7 +318,7 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
   const openEvent = (event: CalEvent) => {
     if (!loaded || pending) return;
     const key = crypto.randomUUID();
-    onCommit([...blocks, { key, start: event.start, end: event.end, title: event.title, tags: [], body: "" }]);
+    onCommit([...blocks, { key, start: event.start, end: event.end, title: event.title, tags: event.tags, body: "" }]);
     onSelect(key, { focusNote: true });
   };
 

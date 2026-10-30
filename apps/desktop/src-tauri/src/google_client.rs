@@ -18,8 +18,11 @@ const API_URL: &str = "https://www.googleapis.com/calendar/v3";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const KEYCHAIN_REFRESH_USER: &str = "google-refresh-token";
+/// Single-account era only; read once by the migration.
 const KEYCHAIN_EMAIL_USER: &str = "google-email";
 const KEYCHAIN_SCOPE_USER: &str = "google-scope";
+/// JSON array of the connected account emails, in connection order.
+const KEYCHAIN_ACCOUNTS_USER: &str = "google-accounts";
 /// Safety net against a server that never stops paging.
 const MAX_PAGES: usize = 10;
 
@@ -68,22 +71,99 @@ impl fmt::Display for Error {
     }
 }
 
-/// Where the long-lived credentials are kept.
+/// Where one account's long-lived credentials are kept.
 pub trait TokenStore: Send + Sync {
     fn refresh_token(&self) -> Result<Option<String>, String>;
     fn set_refresh_token(&self, token: &str) -> Result<(), String>;
     fn delete_refresh_token(&self) -> Result<(), String>;
-    /// Display only; failures are ignored.
-    fn email(&self) -> Option<String>;
-    fn set_email(&self, email: Option<&str>);
     /// The scopes of the last token response (space separated), if known.
     fn scope(&self) -> Option<String>;
     fn set_scope(&self, scope: Option<&str>);
 }
 
-/// The OS keychain, same service as the account token. Verified by hand
+/// Tokens that only live in memory: a connection in progress, before its account is known.
+#[derive(Default)]
+pub struct MemoryStore {
+    pub refresh: std::sync::Mutex<Option<String>>,
+    scope: std::sync::Mutex<Option<String>>,
+}
+
+fn guard<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl TokenStore for MemoryStore {
+    fn refresh_token(&self) -> Result<Option<String>, String> {
+        Ok(guard(&self.refresh).clone())
+    }
+    fn set_refresh_token(&self, token: &str) -> Result<(), String> {
+        *guard(&self.refresh) = Some(token.to_string());
+        Ok(())
+    }
+    fn delete_refresh_token(&self) -> Result<(), String> {
+        *guard(&self.refresh) = None;
+        Ok(())
+    }
+    fn scope(&self) -> Option<String> {
+        guard(&self.scope).clone()
+    }
+    fn set_scope(&self, scope: Option<&str>) {
+        *guard(&self.scope) = scope.map(str::to_string);
+    }
+}
+
+/// The credentials of the single-account era (`google-refresh-token`, `google-email`,
+/// `google-scope`), found at startup by the migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyAccount {
+    pub refresh: String,
+    pub email: Option<String>,
+    pub scope: Option<String>,
+}
+
+/// All accounts' credentials: the list of connected emails and one `TokenStore` each.
+pub trait Vault: Send + Sync {
+    /// Connected account emails, in connection order.
+    fn accounts(&self) -> Vec<String>;
+    fn set_accounts(&self, emails: &[String]) -> Result<(), String>;
+    fn store(&self, email: &str) -> Arc<dyn TokenStore>;
+    /// The single-account entries, when a refresh token is still there.
+    fn legacy(&self) -> Option<LegacyAccount>;
+    /// The single-account refresh token and scope as a store (until it is migrated).
+    fn legacy_store(&self) -> Arc<dyn TokenStore>;
+    /// Removes the single-account entries.
+    fn delete_legacy(&self);
+}
+
+/// Moves the single-account credentials under `email` and removes the old entries.
+/// The new entries and the list are written first: a failure leaves the legacy token
+/// where it was. An account that already has a token keeps it (it was reconnected).
+pub fn migrate_legacy(vault: &dyn Vault, email: &str) -> Result<(), String> {
+    let Some(legacy) = vault.legacy() else {
+        return Ok(());
+    };
+    let store = vault.store(email);
+    if store.refresh_token()?.is_none() {
+        store.set_refresh_token(&legacy.refresh)?;
+        store.set_scope(legacy.scope.as_deref());
+    }
+    let mut accounts = vault.accounts();
+    if !accounts.iter().any(|a| a == email) {
+        accounts.push(email.to_string());
+        vault.set_accounts(&accounts)?;
+    }
+    vault.delete_legacy();
+    Ok(())
+}
+
+/// The OS keychain, same service as the app account token. Verified by hand
 /// (tests must not touch the real keychain).
-pub struct KeychainStore;
+pub struct KeychainVault;
+
+/// One account's entries (`<name>:<email>`), or the single-account ones (`<name>`).
+pub struct KeychainStore {
+    account: Option<String>,
+}
 
 fn entry(user: &str) -> Result<Entry, String> {
     Entry::new(crate::account::KEYCHAIN_SERVICE, user)
@@ -98,6 +178,12 @@ fn get_entry(user: &str) -> Result<Option<String>, String> {
     }
 }
 
+fn set_entry(user: &str, value: &str) -> Result<(), String> {
+    entry(user)?
+        .set_password(value)
+        .map_err(|e| crate::account::keychain_error("saving to", &e))
+}
+
 fn delete_entry(user: &str) -> Result<(), String> {
     match entry(user)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -105,49 +191,78 @@ fn delete_entry(user: &str) -> Result<(), String> {
     }
 }
 
+impl KeychainStore {
+    fn key(&self, name: &str) -> String {
+        match &self.account {
+            Some(email) => format!("{name}:{email}"),
+            None => name.to_string(),
+        }
+    }
+}
+
 impl TokenStore for KeychainStore {
     fn refresh_token(&self) -> Result<Option<String>, String> {
-        get_entry(KEYCHAIN_REFRESH_USER)
+        get_entry(&self.key(KEYCHAIN_REFRESH_USER))
     }
     fn set_refresh_token(&self, token: &str) -> Result<(), String> {
-        entry(KEYCHAIN_REFRESH_USER)?
-            .set_password(token)
-            .map_err(|e| crate::account::keychain_error("saving to", &e))
+        set_entry(&self.key(KEYCHAIN_REFRESH_USER), token)
     }
     fn delete_refresh_token(&self) -> Result<(), String> {
-        delete_entry(KEYCHAIN_REFRESH_USER)
-    }
-    fn email(&self) -> Option<String> {
-        get_entry(KEYCHAIN_EMAIL_USER).ok().flatten()
-    }
-    fn set_email(&self, email: Option<&str>) {
-        let _ = match email {
-            Some(e) => entry(KEYCHAIN_EMAIL_USER).and_then(|en| {
-                en.set_password(e)
-                    .map_err(|e| crate::account::keychain_error("saving to", &e))
-            }),
-            None => delete_entry(KEYCHAIN_EMAIL_USER),
-        };
+        delete_entry(&self.key(KEYCHAIN_REFRESH_USER))
     }
     fn scope(&self) -> Option<String> {
-        get_entry(KEYCHAIN_SCOPE_USER).ok().flatten()
+        get_entry(&self.key(KEYCHAIN_SCOPE_USER)).ok().flatten()
     }
     fn set_scope(&self, scope: Option<&str>) {
+        let key = self.key(KEYCHAIN_SCOPE_USER);
         let _ = match scope {
-            Some(s) => entry(KEYCHAIN_SCOPE_USER).and_then(|en| {
-                en.set_password(s)
-                    .map_err(|e| crate::account::keychain_error("saving to", &e))
-            }),
-            None => delete_entry(KEYCHAIN_SCOPE_USER),
+            Some(s) => set_entry(&key, s),
+            None => delete_entry(&key),
         };
     }
 }
 
-/// An events list for one day plus the account email, when the calendar title is one.
-#[derive(Debug)]
-pub struct DayEvents {
-    pub events: Vec<CalEvent>,
-    pub email: Option<String>,
+impl Vault for KeychainVault {
+    fn accounts(&self) -> Vec<String> {
+        get_entry(KEYCHAIN_ACCOUNTS_USER)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+    fn set_accounts(&self, emails: &[String]) -> Result<(), String> {
+        if emails.is_empty() {
+            return delete_entry(KEYCHAIN_ACCOUNTS_USER);
+        }
+        let json = serde_json::to_string(emails).map_err(|e| e.to_string())?;
+        set_entry(KEYCHAIN_ACCOUNTS_USER, &json)
+    }
+    fn store(&self, email: &str) -> Arc<dyn TokenStore> {
+        Arc::new(KeychainStore {
+            account: Some(email.to_string()),
+        })
+    }
+    fn legacy(&self) -> Option<LegacyAccount> {
+        let legacy = KeychainStore { account: None };
+        let refresh = legacy.refresh_token().ok().flatten()?;
+        Some(LegacyAccount {
+            refresh,
+            email: get_entry(KEYCHAIN_EMAIL_USER).ok().flatten(),
+            scope: legacy.scope(),
+        })
+    }
+    fn legacy_store(&self) -> Arc<dyn TokenStore> {
+        Arc::new(KeychainStore { account: None })
+    }
+    fn delete_legacy(&self) {
+        for name in [
+            KEYCHAIN_REFRESH_USER,
+            KEYCHAIN_EMAIL_USER,
+            KEYCHAIN_SCOPE_USER,
+        ] {
+            let _ = delete_entry(name);
+        }
+    }
 }
 
 struct Access {
@@ -162,6 +277,15 @@ pub struct Client {
     store: Arc<dyn TokenStore>,
     /// Held across a refresh so concurrent callers share one.
     session: Mutex<Option<Access>>,
+    /// What the store held at the first look, kept in step with every write the client
+    /// makes, so status checks do not go to the keychain each time.
+    flags: std::sync::Mutex<Option<Flags>>,
+}
+
+#[derive(Clone)]
+struct Flags {
+    connected: bool,
+    scope: Option<String>,
 }
 
 fn now_ms() -> i64 {
@@ -208,34 +332,50 @@ impl Client {
             endpoints,
             store,
             session: Mutex::new(None),
+            flags: std::sync::Mutex::new(None),
         })
     }
 
+    fn with_flags<R>(&self, f: impl FnOnce(&mut Flags) -> R) -> R {
+        let mut flags = guard(&self.flags);
+        f(flags.get_or_insert_with(|| Flags {
+            connected: matches!(self.store.refresh_token(), Ok(Some(_))),
+            scope: self.store.scope(),
+        }))
+    }
+
+    fn flags(&self) -> Flags {
+        self.with_flags(|f| f.clone())
+    }
+
+    fn update_flags(&self, f: impl FnOnce(&mut Flags)) {
+        self.with_flags(f);
+    }
+
+    #[cfg(test)]
     pub fn is_connected(&self) -> bool {
-        matches!(self.store.refresh_token(), Ok(Some(_)))
+        self.flags().connected
     }
 
-    pub fn stored_email(&self) -> Option<String> {
-        self.store.email()
-    }
-
-    pub fn remember_email(&self, email: Option<&str>) {
-        self.store.set_email(email);
-    }
-
-    /// Connected with a token that lacks the calendar list scope (granted before it existed).
+    /// Without a token (revoked or removed), or with one that lacks the calendar list
+    /// scope (granted before it existed): the user has to connect this account again.
     pub fn needs_reconnect(&self) -> bool {
-        self.is_connected()
-            && self
-                .store
-                .scope()
-                .is_some_and(|s| !google::has_list_scope(&s))
+        let flags = self.flags();
+        !flags.connected || flags.scope.is_some_and(|s| !google::has_list_scope(&s))
     }
 
-    fn remember_scope(&self, tokens: &Tokens) {
-        if let Some(scope) = &tokens.scope {
-            self.store.set_scope(Some(scope));
-        }
+    fn remember_scope(&self, scope: Option<&str>) {
+        self.store.set_scope(scope);
+        self.update_flags(|f| f.scope = scope.map(str::to_string));
+    }
+
+    /// The tokens of a finished consent, for saving under the account once it is known.
+    pub fn credentials_to_keep(&self) -> Result<(String, Option<String>), String> {
+        let refresh = self
+            .store
+            .refresh_token()?
+            .ok_or("Google Calendar is not connected")?;
+        Ok((refresh, self.store.scope()))
     }
 
     async fn token_post(&self, pairs: &[(&str, &str)]) -> Result<Tokens, TokenError> {
@@ -280,7 +420,10 @@ impl Client {
         self.store
             .set_refresh_token(&refresh)
             .map_err(Error::Message)?;
-        self.remember_scope(&tokens);
+        self.update_flags(|f| f.connected = true);
+        if let Some(scope) = &tokens.scope {
+            self.remember_scope(Some(scope));
+        }
         *self.session.lock().await = Some(Access {
             token: tokens.access_token,
             expires_at_ms: now_ms() + tokens.expires_in * 1000,
@@ -312,7 +455,9 @@ impl Client {
             .await;
         match result {
             Ok(tokens) => {
-                self.remember_scope(&tokens);
+                if let Some(scope) = &tokens.scope {
+                    self.remember_scope(Some(scope));
+                }
                 if let Some(new_refresh) = &tokens.refresh_token {
                     self.store
                         .set_refresh_token(new_refresh)
@@ -328,8 +473,8 @@ impl Client {
             Err(TokenError::InvalidGrant) => {
                 *session = None;
                 let _ = self.store.delete_refresh_token();
-                self.store.set_email(None);
-                self.store.set_scope(None);
+                self.remember_scope(None);
+                self.update_flags(|f| f.connected = false);
                 Err(Error::Disconnected)
             }
             Err(TokenError::Other(m)) => Err(Error::Message(m)),
@@ -406,7 +551,7 @@ impl Client {
             let result = self.call(Method::GET, url.as_str(), None).await;
             if matches!(result, Err(Error::MissingScope)) {
                 // Remember it so the status says "reconnect" from now on.
-                self.store.set_scope(Some(google::SCOPE));
+                self.remember_scope(Some(google::SCOPE));
             }
             let page = google::parse_calendar_list(&result?).map_err(Error::Message)?;
             calendars.extend(page.calendars);
@@ -454,21 +599,37 @@ impl Client {
         Ok(series)
     }
 
-    /// All timed events of the local day `date` of the primary calendar.
-    pub async fn list_day(&self, date: &str, tz: &TimeZone) -> Result<DayEvents, Error> {
-        self.list_day_in("primary", date, tz).await
+    /// The Google account's email: the id of its primary calendar, from the calendar
+    /// list, else from `calendars/primary`.
+    pub async fn account_email(&self) -> Result<String, Error> {
+        match self.list_calendars().await {
+            Ok(list) => {
+                if let Some(primary) = list.into_iter().find(|c| c.primary) {
+                    return Ok(primary.id);
+                }
+            }
+            Err(e @ (Error::Disconnected | Error::NotConnected)) => return Err(e),
+            Err(_) => {}
+        }
+        let mut url = self.calendar_url("primary", &[])?;
+        url.query_pairs_mut().append_pair("fields", "id");
+        let body = self.call(Method::GET, url.as_str(), None).await?;
+        serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["id"].as_str().map(str::to_string))
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Error::Message("Google did not say which account this is".into()))
     }
 
-    /// Same for any calendar; the events carry `calendar_id`.
+    /// All timed events of the local day `date` of a calendar; the events carry `calendar_id`.
     pub async fn list_day_in(
         &self,
         calendar_id: &str,
         date: &str,
         tz: &TimeZone,
-    ) -> Result<DayEvents, Error> {
+    ) -> Result<Vec<CalEvent>, Error> {
         let (min, max) = google::day_bounds(date, tz).map_err(Error::Message)?;
         let mut events = Vec::new();
-        let mut summary = None;
         let mut page_token: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let mut url = self.calendar_url(calendar_id, &["events"])?;
@@ -481,7 +642,7 @@ impl Client {
                     .append_pair("maxResults", "250")
                     .append_pair(
                         "fields",
-                        "summary,nextPageToken,items(id,status,summary,start,end,htmlLink,recurringEventId)",
+                        "nextPageToken,items(id,status,summary,start,end,htmlLink,recurringEventId,extendedProperties)",
                     );
                 if let Some(t) = &page_token {
                     q.append_pair("pageToken", t);
@@ -493,29 +654,28 @@ impl Client {
                 e.calendar_id = calendar_id.to_string();
                 e
             }));
-            summary = summary.or(page.summary);
             match page.next_page_token {
                 Some(t) => page_token = Some(t),
                 None => break,
             }
         }
         events.sort_by_key(|e| (e.start, e.end));
-        Ok(DayEvents {
-            events,
-            email: google::account_email(summary.as_deref()),
-        })
+        Ok(events)
     }
 
+    /// Creates a timed event; `tags` (when any) are kept hidden on it.
     pub async fn create_event(
         &self,
         calendar_id: &str,
         date: &str,
-        start: u32,
-        end: u32,
+        (start, end): (u32, u32),
         title: &str,
+        tags: &[String],
         tz: &TimeZone,
     ) -> Result<CalEvent, Error> {
-        let payload = google::event_body(date, start, end, title, tz).map_err(Error::Message)?;
+        let tags = (!tags.is_empty()).then_some(tags);
+        let payload =
+            google::event_body(date, start, end, title, tags, tz).map_err(Error::Message)?;
         let url = self.calendar_url(calendar_id, &["events"])?;
         let body = self
             .call(Method::POST, url.as_str(), Some(&payload))
@@ -525,16 +685,18 @@ impl Client {
         Ok(event)
     }
 
+    /// Patches time, title and tags (an empty list clears them).
     pub async fn update_event(
         &self,
         (calendar_id, event_id): (&str, &str),
         date: &str,
-        start: u32,
-        end: u32,
+        (start, end): (u32, u32),
         title: &str,
+        tags: &[String],
         tz: &TimeZone,
     ) -> Result<CalEvent, Error> {
-        let payload = google::event_body(date, start, end, title, tz).map_err(Error::Message)?;
+        let payload =
+            google::event_body(date, start, end, title, Some(tags), tz).map_err(Error::Message)?;
         let url = self.calendar_url(calendar_id, &["events", event_id])?;
         let body = self
             .call(Method::PATCH, url.as_str(), Some(&payload))
@@ -542,6 +704,44 @@ impl Client {
         let mut event = google::parse_event(&body, date, tz).map_err(Error::Message)?;
         event.calendar_id = calendar_id.to_string();
         Ok(event)
+    }
+
+    /// Patches only the hidden tags of an event; title and time are untouched. The
+    /// answer is the event as it is on `date` (for a series master, pass the master id
+    /// to `set_series_tags` instead: its own date is not the day shown).
+    pub async fn set_tags(
+        &self,
+        (calendar_id, event_id): (&str, &str),
+        date: &str,
+        tags: &[String],
+        tz: &TimeZone,
+    ) -> Result<CalEvent, Error> {
+        let body = self.patch_tags(calendar_id, event_id, tags).await?;
+        let mut event = google::parse_event(&body, date, tz).map_err(Error::Message)?;
+        event.calendar_id = calendar_id.to_string();
+        Ok(event)
+    }
+
+    /// Same on the master of a repeating series, so every occurrence has the tags.
+    pub async fn set_series_tags(
+        &self,
+        (calendar_id, master_id): (&str, &str),
+        tags: &[String],
+    ) -> Result<(), Error> {
+        self.patch_tags(calendar_id, master_id, tags)
+            .await
+            .map(drop)
+    }
+
+    async fn patch_tags(
+        &self,
+        calendar_id: &str,
+        event_id: &str,
+        tags: &[String],
+    ) -> Result<String, Error> {
+        let url = self.calendar_url(calendar_id, &["events", event_id])?;
+        self.call(Method::PATCH, url.as_str(), Some(&google::tags_patch(tags)))
+            .await
     }
 
     /// Deletes the event (for an instance id of a repeating series: only that occurrence).
@@ -572,8 +772,8 @@ impl Client {
         }
         *self.session.lock().await = None;
         self.store.delete_refresh_token().map_err(Error::Message)?;
-        self.store.set_email(None);
-        self.store.set_scope(None);
+        self.remember_scope(None);
+        self.update_flags(|f| f.connected = false);
         Ok(())
     }
 }
@@ -585,36 +785,61 @@ pub(crate) mod test_util {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    pub use crate::google_client::MemoryStore as MemStore;
+
+    /// An in-memory `Vault`: tests never touch the real keychain.
     #[derive(Default)]
-    pub struct MemStore {
-        pub refresh: Mutex<Option<String>>,
-        email: Mutex<Option<String>>,
-        scope: Mutex<Option<String>>,
+    pub struct MemVault {
+        pub list: Mutex<Vec<String>>,
+        pub stores: Mutex<std::collections::HashMap<String, Arc<MemStore>>>,
+        pub legacy_store: Arc<MemStore>,
+        pub legacy_email: Mutex<Option<String>>,
+        /// Makes `set_accounts` fail, to test a migration that cannot finish.
+        pub fail_set_accounts: std::sync::atomic::AtomicBool,
     }
 
-    impl TokenStore for MemStore {
-        fn refresh_token(&self) -> Result<Option<String>, String> {
-            Ok(self.refresh.lock().unwrap().clone())
+    impl MemVault {
+        pub fn account(&self, email: &str) -> Arc<MemStore> {
+            self.stores
+                .lock()
+                .unwrap()
+                .entry(email.to_string())
+                .or_default()
+                .clone()
         }
-        fn set_refresh_token(&self, token: &str) -> Result<(), String> {
-            *self.refresh.lock().unwrap() = Some(token.to_string());
+    }
+
+    impl Vault for MemVault {
+        fn accounts(&self) -> Vec<String> {
+            self.list.lock().unwrap().clone()
+        }
+        fn set_accounts(&self, emails: &[String]) -> Result<(), String> {
+            if self
+                .fail_set_accounts
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("keychain unavailable".into());
+            }
+            *self.list.lock().unwrap() = emails.to_vec();
             Ok(())
         }
-        fn delete_refresh_token(&self) -> Result<(), String> {
-            *self.refresh.lock().unwrap() = None;
-            Ok(())
+        fn store(&self, email: &str) -> Arc<dyn TokenStore> {
+            self.account(email)
         }
-        fn email(&self) -> Option<String> {
-            self.email.lock().unwrap().clone()
+        fn legacy(&self) -> Option<LegacyAccount> {
+            Some(LegacyAccount {
+                refresh: self.legacy_store.refresh_token().unwrap()?,
+                email: self.legacy_email.lock().unwrap().clone(),
+                scope: self.legacy_store.scope(),
+            })
         }
-        fn set_email(&self, email: Option<&str>) {
-            *self.email.lock().unwrap() = email.map(str::to_string);
+        fn legacy_store(&self) -> Arc<dyn TokenStore> {
+            self.legacy_store.clone()
         }
-        fn scope(&self) -> Option<String> {
-            self.scope.lock().unwrap().clone()
-        }
-        fn set_scope(&self, scope: Option<&str>) {
-            *self.scope.lock().unwrap() = scope.map(str::to_string);
+        fn delete_legacy(&self) {
+            self.legacy_store.delete_refresh_token().unwrap();
+            self.legacy_store.set_scope(None);
+            *self.legacy_email.lock().unwrap() = None;
         }
     }
 
@@ -665,20 +890,23 @@ pub(crate) mod test_util {
         (base, seen)
     }
 
+    pub fn creds() -> Credentials {
+        Credentials {
+            client_id: "cid".into(),
+            client_secret: "sec".into(),
+        }
+    }
+
+    pub fn endpoints(base: &str) -> Endpoints {
+        Endpoints {
+            token: format!("{base}/token"),
+            revoke: format!("{base}/revoke"),
+            api: format!("{base}/calendar/v3"),
+        }
+    }
+
     pub fn client(base: &str, store: Arc<MemStore>) -> Client {
-        Client::new(
-            Credentials {
-                client_id: "cid".into(),
-                client_secret: "sec".into(),
-            },
-            Endpoints {
-                token: format!("{base}/token"),
-                revoke: format!("{base}/revoke"),
-                api: format!("{base}/calendar/v3"),
-            },
-            store,
-        )
-        .unwrap()
+        Client::new(creds(), endpoints(base), store).unwrap()
     }
 }
 
@@ -726,10 +954,9 @@ mod tests {
         let (base, seen) = fake_server(vec![tok("access-1"), page(EVENT, None)]);
         let store = connected_store();
         let c = client(&base, store.clone());
-        let day = run(c.list_day("2026-10-21", &tz())).unwrap();
-        assert_eq!(day.events.len(), 1);
-        assert_eq!(day.events[0].title, "Deep work");
-        assert_eq!(day.email.as_deref(), Some("me@example.com"));
+        let day = run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap();
+        assert_eq!(day.len(), 1);
+        assert_eq!(day[0].title, "Deep work");
         let reqs = seen.lock().unwrap();
         assert!(reqs[0].starts_with("POST /token"));
         assert!(reqs[0].contains("grant_type=refresh_token"));
@@ -749,8 +976,8 @@ mod tests {
     fn a_valid_access_token_is_reused() {
         let (base, seen) = fake_server(vec![tok("a"), page("", None), page("", None)]);
         let c = client(&base, connected_store());
-        run(c.list_day("2026-10-21", &tz())).unwrap();
-        run(c.list_day("2026-10-22", &tz())).unwrap();
+        run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap();
+        run(c.list_day_in("primary", "2026-10-22", &tz())).unwrap();
         assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
@@ -763,8 +990,8 @@ mod tests {
             page(EVENT, None),
         ]);
         let c = client(&base, connected_store());
-        let day = run(c.list_day("2026-10-21", &tz())).unwrap();
-        assert_eq!(day.events.len(), 1);
+        let day = run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap();
+        assert_eq!(day.len(), 1);
         let reqs = seen.lock().unwrap();
         assert_eq!(reqs.len(), 4);
         assert!(
@@ -782,7 +1009,7 @@ mod tests {
         );
         let (base, _) = fake_server(vec![tok("a"), unauthorized.clone(), tok("b"), unauthorized]);
         let c = client(&base, connected_store());
-        let err = run(c.list_day("2026-10-21", &tz())).unwrap_err();
+        let err = run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap_err();
         assert_eq!(err.to_string(), "Invalid Credentials");
     }
 
@@ -794,20 +1021,19 @@ mod tests {
                 .into(),
         )]);
         let store = connected_store();
-        store.set_email(Some("me@example.com"));
         let c = client(&base, store.clone());
-        let err = run(c.list_day("2026-10-21", &tz())).unwrap_err();
+        let err = run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap_err();
         assert!(matches!(err, Error::Disconnected), "{err}");
         assert_eq!(store.refresh_token().unwrap(), None);
-        assert_eq!(store.email(), None);
         assert!(!c.is_connected());
+        assert!(c.needs_reconnect(), "no token: connect this account again");
     }
 
     #[test]
     fn not_connected_makes_no_request() {
         let (base, seen) = fake_server(vec![]);
         let c = client(&base, Arc::new(MemStore::default()));
-        let err = run(c.list_day("2026-10-21", &tz())).unwrap_err();
+        let err = run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap_err();
         assert!(matches!(err, Error::NotConnected));
         assert!(seen.lock().unwrap().is_empty());
     }
@@ -821,8 +1047,8 @@ mod tests {
             page(second, None),
         ]);
         let c = client(&base, connected_store());
-        let day = run(c.list_day("2026-10-21", &tz())).unwrap();
-        assert_eq!(day.events.len(), 2);
+        let day = run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap();
+        assert_eq!(day.len(), 2);
         assert!(seen.lock().unwrap()[2].contains("pageToken=PAGE2"));
     }
 
@@ -830,12 +1056,213 @@ mod tests {
     fn create_posts_the_body_and_returns_the_event() {
         let (base, seen) = fake_server(vec![tok("a"), (200, EVENT.to_string())]);
         let c = client(&base, connected_store());
-        let e = run(c.create_event("primary", "2026-10-21", 540, 600, "Deep work", &tz())).unwrap();
+        let e = run(c.create_event("primary", "2026-10-21", (540, 600), "Deep work", &[], &tz()))
+            .unwrap();
         assert_eq!((e.id.as_str(), e.start, e.end), ("e1", 540, 600));
         let reqs = seen.lock().unwrap();
         assert!(reqs[1].starts_with("POST /calendar/v3/calendars/primary/events "));
         assert!(reqs[1].contains(r#""summary":"Deep work""#));
         assert!(reqs[1].contains(r#""timeZone":"America/Sao_Paulo""#));
+        assert!(
+            !reqs[1].contains("extendedProperties"),
+            "no tags, nothing hidden is sent on create"
+        );
+    }
+
+    fn body_of(req: &str) -> serde_json::Value {
+        serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn create_and_update_send_the_tags_hidden_on_the_event() {
+        let (base, seen) = fake_server(vec![
+            tok("a"),
+            (200, EVENT.to_string()),
+            (200, EVENT.to_string()),
+            (200, EVENT.to_string()),
+        ]);
+        let c = client(&base, connected_store());
+        let tags = vec!["rust".to_string(), "mestrado".to_string()];
+        run(c.create_event("primary", "2026-10-21", (540, 600), "Deep", &tags, &tz())).unwrap();
+        run(c.update_event(
+            ("primary", "e1"),
+            "2026-10-21",
+            (540, 600),
+            "Deep",
+            &tags,
+            &tz(),
+        ))
+        .unwrap();
+        run(c.update_event(
+            ("primary", "e1"),
+            "2026-10-21",
+            (540, 600),
+            "Deep",
+            &[],
+            &tz(),
+        ))
+        .unwrap();
+        let reqs = seen.lock().unwrap();
+        for r in &reqs[1..3] {
+            assert_eq!(
+                body_of(r)["extendedProperties"]["private"]["catengaTags"],
+                "rust mestrado"
+            );
+            assert_eq!(body_of(r)["summary"], "Deep");
+        }
+        // an update with no tags clears them
+        assert_eq!(
+            body_of(&reqs[3])["extendedProperties"]["private"]["catengaTags"],
+            ""
+        );
+    }
+
+    #[test]
+    fn set_tags_patches_only_the_hidden_property() {
+        let tagged = r#"{"id":"e1","summary":"Deep work","start":{"dateTime":"2026-10-21T09:00:00-03:00"},"end":{"dateTime":"2026-10-21T10:00:00-03:00"},"extendedProperties":{"private":{"catengaTags":"rust"}}}"#;
+        let master = r#"{"id":"s1","summary":"Deep work","start":{"dateTime":"2026-01-05T09:00:00-03:00"},"end":{"dateTime":"2026-01-05T10:00:00-03:00"}}"#;
+        let (base, seen) = fake_server(vec![
+            tok("a"),
+            (200, master.to_string()),
+            (200, tagged.to_string()),
+        ]);
+        let c = client(&base, connected_store());
+        let tags = vec!["rust".to_string()];
+        // the master answers with its own first date, which must not matter
+        run(c.set_series_tags(("mest@x", "s1"), &tags)).unwrap();
+        let e = run(c.set_tags(
+            ("mest@x", "s1_20261021T120000Z"),
+            "2026-10-21",
+            &tags,
+            &tz(),
+        ))
+        .unwrap();
+        assert_eq!(e.tags, ["rust"]);
+        assert_eq!(e.calendar_id, "mest@x");
+        let reqs = seen.lock().unwrap();
+        assert!(reqs[1].starts_with("PATCH /calendar/v3/calendars/mest@x/events/s1 "));
+        assert!(
+            reqs[2].starts_with("PATCH /calendar/v3/calendars/mest@x/events/s1_20261021T120000Z ")
+        );
+        for r in &reqs[1..] {
+            assert_eq!(
+                body_of(r),
+                serde_json::json!({"extendedProperties":{"private":{"catengaTags":"rust"}}})
+            );
+        }
+    }
+
+    #[test]
+    fn the_account_email_is_the_primary_calendars_id() {
+        let (base, seen) = fake_server(vec![
+            tok("a"),
+            cal_page(
+                r##"{"id":"other@x","summary":"Other"},{"id":"me@work.com","summary":"Me","primary":true}"##,
+                None,
+            ),
+        ]);
+        let c = client(&base, connected_store());
+        assert_eq!(run(c.account_email()).unwrap(), "me@work.com");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_account_email_falls_back_to_the_primary_calendar_resource() {
+        // The list cannot be read (token without the list scope): ask for calendars/primary.
+        let denied = (
+            403,
+            r#"{"error":{"code":403,"message":"Request had insufficient authentication scopes."}}"#
+                .to_string(),
+        );
+        let (base, seen) = fake_server(vec![
+            tok("a"),
+            denied,
+            (200, r#"{"id":"me@work.com"}"#.to_string()),
+        ]);
+        let c = client(&base, connected_store());
+        assert_eq!(run(c.account_email()).unwrap(), "me@work.com");
+        let reqs = seen.lock().unwrap();
+        assert!(reqs[2].starts_with("GET /calendar/v3/calendars/primary?"));
+        assert!(reqs[2].contains("fields=id"));
+        drop(reqs);
+        // and says so when neither answers
+        let (base, _) = fake_server(vec![tok("a"), cal_page("", None), (200, "{}".into())]);
+        let c = client(&base, connected_store());
+        assert!(run(c.account_email()).is_err());
+    }
+
+    #[test]
+    fn credentials_to_keep_are_the_tokens_of_the_consent() {
+        let (base, _) = fake_server(vec![(200, LIST_SCOPE_RESPONSE.into())]);
+        let c = client(&base, Arc::new(MemStore::default()));
+        assert!(c.credentials_to_keep().is_err());
+        run(c.exchange_code("c", "v", "http://127.0.0.1:9/callback")).unwrap();
+        let (refresh, scope) = c.credentials_to_keep().unwrap();
+        assert_eq!(refresh, "R1");
+        assert!(google::has_list_scope(&scope.unwrap()));
+    }
+
+    fn vault_with_legacy(email: Option<&str>) -> MemVault {
+        let v = MemVault::default();
+        v.legacy_store.set_refresh_token("legacy-refresh").unwrap();
+        v.legacy_store.set_scope(Some("s1 s2"));
+        *v.legacy_email.lock().unwrap() = email.map(str::to_string);
+        v
+    }
+
+    #[test]
+    fn legacy_credentials_move_under_the_email_and_the_old_entries_go() {
+        let v = vault_with_legacy(Some("me@x"));
+        migrate_legacy(&v, "me@x").unwrap();
+        assert_eq!(v.accounts(), ["me@x"]);
+        let s = v.store("me@x");
+        assert_eq!(
+            s.refresh_token().unwrap().as_deref(),
+            Some("legacy-refresh")
+        );
+        assert_eq!(s.scope().as_deref(), Some("s1 s2"));
+        assert!(v.legacy().is_none());
+        assert_eq!(v.legacy_store.refresh_token().unwrap(), None);
+        // nothing left to do the second time
+        migrate_legacy(&v, "me@x").unwrap();
+        assert_eq!(v.accounts(), ["me@x"]);
+    }
+
+    #[test]
+    fn a_migration_that_cannot_finish_keeps_the_legacy_token() {
+        let v = vault_with_legacy(Some("me@x"));
+        v.fail_set_accounts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(migrate_legacy(&v, "me@x").is_err());
+        assert_eq!(
+            v.legacy_store.refresh_token().unwrap().as_deref(),
+            Some("legacy-refresh"),
+            "the old token is never deleted before the new entries are saved"
+        );
+        assert!(v.legacy().is_some() && v.accounts().is_empty());
+        // the next start tries again and works
+        v.fail_set_accounts
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        migrate_legacy(&v, "me@x").unwrap();
+        assert_eq!(v.accounts(), ["me@x"]);
+        assert!(v.legacy().is_none());
+    }
+
+    #[test]
+    fn migrating_keeps_a_token_the_account_already_has_and_other_accounts() {
+        let v = vault_with_legacy(None);
+        v.set_accounts(&["a@x".to_string(), "me@x".to_string()])
+            .unwrap();
+        v.store("me@x").set_refresh_token("newer").unwrap();
+        migrate_legacy(&v, "me@x").unwrap();
+        assert_eq!(v.accounts(), ["a@x", "me@x"]);
+        assert_eq!(
+            v.store("me@x").refresh_token().unwrap().as_deref(),
+            Some("newer")
+        );
+        assert!(v.legacy().is_none());
+        // no legacy entries: no-op
+        migrate_legacy(&v, "me@x").unwrap();
     }
 
     #[test]
@@ -845,9 +1272,9 @@ mod tests {
         run(c.update_event(
             ("primary", "abc_20261021T120000Z/x"),
             "2026-10-21",
-            540,
-            600,
+            (540, 600),
             "T",
+            &[],
             &tz(),
         ))
         .unwrap();
@@ -912,7 +1339,7 @@ mod tests {
             ),
         ]);
         let c = client(&base, connected_store());
-        let err = run(c.list_day("2026-10-21", &tz())).unwrap_err();
+        let err = run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap_err();
         assert_eq!(err.to_string(), "Rate Limit Exceeded");
     }
 
@@ -948,12 +1375,10 @@ mod tests {
     fn disconnect_revokes_best_effort_and_clears_state() {
         let (base, seen) = fake_server(vec![(200, "{}".into())]);
         let store = connected_store();
-        store.set_email(Some("me@example.com"));
         let c = client(&base, store.clone());
         run(c.disconnect()).unwrap();
         assert!(seen.lock().unwrap()[0].starts_with("POST /revoke?token=refresh-1"));
         assert_eq!(store.refresh_token().unwrap(), None);
-        assert_eq!(store.email(), None);
     }
 
     #[test]
@@ -978,7 +1403,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            day.events[0].calendar_id,
+            day[0].calendar_id,
             "en.br#holiday@group.v.calendar.google.com"
         );
         let reqs = seen.lock().unwrap();
@@ -1002,9 +1427,9 @@ mod tests {
         let e = run(c.create_event(
             "mest@group.calendar.google.com",
             "2026-10-21",
-            540,
-            600,
+            (540, 600),
             "T",
+            &[],
             &tz(),
         ))
         .unwrap();
@@ -1012,9 +1437,9 @@ mod tests {
         let e = run(c.update_event(
             ("mest@group.calendar.google.com", "e1"),
             "2026-10-21",
-            540,
-            600,
+            (540, 600),
             "T",
+            &[],
             &tz(),
         ))
         .unwrap();
@@ -1085,8 +1510,8 @@ mod tests {
             ),
         ]);
         let c = client(&base, connected_store());
-        let day = run(c.list_day("2026-10-21", &tz())).unwrap();
-        assert_eq!(day.events[0].recurring_event_id.as_deref(), Some("s1"));
+        let day = run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap();
+        assert_eq!(day[0].recurring_event_id.as_deref(), Some("s1"));
         assert!(seen.lock().unwrap()[1].contains("recurringEventId"));
     }
 
@@ -1150,11 +1575,11 @@ mod tests {
             r#"{"access_token":"a","expires_in":3600,"scope":"https://www.googleapis.com/auth/calendar.events"}"#.into(),
         ), page("", None)]);
         let c = client(&base, connected_store());
-        run(c.list_day("2026-10-21", &tz())).unwrap();
+        run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap();
         assert!(c.needs_reconnect());
-        // disconnecting forgets it
+        // disconnecting forgets the token
         run(c.disconnect()).unwrap();
-        assert!(!c.needs_reconnect());
+        assert!(!c.is_connected());
     }
 
     #[test]
@@ -1163,7 +1588,7 @@ mod tests {
         let store = connected_store();
         store.set_scope(Some("https://www.googleapis.com/auth/calendar.events"));
         let c = client(&base, store.clone());
-        run(c.list_day("2026-10-21", &tz())).unwrap();
+        run(c.list_day_in("primary", "2026-10-21", &tz())).unwrap();
         assert!(c.needs_reconnect());
     }
 }

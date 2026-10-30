@@ -7,6 +7,7 @@ use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 pub const SCOPE: &str = "https://www.googleapis.com/auth/calendar.events";
 /// Lets us list the user's calendars.
@@ -52,6 +53,9 @@ pub struct CalEvent {
     /// The event's calendar color (`#rrggbb`), or `""` when the calendar is unknown.
     #[serde(default)]
     pub color: String,
+    /// Tags kept on the event (`extendedProperties.private.catengaTags`), without `#`.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// A repeating series: the master event of a recurrence.
@@ -216,11 +220,17 @@ struct Item {
     #[serde(rename = "recurringEventId")]
     recurring_event_id: Option<String>,
     recurrence: Option<Vec<String>>,
+    #[serde(rename = "extendedProperties")]
+    extended_properties: Option<ExtendedProperties>,
+}
+
+#[derive(Deserialize)]
+struct ExtendedProperties {
+    private: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize)]
 struct ListBody {
-    summary: Option<String>,
     #[serde(default)]
     items: Vec<Item>,
     #[serde(rename = "nextPageToken")]
@@ -230,8 +240,6 @@ struct ListBody {
 #[derive(Debug, PartialEq, Eq)]
 pub struct DayList {
     pub events: Vec<CalEvent>,
-    /// Calendar title (`summary`); for a primary calendar usually the account email.
-    pub summary: Option<String>,
     pub next_page_token: Option<String>,
 }
 
@@ -281,6 +289,11 @@ fn to_cal_event(item: Item, day: Date, tz: &TimeZone) -> Option<CalEvent> {
         project_key: None,
         project_id: None,
         color: String::new(),
+        tags: item
+            .extended_properties
+            .and_then(|p| p.private)
+            .and_then(|p| p.get(TAGS_PROPERTY).map(|v| parse_tags(v)))
+            .unwrap_or_default(),
     })
 }
 
@@ -296,7 +309,6 @@ pub fn parse_event_list(body: &str, date: &str, tz: &TimeZone) -> Result<DayList
         .collect();
     Ok(DayList {
         events,
-        summary: list.summary,
         next_page_token: list.next_page_token,
     })
 }
@@ -424,11 +436,29 @@ pub fn parse_calendar_list(body: &str) -> Result<CalendarPage, String> {
     })
 }
 
-/// The account email when the calendar title looks like one (a renamed primary
-/// calendar shows a name instead, and then we only say "Connected").
-pub fn account_email(summary: Option<&str>) -> Option<String> {
-    let s = summary?.trim();
-    (s.contains('@') && !s.contains(char::is_whitespace)).then(|| s.to_string())
+/// Name of the hidden event property that keeps the block's tags.
+pub const TAGS_PROPERTY: &str = "catengaTags";
+
+/// The tags of a `catengaTags` value: space separated, `#` tolerated, duplicates kept out.
+pub fn parse_tags(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in value.split_whitespace() {
+        let t = t.trim_start_matches('#');
+        if !t.is_empty() && !out.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// The `catengaTags` value for these tags: without `#`, space separated.
+pub fn tags_value(tags: &[String]) -> String {
+    parse_tags(&tags.join(" ")).join(" ")
+}
+
+/// `{"extendedProperties":{"private":{"catengaTags":"…"}}}`: the only thing a tags patch sends.
+pub fn tags_patch(tags: &[String]) -> Value {
+    json!({ "extendedProperties": { "private": { TAGS_PROPERTY: tags_value(tags) } } })
 }
 
 fn wall_clock(day: Date, minutes: u32) -> Result<jiff::civil::DateTime, String> {
@@ -439,11 +469,13 @@ fn wall_clock(day: Date, minutes: u32) -> Result<jiff::civil::DateTime, String> 
 
 /// Body of `events.insert` / `events.patch`: local wall-clock times in the
 /// system zone (`timeZone` is omitted, and an offset sent, when the zone has no IANA name).
+/// `tags` (`Some`) also sets the hidden tags property; `None` leaves it out.
 pub fn event_body(
     date: &str,
     start: u32,
     end: u32,
     title: &str,
+    tags: Option<&[String]>,
     tz: &TimeZone,
 ) -> Result<Value, String> {
     if start >= end || end > 1440 {
@@ -463,7 +495,11 @@ pub fn event_body(
             }
         }
     };
-    Ok(json!({ "summary": title, "start": time(start)?, "end": time(end)? }))
+    let mut body = json!({ "summary": title, "start": time(start)?, "end": time(end)? });
+    if let Some(tags) = tags {
+        body["extendedProperties"] = tags_patch(tags)["extendedProperties"].clone();
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -629,9 +665,9 @@ mod tests {
                 project_key: None,
                 project_id: None,
                 color: String::new(),
+                tags: vec![],
             }]
         );
-        assert_eq!(r.summary.as_deref(), Some("me@example.com"));
         assert_eq!(r.next_page_token, None);
     }
 
@@ -759,19 +795,60 @@ mod tests {
     }
 
     #[test]
-    fn email_only_when_the_title_looks_like_one() {
+    fn tags_parse_from_the_private_property_of_events_and_instances() {
+        let with = |id: &str, props: &str| {
+            format!(
+                r#"{{"id":"{id}","summary":"S","start":{{"dateTime":"2026-10-21T09:00:00-03:00"}},"end":{{"dateTime":"2026-10-21T10:00:00-03:00"}}{props}}}"#
+            )
+        };
+        let body = list(&format!(
+            "{},{},{},{}",
+            with(
+                "a",
+                r#","extendedProperties":{"private":{"catengaTags":"rust  #mestrado Rust","other":"x"}}"#
+            ),
+            with(
+                "b",
+                r#","extendedProperties":{"private":{"catengaTags":""}}"#
+            ),
+            with(
+                "c",
+                r#","extendedProperties":{"shared":{"catengaTags":"no"}}"#
+            ),
+            with("d", ""),
+        ));
+        let r = parse_event_list(&body, "2026-10-21", &sp()).unwrap();
+        let tags: Vec<_> = r.events.iter().map(|e| e.tags.clone()).collect();
+        assert_eq!(tags[0], ["rust", "mestrado"]);
+        assert!(tags[1].is_empty() && tags[2].is_empty() && tags[3].is_empty());
+    }
+
+    #[test]
+    fn tag_values_are_written_without_hashes_and_deduplicated() {
+        let t = |v: &[&str]| tags_value(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert_eq!(t(&["rust", "#mestrado", "RUST"]), "rust mestrado");
+        assert_eq!(t(&[]), "");
         assert_eq!(
-            account_email(Some(" me@example.com ")),
-            Some("me@example.com".into())
+            tags_patch(&["a".to_string()]),
+            json!({"extendedProperties":{"private":{"catengaTags":"a"}}})
         );
-        assert_eq!(account_email(Some("Ismael's calendar")), None);
-        assert_eq!(account_email(Some("My @ work")), None);
-        assert_eq!(account_email(None), None);
+    }
+
+    #[test]
+    fn event_body_carries_tags_only_when_given() {
+        let tags = vec!["rust".to_string()];
+        let b = event_body("2026-10-21", 540, 600, "X", Some(&tags), &sp()).unwrap();
+        assert_eq!(b["extendedProperties"]["private"]["catengaTags"], "rust");
+        assert_eq!(b["summary"], "X");
+        let b = event_body("2026-10-21", 540, 600, "X", Some(&[]), &sp()).unwrap();
+        assert_eq!(b["extendedProperties"]["private"]["catengaTags"], "");
+        let b = event_body("2026-10-21", 540, 600, "X", None, &sp()).unwrap();
+        assert!(b.get("extendedProperties").is_none());
     }
 
     #[test]
     fn event_body_uses_wall_clock_and_iana_zone() {
-        let b = event_body("2026-10-21", 540, 630, "Deep work", &sp()).unwrap();
+        let b = event_body("2026-10-21", 540, 630, "Deep work", None, &sp()).unwrap();
         assert_eq!(
             b,
             json!({
@@ -784,7 +861,7 @@ mod tests {
 
     #[test]
     fn event_body_end_at_midnight_rolls_to_the_next_day() {
-        let b = event_body("2026-10-21", 1380, 1440, "Late", &berlin()).unwrap();
+        let b = event_body("2026-10-21", 1380, 1440, "Late", None, &berlin()).unwrap();
         assert_eq!(b["end"]["dateTime"], "2026-10-22T00:00:00");
         assert_eq!(b["end"]["timeZone"], "Europe/Berlin");
     }
@@ -792,16 +869,16 @@ mod tests {
     #[test]
     fn event_body_without_iana_name_sends_an_offset() {
         let tz = TimeZone::fixed(jiff::tz::offset(-3));
-        let b = event_body("2026-10-21", 540, 600, "X", &tz).unwrap();
+        let b = event_body("2026-10-21", 540, 600, "X", None, &tz).unwrap();
         assert_eq!(b["start"]["dateTime"], "2026-10-21T09:00:00-03:00");
         assert!(b["start"].get("timeZone").is_none());
     }
 
     #[test]
     fn event_body_rejects_bad_ranges() {
-        assert!(event_body("2026-10-21", 600, 600, "X", &sp()).is_err());
-        assert!(event_body("2026-10-21", 600, 540, "X", &sp()).is_err());
-        assert!(event_body("2026-10-21", 600, 1441, "X", &sp()).is_err());
+        assert!(event_body("2026-10-21", 600, 600, "X", None, &sp()).is_err());
+        assert!(event_body("2026-10-21", 600, 540, "X", None, &sp()).is_err());
+        assert!(event_body("2026-10-21", 600, 1441, "X", None, &sp()).is_err());
     }
 
     #[test]
@@ -817,21 +894,23 @@ mod tests {
             project_key: Some("series:series1".into()),
             project_id: Some(3),
             color: "#16a765".into(),
+            tags: vec!["rust".into()],
         };
         assert_eq!(
             serde_json::to_value(&e).unwrap(),
-            json!({"id":"i","start":1,"end":2,"title":"t","projectKey":"series:series1","projectId":3,"color":"#16a765"})
+            json!({"id":"i","start":1,"end":2,"title":"t","projectKey":"series:series1","projectId":3,"color":"#16a765","tags":["rust"]})
         );
         let none = CalEvent {
             recurring_event_id: None,
             project_key: None,
             project_id: None,
             color: String::new(),
+            tags: vec![],
             ..e
         };
         assert_eq!(
             serde_json::to_value(&none).unwrap(),
-            json!({"id":"i","start":1,"end":2,"title":"t","projectKey":null,"projectId":null,"color":""})
+            json!({"id":"i","start":1,"end":2,"title":"t","projectKey":null,"projectId":null,"color":"","tags":[]})
         );
     }
 

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { blockDeletePlan, calendarOps, ghostEvents, isSeriesInstance, matchBlocks, type CalBlock, type CalEvent } from "./calendar";
+import { blockDeletePlan, calendarOps, ghostEvents, isSeriesInstance, matchBlocks, sameTags, type CalBlock, type CalEvent } from "./calendar";
 
-const block = (key: string, start: number, end: number, title: string): CalBlock => ({ key, start, end, title });
-const event = (id: string, start: number, end: number, title: string): CalEvent => ({ id, start, end, title, projectKey: null, projectId: null, color: "#3d6fb6" });
+const block = (key: string, start: number, end: number, title: string, tags: string[] = []): CalBlock => ({ key, start, end, title, tags });
+const event = (id: string, start: number, end: number, title: string, tags: string[] = []): CalEvent => ({ id, start, end, title, tags, projectKey: null, projectId: null, color: "#3d6fb6" });
 
 describe("matchBlocks", () => {
   it("matches_on_start_end_and_trimmed_title", () => {
@@ -122,6 +122,56 @@ describe("calendarOps", () => {
     const prev = [block("a", 540, 600, "Study"), block("o", 800, 860, "Old")];
     const next = [block("a", 540, 600, "Study"), block("o", 800, 860, "Old"), block("n", 900, 960, "New")];
     expect(calendarOps(prev, next, events)).toEqual([{ kind: "create", block: next[2] }]);
+  });
+});
+
+describe("calendarOps with tags", () => {
+  const events = [event("e1", 540, 600, "Study", ["rust"])];
+
+  it("adding_a_tag_to_a_matched_block_emits_a_tags_op", () => {
+    const prev = [block("a", 540, 600, "Study", ["rust"])];
+    const next = [block("a", 540, 600, "Study", ["rust", "mestrado"])];
+    expect(calendarOps(prev, next, events)).toEqual([{ kind: "tags", eventId: "e1", block: next[0] }]);
+  });
+
+  it("removing_the_last_tag_emits_a_tags_op", () => {
+    const prev = [block("a", 540, 600, "Study", ["rust"])];
+    const next = [block("a", 540, 600, "Study", [])];
+    expect(calendarOps(prev, next, events)).toEqual([{ kind: "tags", eventId: "e1", block: next[0] }]);
+  });
+
+  it("reordering_or_recasing_tags_is_not_a_change", () => {
+    const prev = [block("a", 540, 600, "Study", ["rust", "Mestrado"])];
+    const next = [block("a", 540, 600, "Study", ["mestrado", "RUST", "rust"])];
+    expect(calendarOps(prev, next, events)).toEqual([]);
+  });
+
+  it("time_and_tags_changed_emit_update_then_tags", () => {
+    const prev = [block("a", 540, 600, "Study", [])];
+    const next = [block("a", 570, 630, "Study", ["rust"])];
+    expect(calendarOps(prev, next, events)).toEqual([
+      { kind: "update", eventId: "e1", block: next[0] },
+      { kind: "tags", eventId: "e1", block: next[0] },
+    ]);
+  });
+
+  it("tags_change_on_an_app_only_block_does_nothing", () => {
+    const prev = [block("o", 800, 860, "Old", [])];
+    expect(calendarOps(prev, [block("o", 800, 860, "Old", ["x"])], events)).toEqual([]);
+  });
+
+  it("create_carries_the_block_tags", () => {
+    const next = block("n", 700, 760, "Gym", ["health"]);
+    expect(calendarOps([], [next], events)).toEqual([{ kind: "create", block: next }]);
+  });
+});
+
+describe("sameTags", () => {
+  it("ignores_case_order_and_duplicates", () => {
+    expect(sameTags(["A", "b"], ["b", "a", "a"])).toBe(true);
+    expect(sameTags([], [])).toBe(true);
+    expect(sameTags(["a"], [])).toBe(false);
+    expect(sameTags(["a"], ["b"])).toBe(false);
   });
 });
 

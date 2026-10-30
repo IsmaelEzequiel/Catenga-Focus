@@ -4,7 +4,9 @@
 use crate::app_db::{AppDb, Calendar, Project, ProjectKind, ProjectRow, project_key};
 use crate::commands::{AppDbHandle, IndexHandle, now_secs};
 use crate::google::{self, CalEvent};
-use crate::google_client::{Client, Credentials, Endpoints, Error, KeychainStore};
+use crate::google_client::{
+    Client, Credentials, Endpoints, Error, KeychainVault, MemoryStore, Vault, migrate_legacy,
+};
 use crate::loopback;
 use jiff::tz::TimeZone;
 use serde::Serialize;
@@ -19,6 +21,11 @@ use tauri_plugin_opener::OpenerExt;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const NOT_CONFIGURED: &str = "Google Calendar isn't configured in this build";
 const DISCONNECTED: &str = "Google Calendar was disconnected \u{2014} connect again";
+/// Meta key (app database, local) of the calendar new blocks are created in.
+const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
+/// The email of an account the migration could not name yet (the single-account token
+/// found with no email; resolved in the background, retried at the next start).
+const UNNAMED_ACCOUNT: &str = "";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -28,9 +35,21 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[serde(rename_all = "camelCase")]
 pub struct GoogleStatus {
     pub configured: bool,
+    /// At least one account is connected.
     pub connected: bool,
-    pub email: Option<String>,
-    /// Connected, but the token predates the calendar list scope: connect again.
+    /// Connection order.
+    pub accounts: Vec<GoogleAccount>,
+    /// Any account needs it.
+    pub needs_reconnect: bool,
+    /// `google_calendar_id` new blocks are created in (the resolved default).
+    pub new_event_calendar_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleAccount {
+    pub email: String,
+    /// Its token was revoked, or predates the calendar list scope: connect it again.
     pub needs_reconnect: bool,
 }
 
@@ -78,15 +97,25 @@ fn credentials() -> Option<Credentials> {
     })
 }
 
+/// One connected Google account and its client.
+#[derive(Clone)]
+struct Account {
+    email: String,
+    client: Arc<Client>,
+}
+
 struct Inner {
     /// `None` when the build has no Google client credentials.
-    client: Option<Client>,
+    creds: Option<Credentials>,
+    endpoints: Endpoints,
+    vault: Arc<dyn Vault>,
+    /// The connected accounts in connection order, read from the vault at first use
+    /// so day navigation does not hit the keychain.
+    accounts: Mutex<Option<Vec<Account>>>,
     /// Cancel flag of the consent wait in progress, if any.
     cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// Dates whose refresh is in flight.
     refreshing: Mutex<HashSet<String>>,
-    /// Remembered keychain lookup, so day navigation does not hit the keychain.
-    connected: Mutex<Option<bool>>,
     /// A calendar/series refresh is in flight.
     projects_refreshing: AtomicBool,
     /// Cache used only when the SQLite index is unavailable.
@@ -96,61 +125,217 @@ struct Inner {
 #[derive(Clone)]
 pub struct GoogleState(Arc<Inner>);
 
+/// An account id is its email: non-empty, no spaces (it is part of a keychain key).
+fn valid_email(s: &str) -> bool {
+    !s.is_empty() && !s.contains(char::is_whitespace)
+}
+
 impl GoogleState {
     pub fn new() -> GoogleState {
-        let client = credentials().and_then(|creds| {
-            Client::new(creds, Endpoints::default(), Arc::new(KeychainStore))
-                .map_err(|e| eprintln!("google calendar disabled: {e}"))
-                .ok()
-        });
+        GoogleState::with(credentials(), Endpoints::default(), Arc::new(KeychainVault))
+    }
+
+    fn with(
+        creds: Option<Credentials>,
+        endpoints: Endpoints,
+        vault: Arc<dyn Vault>,
+    ) -> GoogleState {
         GoogleState(Arc::new(Inner {
-            client,
+            creds,
+            endpoints,
+            vault,
+            accounts: Mutex::new(None),
             cancel: Mutex::new(None),
             refreshing: Mutex::new(HashSet::new()),
-            connected: Mutex::new(None),
             projects_refreshing: AtomicBool::new(false),
             memory: Mutex::new(HashMap::new()),
         }))
     }
 
-    fn client(&self) -> Result<&Client, String> {
-        self.0.client.as_ref().ok_or_else(|| NOT_CONFIGURED.into())
+    fn configured(&self) -> bool {
+        self.0.creds.is_some()
+    }
+
+    fn credentials(&self) -> Result<Credentials, String> {
+        self.0.creds.clone().ok_or_else(|| NOT_CONFIGURED.into())
+    }
+
+    fn build_client(&self, store: Arc<dyn crate::google_client::TokenStore>) -> Option<Client> {
+        let creds = self.0.creds.clone()?;
+        Client::new(creds, self.0.endpoints.clone(), store)
+            .map_err(|e| eprintln!("google calendar disabled: {e}"))
+            .ok()
+    }
+
+    /// The accounts the vault holds. A single-account token (before several accounts)
+    /// whose email is known moves to its per-account entries now; one without an email
+    /// stays as an unnamed account until `migrate_legacy_account` names it.
+    fn load_accounts(&self) -> Vec<Account> {
+        if !self.configured() {
+            return Vec::new();
+        }
+        let vault = &self.0.vault;
+        let mut unnamed = false;
+        if let Some(legacy) = vault.legacy() {
+            match legacy.email.filter(|e| valid_email(e)) {
+                Some(email) => {
+                    if let Err(e) = migrate_legacy(vault.as_ref(), &email) {
+                        eprintln!("moving the Google connection: {e}");
+                        unnamed = true;
+                    }
+                }
+                None => unnamed = true,
+            }
+        }
+        let mut out: Vec<Account> = Vec::new();
+        for email in vault.accounts() {
+            if let Some(client) = self.build_client(vault.store(&email)) {
+                out.push(Account {
+                    email,
+                    client: Arc::new(client),
+                });
+            }
+        }
+        if unnamed && let Some(client) = self.build_client(vault.legacy_store()) {
+            out.insert(
+                0,
+                Account {
+                    email: UNNAMED_ACCOUNT.into(),
+                    client: Arc::new(client),
+                },
+            );
+        }
+        out
+    }
+
+    fn with_accounts<R>(&self, f: impl FnOnce(&mut Vec<Account>) -> R) -> R {
+        let mut accounts = lock(&self.0.accounts);
+        f(accounts.get_or_insert_with(|| self.load_accounts()))
+    }
+
+    fn accounts(&self) -> Vec<Account> {
+        self.with_accounts(|a| a.clone())
+    }
+
+    fn emails(&self) -> Vec<String> {
+        self.with_accounts(|a| a.iter().map(|x| x.email.clone()).collect())
     }
 
     fn connected(&self) -> bool {
-        let Some(client) = &self.0.client else {
-            return false;
+        self.with_accounts(|a| !a.is_empty())
+    }
+
+    fn client_of(&self, email: &str) -> Option<Arc<Client>> {
+        self.with_accounts(|a| {
+            a.iter()
+                .find(|x| x.email == email)
+                .map(|x| x.client.clone())
+        })
+    }
+
+    /// Gives the unnamed single-account token its email (the primary calendar's id).
+    /// Best effort: on failure it stays as it is and the next start tries again.
+    async fn migrate_legacy_account(&self) {
+        let Some(account) = self
+            .accounts()
+            .into_iter()
+            .find(|a| a.email == UNNAMED_ACCOUNT)
+        else {
+            return;
         };
-        *lock(&self.0.connected).get_or_insert_with(|| client.is_connected())
-    }
-
-    fn set_connected(&self, value: bool) {
-        *lock(&self.0.connected) = Some(value);
-    }
-
-    fn status(&self) -> GoogleStatus {
-        let connected = self.connected();
-        GoogleStatus {
-            configured: self.0.client.is_some(),
-            connected,
-            email: self
-                .0
-                .client
-                .as_ref()
-                .filter(|_| connected)
-                .and_then(Client::stored_email),
-            needs_reconnect: connected
-                && self.0.client.as_ref().is_some_and(Client::needs_reconnect),
+        let result = match account.client.account_email().await {
+            Ok(email) => migrate_legacy(self.0.vault.as_ref(), &email),
+            Err(e) => Err(e.to_string()),
+        };
+        match result {
+            Ok(()) => {
+                let fresh = self.load_accounts();
+                *lock(&self.0.accounts) = Some(fresh);
+            }
+            Err(e) => eprintln!("naming the Google account: {e}"),
         }
     }
 
-    /// Maps a client error to the user-facing text, noting a revoked connection.
+    /// Saves the tokens of a finished consent under `email` and adds the account
+    /// (or, when it is already connected, replaces its token: this is also "Reconnect").
+    fn adopt(&self, email: &str, consent: &Client) -> Result<(), String> {
+        if !valid_email(email) {
+            return Err("Google did not say which account this is".into());
+        }
+        let (refresh, scope) = consent.credentials_to_keep()?;
+        let store = self.0.vault.store(email);
+        store.set_refresh_token(&refresh)?;
+        store.set_scope(scope.as_deref());
+        let mut emails = self.0.vault.accounts();
+        if !emails.iter().any(|e| e == email) {
+            emails.push(email.to_string());
+            self.0.vault.set_accounts(&emails)?;
+        }
+        let client = Arc::new(
+            self.build_client(store)
+                .ok_or("Google Calendar could not start")?,
+        );
+        self.with_accounts(
+            |accounts| match accounts.iter_mut().find(|a| a.email == email) {
+                Some(slot) => slot.client = client,
+                None => accounts.push(Account {
+                    email: email.to_string(),
+                    client,
+                }),
+            },
+        );
+        Ok(())
+    }
+
+    /// Forgets the account once its client has disconnected it.
+    fn forget(&self, email: &str) -> Result<(), String> {
+        if email == UNNAMED_ACCOUNT {
+            self.0.vault.delete_legacy();
+        }
+        let emails: Vec<String> = self
+            .0
+            .vault
+            .accounts()
+            .into_iter()
+            .filter(|e| e != email)
+            .collect();
+        self.0.vault.set_accounts(&emails)?;
+        self.with_accounts(|accounts| accounts.retain(|a| a.email != email));
+        Ok(())
+    }
+
+    fn status(&self, calendars: &[Calendar], chosen: Option<&str>) -> GoogleStatus {
+        let accounts: Vec<GoogleAccount> = self.with_accounts(|a| {
+            a.iter()
+                .map(|x| GoogleAccount {
+                    email: x.email.clone(),
+                    needs_reconnect: x.client.needs_reconnect(),
+                })
+                .collect()
+        });
+        let emails: Vec<String> = accounts.iter().map(|a| a.email.clone()).collect();
+        GoogleStatus {
+            configured: self.configured(),
+            connected: !accounts.is_empty(),
+            needs_reconnect: accounts.iter().any(|a| a.needs_reconnect),
+            new_event_calendar_id: new_event_calendar(calendars, &emails, chosen),
+            accounts,
+        }
+    }
+
+    /// The status with what the app database knows (calendars, the chosen new-block calendar).
+    fn status_with(&self, db: &AppDbHandle) -> GoogleStatus {
+        let chosen =
+            db.0.as_ref()
+                .ok()
+                .and_then(|db| db.meta(NEW_EVENT_CALENDAR).ok().flatten());
+        self.status(&known(db).calendars, chosen.as_deref())
+    }
+
+    /// Maps a client error to the user-facing text.
     fn describe(&self, e: &Error) -> String {
         match e {
-            Error::Disconnected | Error::NotConnected => {
-                self.set_connected(false);
-                DISCONNECTED.into()
-            }
+            Error::Disconnected | Error::NotConnected => DISCONNECTED.into(),
             Error::MissingScope => e.to_string(),
             Error::Message(m) => m.clone(),
         }
@@ -224,20 +409,75 @@ fn remove_event(events: &mut Vec<CalEvent>, id: &str) -> bool {
     events.len() != before
 }
 
-/// Calendars whose events the timeline fetches: the primary one always, then
-/// every live calendar the user shows. Without any calendar row yet, just `primary`.
-fn calendars_to_fetch(calendars: &[Calendar]) -> Vec<String> {
+/// The account a calendar belongs to; rows from before several accounts (no account
+/// yet) belong to the first one, the only one there was.
+fn owner<'a>(calendar: &'a Calendar, first: &'a str) -> &'a str {
+    calendar.account.as_deref().unwrap_or(first)
+}
+
+/// Calendars whose events the timeline fetches for `account`: its primary one always,
+/// then every live calendar of it the user shows. Without a primary row yet, the
+/// `primary` alias (which Google resolves for that account's own token).
+fn calendars_to_fetch(calendars: &[Calendar], account: &str, first: &str) -> Vec<String> {
+    let mine = |c: &&Calendar| !c.archived && owner(c, first) == account;
     let mut out: Vec<String> = Vec::new();
-    match calendars.iter().find(|c| c.is_primary && !c.archived) {
+    match calendars.iter().filter(mine).find(|c| c.is_primary) {
         Some(c) => out.push(c.google_calendar_id.clone()),
         None => out.push("primary".to_string()),
     }
-    for c in calendars {
-        if !c.archived && c.show_on_timeline && !out.contains(&c.google_calendar_id) {
+    for c in calendars.iter().filter(mine) {
+        if c.show_on_timeline && !out.contains(&c.google_calendar_id) {
             out.push(c.google_calendar_id.clone());
         }
     }
     out
+}
+
+/// The calendar new blocks go to: the user's choice when it is a live calendar of a
+/// connected account, else the primary calendar of the first account. `None` while
+/// the calendars are not known yet.
+fn new_event_calendar(
+    calendars: &[Calendar],
+    accounts: &[String],
+    chosen: Option<&str>,
+) -> Option<String> {
+    let first = accounts.first()?;
+    let live = |c: &&Calendar| !c.archived && accounts.iter().any(|a| a == owner(c, first));
+    if let Some(id) = chosen
+        && calendars
+            .iter()
+            .filter(live)
+            .any(|c| c.google_calendar_id == id)
+    {
+        return Some(id.to_string());
+    }
+    calendars
+        .iter()
+        .filter(live)
+        .find(|c| c.is_primary && owner(c, first) == first)
+        .map(|c| c.google_calendar_id.clone())
+}
+
+/// The email of the account that owns `calendar_id`: its row's account, the first account
+/// for the `primary` alias or a calendar the app does not know.
+fn account_for(
+    calendars: &[Calendar],
+    calendar_id: &str,
+    accounts: &[Account],
+) -> Result<Account, String> {
+    let first = accounts.first().ok_or(DISCONNECTED)?;
+    let email = match calendar_id {
+        "primary" => first.email.as_str(),
+        id => calendars
+            .iter()
+            .find(|c| c.google_calendar_id == id)
+            .map_or(first.email.as_str(), |c| owner(c, &first.email)),
+    };
+    accounts
+        .iter()
+        .find(|a| a.email == email)
+        .cloned()
+        .ok_or_else(|| format!("{email} is not connected; connect it again in Settings"))
 }
 
 /// The calendar row an event's calendar stands for; `primary` is the primary row.
@@ -304,7 +544,7 @@ fn enrich(events: Vec<CalEvent>, known: &Known) -> Vec<CalEvent> {
         .into_iter()
         .filter_map(|mut e| {
             if let Some(c) = calendar_of(&known.calendars, &e.calendar_id) {
-                let shown = c.is_primary || (c.show_on_timeline && !c.archived);
+                let shown = !c.archived && (c.is_primary || c.show_on_timeline);
                 if !shown {
                     return None;
                 }
@@ -346,10 +586,11 @@ fn today() -> String {
 }
 
 #[tauri::command]
-pub fn google_status(google: State<GoogleState>) -> GoogleStatus {
-    google.status()
+pub fn google_status(google: State<GoogleState>, db: State<AppDbHandle>) -> GoogleStatus {
+    google.status_with(&db)
 }
 
+/// Runs the consent in the browser and adds (or reconnects) the account it was for.
 #[tauri::command]
 pub async fn google_connect(
     app: AppHandle,
@@ -361,7 +602,7 @@ pub async fn google_connect(
     state: String,
 ) -> Result<GoogleStatus, String> {
     let google = google.inner().clone();
-    let client = google.client()?;
+    let creds = google.credentials()?;
     if !google::valid_challenge(&code_challenge) {
         return Err("invalid code challenge".into());
     }
@@ -378,7 +619,7 @@ pub async fn google_connect(
     }
     let (listener, port) = loopback::bind().map_err(|e| format!("starting sign-in: {e}"))?;
     let redirect = format!("http://127.0.0.1:{port}/callback");
-    let url = google::auth_url(&client_id_of(&google)?, &redirect, &code_challenge, &state);
+    let url = google::auth_url(&creds.client_id, &redirect, &code_challenge, &state);
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("opening the browser: {e}"))?;
@@ -389,38 +630,39 @@ pub async fn google_connect(
     .await
     .map_err(|e| e.to_string())??;
     let code = code_from_callback(&params, &state)?;
-    client
-        .exchange_code(&code, &code_verifier, &redirect)
-        .await
-        .map_err(|e| google.describe(&e))?;
-    google.set_connected(true);
-    // One test call: proves the API works, fills the cache and finds the account email.
-    let date = today();
-    match client.list_day(&date, &TimeZone::system()).await {
-        Ok(day) => {
-            client.remember_email(day.email.as_deref());
-            google.cache_put(&index, &date, &day.events, now_ms());
-            // Best effort: the calendars become projects.
-            if let Err(e) = refresh_projects(&app, &google, &db).await {
-                eprintln!("loading calendars: {e}");
-            }
-            Ok(google.status())
-        }
-        Err(e) => {
-            let message = google.describe(&e);
-            let _ = client.disconnect().await;
-            google.set_connected(false);
-            Err(message)
-        }
+    connect_with_code(&google, &code, &code_verifier, &redirect).await?;
+    // Best effort: the account's calendars become known (and its projects), then today shows its events.
+    if let Err(e) = refresh_projects(&app, &google, &db).await {
+        eprintln!("loading calendars: {e}");
     }
+    refresh_day(&app, &google, &index, &db, &today()).await;
+    Ok(google.status_with(&db))
 }
 
-/// The OAuth client id, for the consent URL.
-fn client_id_of(google: &GoogleState) -> Result<String, String> {
-    google.client()?;
-    credentials()
-        .map(|c| c.client_id)
-        .ok_or_else(|| NOT_CONFIGURED.to_string())
+/// Trades the consent code for tokens in memory, learns which account they belong to,
+/// then saves them under that email.
+async fn connect_with_code(
+    google: &GoogleState,
+    code: &str,
+    verifier: &str,
+    redirect: &str,
+) -> Result<String, String> {
+    let creds = google.credentials()?;
+    let consent = Client::new(
+        creds,
+        google.0.endpoints.clone(),
+        Arc::new(MemoryStore::default()),
+    )?;
+    consent
+        .exchange_code(code, verifier, redirect)
+        .await
+        .map_err(|e| google.describe(&e))?;
+    let email = consent
+        .account_email()
+        .await
+        .map_err(|e| google.describe(&e))?;
+    google.adopt(&email, &consent)?;
+    Ok(email)
 }
 
 #[tauri::command]
@@ -430,20 +672,76 @@ pub fn google_cancel_connect(google: State<GoogleState>) {
     }
 }
 
+/// Disconnects one account: revokes it (best effort), forgets its keychain entries and
+/// archives its calendars (projects and goals still point at them).
 #[tauri::command]
 pub async fn google_disconnect(
+    app: AppHandle,
     google: State<'_, GoogleState>,
     index: State<'_, IndexHandle>,
+    db: State<'_, AppDbHandle>,
+    email: String,
 ) -> Result<GoogleStatus, String> {
     let google = google.inner().clone();
-    google
-        .client()?
-        .disconnect()
-        .await
-        .map_err(|e| e.to_string())?;
-    google.set_connected(false);
-    google.cache_clear(&index);
-    Ok(google.status())
+    disconnect_account(&google, &index, &db, &email).await?;
+    emit_changed(&app, "calendars-changed");
+    emit_changed(&app, "projects-changed");
+    if let Err(e) = app.emit("calendar-changed", ChangedPayload { date: today() }) {
+        eprintln!("emitting calendar-changed: {e}");
+    }
+    Ok(google.status_with(&db))
+}
+
+async fn disconnect_account(
+    google: &GoogleState,
+    index: &IndexHandle,
+    db: &AppDbHandle,
+    email: &str,
+) -> Result<(), String> {
+    let client = google
+        .client_of(email)
+        .ok_or_else(|| format!("{email} is not connected"))?;
+    client.disconnect().await.map_err(|e| e.to_string())?;
+    google.forget(email)?;
+    // Its events stop showing because its calendars are archived; with nothing left
+    // (or no database to say so) the whole cache goes.
+    let archived = match &db.0 {
+        Ok(db) => db
+            .archive_calendars_except(&google.emails(), now_secs())
+            .map_err(|e| eprintln!("archiving calendars: {e}"))
+            .is_ok(),
+        Err(_) => false,
+    };
+    if !archived || !google.connected() {
+        google.cache_clear(index);
+    }
+    Ok(())
+}
+
+/// Chooses the calendar new blocks are created in (a live calendar of a connected account).
+#[tauri::command]
+pub fn google_set_new_event_calendar(
+    google: State<GoogleState>,
+    db: State<AppDbHandle>,
+    google_calendar_id: String,
+) -> Result<GoogleStatus, String> {
+    set_new_event_calendar(&google, &db, &google_calendar_id)
+}
+
+fn set_new_event_calendar(
+    google: &GoogleState,
+    db: &AppDbHandle,
+    google_calendar_id: &str,
+) -> Result<GoogleStatus, String> {
+    let handle = db.get()?;
+    let calendars = handle.calendars()?;
+    if new_event_calendar(&calendars, &google.emails(), Some(google_calendar_id)).as_deref()
+        != Some(google_calendar_id)
+    {
+        return Err("That calendar isn't available; refresh the calendars and try again".into());
+    }
+    handle.set_meta(NEW_EVENT_CALENDAR, google_calendar_id)?;
+    Ok(google.status_with(db))
 }
 
 #[tauri::command]
@@ -511,24 +809,20 @@ pub fn calendar_refresh(
     Ok(())
 }
 
-/// The day's events from every calendar to show. The primary one must succeed;
-/// another calendar that fails is skipped (and logged). An event that sits in
-/// several calendars is kept once, from the first.
+/// The day's events from every calendar of one account to show. Its primary
+/// calendar must succeed; another calendar that fails is skipped (and logged).
+/// An event that sits in several calendars is kept once, from the first.
 async fn fetch_day(
     client: &Client,
     calendars: &[String],
     date: &str,
     tz: &TimeZone,
-) -> Result<crate::google_client::DayEvents, Error> {
+) -> Result<Vec<CalEvent>, Error> {
     let mut all: Vec<CalEvent> = Vec::new();
-    let mut email = None;
     for (i, calendar) in calendars.iter().enumerate() {
         match client.list_day_in(calendar, date, tz).await {
             Ok(day) => {
-                if i == 0 {
-                    email = day.email;
-                }
-                for e in day.events {
+                for e in day {
                     if !all.iter().any(|x| x.id == e.id) {
                         all.push(e);
                     }
@@ -541,7 +835,96 @@ async fn fetch_day(
         }
     }
     all.sort_by_key(|e| (e.start, e.end));
-    Ok(crate::google_client::DayEvents { events: all, email })
+    Ok(all)
+}
+
+/// What a day fetch across accounts came to.
+#[derive(Debug, PartialEq)]
+struct DayFetch {
+    /// `None` when every account failed: the cache stays as it is.
+    events: Option<Vec<CalEvent>>,
+    /// One `(email, message)` per account that failed.
+    failed: Vec<(String, String)>,
+}
+
+/// Puts the accounts' answers together, first account first. An event seen in two
+/// accounts shows once. An account that failed keeps the events of its calendars
+/// from `previous` (the cache), so one failing account does not empty its part of the
+/// day; `owner_of` names the account of a cached event.
+fn merge_days(
+    answers: Vec<(String, Result<Vec<CalEvent>, String>)>,
+    previous: &[CalEvent],
+    owner_of: impl Fn(&CalEvent) -> String,
+) -> DayFetch {
+    let mut events: Vec<CalEvent> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    let mut any_ok = false;
+    for (email, answer) in answers {
+        match answer {
+            Ok(day) => {
+                any_ok = true;
+                for e in day {
+                    if !events.iter().any(|x| x.id == e.id) {
+                        events.push(e);
+                    }
+                }
+            }
+            Err(message) => failed.push((email, message)),
+        }
+    }
+    if !any_ok {
+        return DayFetch {
+            events: None,
+            failed,
+        };
+    }
+    for e in previous {
+        let owner = owner_of(e);
+        if failed.iter().any(|(email, _)| *email == owner) && !events.iter().any(|x| x.id == e.id) {
+            events.push(e.clone());
+        }
+    }
+    events.sort_by_key(|e| (e.start, e.end));
+    DayFetch {
+        events: Some(events),
+        failed,
+    }
+}
+
+/// The day from every connected account. One failing account does not hide the others.
+async fn fetch_all(
+    google: &GoogleState,
+    calendars: &[Calendar],
+    previous: &[CalEvent],
+    date: &str,
+    tz: &TimeZone,
+) -> DayFetch {
+    let accounts = google.accounts();
+    let first = accounts
+        .first()
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
+    let mut answers = Vec::new();
+    for account in &accounts {
+        let wanted = calendars_to_fetch(calendars, &account.email, &first);
+        let answer = fetch_day(&account.client, &wanted, date, tz)
+            .await
+            .map_err(|e| google.describe(&e));
+        answers.push((account.email.clone(), answer));
+    }
+    merge_days(answers, previous, |e| {
+        account_for(calendars, &e.calendar_id, &accounts)
+            .map_or_else(|_| first.clone(), |a| a.email)
+    })
+}
+
+/// `email: message`, so the user can tell which account failed.
+fn named(email: &str, message: &str) -> String {
+    if email == UNNAMED_ACCOUNT {
+        message.to_string()
+    } else {
+        format!("{email}: {message}")
+    }
 }
 
 async fn refresh_day(
@@ -551,44 +934,38 @@ async fn refresh_day(
     db: &AppDbHandle,
     date: &str,
 ) {
-    let result = match google.client() {
-        Ok(client) => fetch_day(
-            client,
-            &calendars_to_fetch(&known(db).calendars),
-            date,
-            &TimeZone::system(),
-        )
-        .await
-        .map_err(|e| (google.describe(&e), e)),
-        Err(m) => {
-            emit_error(app, date, m);
-            return;
-        }
+    let before = google.cache_get(index, date);
+    let previous = before
+        .as_ref()
+        .map(|(e, _)| e.as_slice())
+        .unwrap_or_default();
+    let day = fetch_all(
+        google,
+        &known(db).calendars,
+        previous,
+        date,
+        &TimeZone::system(),
+    )
+    .await;
+    for (email, message) in &day.failed {
+        emit_error(app, date, named(email, message));
+    }
+    // Projects come only from `projects_refresh`: an instance doesn't say how often
+    // its series repeats, and only series repeating at least weekly are projects.
+    let Some(events) = day.events else {
+        return;
     };
-    match result {
-        Ok(day) => {
-            if let Ok(client) = google.client()
-                && day.email.is_some()
-            {
-                client.remember_email(day.email.as_deref());
-            }
-            // Projects come only from `projects_refresh`: an instance doesn't say how often
-            // its series repeats, and only series repeating at least weekly are projects.
-            let before = google.cache_get(index, date);
-            let changed = before.is_none_or(|(events, _)| events != day.events);
-            google.cache_put(index, date, &day.events, now_ms());
-            if changed
-                && let Err(e) = app.emit(
-                    "calendar-changed",
-                    ChangedPayload {
-                        date: date.to_string(),
-                    },
-                )
-            {
-                eprintln!("emitting calendar-changed: {e}");
-            }
-        }
-        Err((message, _)) => emit_error(app, date, message),
+    let changed = before.is_none_or(|(old, _)| old != events);
+    google.cache_put(index, date, &events, now_ms());
+    if changed
+        && let Err(e) = app.emit(
+            "calendar-changed",
+            ChangedPayload {
+                date: date.to_string(),
+            },
+        )
+    {
+        eprintln!("emitting calendar-changed: {e}");
     }
 }
 
@@ -637,6 +1014,63 @@ fn uncache_event(google: &GoogleState, index: &IndexHandle, date: &str, event_id
     }
 }
 
+/// The account and calendar that serve a write on an event: the calendar the cache
+/// says it is in (else the primary calendar of the first account).
+fn route(
+    google: &GoogleState,
+    index: &IndexHandle,
+    db: &AppDbHandle,
+    date: &str,
+    event_id: &str,
+) -> Result<(Account, String), String> {
+    let known = known(db);
+    let accounts = google.accounts();
+    let first = accounts
+        .first()
+        .map(|a| a.email.as_str())
+        .unwrap_or_default();
+    let calendar = cached_calendar(google, index, date, event_id)
+        .unwrap_or_else(|| primary_calendar(&known.calendars, first));
+    Ok((
+        account_for(&known.calendars, &calendar, &accounts)?,
+        calendar,
+    ))
+}
+
+async fn create_event(
+    google: &GoogleState,
+    index: &IndexHandle,
+    db: &AppDbHandle,
+    (date, start, end): (&str, u32, u32),
+    title: &str,
+    tags: &[String],
+) -> Result<CalEvent, String> {
+    let title = check_write(date, start, end, title)?;
+    let known = known(db);
+    let accounts = google.accounts();
+    let chosen =
+        db.0.as_ref()
+            .ok()
+            .and_then(|db| db.meta(NEW_EVENT_CALENDAR).ok().flatten());
+    let calendar = new_event_calendar(&known.calendars, &google.emails(), chosen.as_deref())
+        .unwrap_or_else(|| "primary".to_string());
+    let account = account_for(&known.calendars, &calendar, &accounts)?;
+    let event = account
+        .client
+        .create_event(
+            &calendar,
+            date,
+            (start, end),
+            &title,
+            tags,
+            &TimeZone::system(),
+        )
+        .await
+        .map_err(|e| google.describe(&e))?;
+    cache_event(google, index, date, &event);
+    Ok(enrich_one(event, &known))
+}
+
 #[tauri::command]
 pub async fn calendar_create(
     app: AppHandle,
@@ -644,22 +1078,44 @@ pub async fn calendar_create(
     start: u32,
     end: u32,
     title: String,
+    tags: Vec<String>,
 ) -> Result<CalEvent, String> {
     let (google, index, db) = (
         app.state::<GoogleState>(),
         app.state::<IndexHandle>(),
         app.state::<AppDbHandle>(),
     );
-    let title = check_write(&date, start, end, &title)?;
-    let calendar = primary_calendar(&known(&db).calendars);
-    let google = google.inner().clone();
-    let event = google
-        .client()?
-        .create_event(&calendar, &date, start, end, &title, &TimeZone::system())
+    create_event(&google, &index, &db, (&date, start, end), &title, &tags).await
+}
+
+async fn update_event(
+    google: &GoogleState,
+    index: &IndexHandle,
+    db: &AppDbHandle,
+    (date, event_id): (&str, &str),
+    (start, end): (u32, u32),
+    title: &str,
+    tags: &[String],
+) -> Result<CalEvent, String> {
+    let title = check_write(date, start, end, title)?;
+    if event_id.is_empty() {
+        return Err("missing event id".into());
+    }
+    let (account, calendar) = route(google, index, db, date, event_id)?;
+    let event = account
+        .client
+        .update_event(
+            (&calendar, event_id),
+            date,
+            (start, end),
+            &title,
+            tags,
+            &TimeZone::system(),
+        )
         .await
         .map_err(|e| google.describe(&e))?;
-    cache_event(&google, &index, &date, &event);
-    Ok(enrich_one(event, &known(&db)))
+    cache_event(google, index, date, &event);
+    Ok(enrich_one(event, &known(db)))
 }
 
 #[tauri::command]
@@ -670,34 +1126,115 @@ pub async fn calendar_update(
     start: u32,
     end: u32,
     title: String,
+    tags: Vec<String>,
 ) -> Result<CalEvent, String> {
     let (google, index, db) = (
         app.state::<GoogleState>(),
         app.state::<IndexHandle>(),
         app.state::<AppDbHandle>(),
     );
-    let title = check_write(&date, start, end, &title)?;
+    update_event(
+        &google,
+        &index,
+        &db,
+        (&date, &event_id),
+        (start, end),
+        &title,
+        &tags,
+    )
+    .await
+}
+
+/// Gives the event these tags on Google (hidden, title untouched). For an instance of a
+/// repeating series the master gets them too, so every occurrence has them; the
+/// instance is patched as well, since today's occurrence may be an exception.
+async fn set_event_tags(
+    google: &GoogleState,
+    index: &IndexHandle,
+    db: &AppDbHandle,
+    (date, event_id): (&str, &str),
+    tags: &[String],
+) -> Result<CalEvent, String> {
+    check_date(date)?;
     if event_id.is_empty() {
         return Err("missing event id".into());
     }
-    let google = google.inner().clone();
-    // The event lives in the calendar the cache says (the primary one if unknown).
-    let calendar = cached_calendar(&google, &index, &date, &event_id)
-        .unwrap_or_else(|| primary_calendar(&known(&db).calendars));
-    let event = google
-        .client()?
-        .update_event(
-            (&calendar, &event_id),
-            &date,
-            start,
-            end,
-            &title,
-            &TimeZone::system(),
-        )
+    let cached = google
+        .cache_get(index, date)
+        .and_then(|(events, _)| events.into_iter().find(|e| e.id == event_id))
+        .ok_or("Event not found; refresh the day and try again")?;
+    let (account, calendar) = route(google, index, db, date, event_id)?;
+    let tz = TimeZone::system();
+    if let Some(master) = &cached.recurring_event_id {
+        account
+            .client
+            .set_series_tags((&calendar, master), tags)
+            .await
+            .map_err(|e| google.describe(&e))?;
+    }
+    let event = account
+        .client
+        .set_tags((&calendar, event_id), date, tags, &tz)
         .await
         .map_err(|e| google.describe(&e))?;
-    cache_event(&google, &index, &date, &event);
-    Ok(enrich_one(event, &known(&db)))
+    if let Some((mut events, at)) = google.cache_get(index, date) {
+        if let Some(master) = &cached.recurring_event_id {
+            retag_series(
+                &mut events,
+                master,
+                &google::parse_tags(&google::tags_value(tags)),
+            );
+        }
+        upsert_event(&mut events, event.clone());
+        google.cache_put(index, date, &events, at);
+    }
+    Ok(enrich_one(event, &known(db)))
+}
+
+/// Every cached occurrence of the series gets the tags (they inherit the master's).
+fn retag_series(events: &mut [CalEvent], series: &str, tags: &[String]) {
+    for e in events
+        .iter_mut()
+        .filter(|e| e.recurring_event_id.as_deref() == Some(series))
+    {
+        e.tags = tags.to_vec();
+    }
+}
+
+#[tauri::command]
+pub async fn calendar_set_tags(
+    app: AppHandle,
+    date: String,
+    event_id: String,
+    tags: Vec<String>,
+) -> Result<CalEvent, String> {
+    let (google, index, db) = (
+        app.state::<GoogleState>(),
+        app.state::<IndexHandle>(),
+        app.state::<AppDbHandle>(),
+    );
+    set_event_tags(&google, &index, &db, (&date, &event_id), &tags).await
+}
+
+async fn delete_event(
+    google: &GoogleState,
+    index: &IndexHandle,
+    db: &AppDbHandle,
+    date: &str,
+    event_id: &str,
+) -> Result<(), String> {
+    check_date(date)?;
+    if event_id.is_empty() {
+        return Err("missing event id".into());
+    }
+    let (account, calendar) = route(google, index, db, date, event_id)?;
+    account
+        .client
+        .delete_event(&calendar, event_id)
+        .await
+        .map_err(|e| google.describe(&e))?;
+    uncache_event(google, index, date, event_id);
+    Ok(())
 }
 
 /// Deletes the event from Google Calendar (only that occurrence of a repeating series), then from the day cache.
@@ -708,29 +1245,19 @@ pub async fn calendar_delete(app: AppHandle, date: String, event_id: String) -> 
         app.state::<IndexHandle>(),
         app.state::<AppDbHandle>(),
     );
-    check_date(&date)?;
-    if event_id.is_empty() {
-        return Err("missing event id".into());
-    }
-    let google = google.inner().clone();
-    let calendar = cached_calendar(&google, &index, &date, &event_id)
-        .unwrap_or_else(|| primary_calendar(&known(&db).calendars));
-    google
-        .client()?
-        .delete_event(&calendar, &event_id)
-        .await
-        .map_err(|e| google.describe(&e))?;
-    uncache_event(&google, &index, &date, &event_id);
+    delete_event(&google, &index, &db, &date, &event_id).await?;
     if let Err(e) = app.emit("calendar-changed", ChangedPayload { date }) {
         eprintln!("emitting calendar-changed: {e}");
     }
     Ok(())
 }
 
-fn primary_calendar(calendars: &[Calendar]) -> String {
+/// The calendar to use when an event's calendar is not known: the primary calendar
+/// of the first account.
+fn primary_calendar(calendars: &[Calendar], first: &str) -> String {
     calendars
         .iter()
-        .find(|c| c.is_primary && !c.archived)
+        .find(|c| c.is_primary && !c.archived && owner(c, first) == first)
         .map_or_else(|| "primary".to_string(), |c| c.google_calendar_id.clone())
 }
 
@@ -771,58 +1298,82 @@ fn series_time_min(today: jiff::civil::Date, tz: &TimeZone) -> Result<String, St
     google::day_bounds(&from.to_string(), tz).map(|(min, _)| min)
 }
 
-/// Reads Google's calendar list into the calendars, then the repeating series of
-/// the calendars the timeline shows into the projects. `Ok(false)` when there was
-/// nothing to do (not connected, token without the list scope, or a refresh
-/// already running). A calendar whose series can't be read is skipped (its
-/// projects stay as they are); only when none could be read is it an error.
+/// Reads every account's calendar list into the calendars, then the repeating series
+/// of the calendars the timeline shows into the projects. `Ok(false)` when there was
+/// nothing to do (no account that can be read, or a refresh already running).
+/// An account whose token lacks the list scope or whose calendars can't be read is
+/// skipped (its calendars and projects stay as they are); only when no calendar of
+/// any account could be read is it an error.
 async fn load_projects(google: &GoogleState, db: &AppDb) -> Result<bool, String> {
-    let client = match google.client() {
-        Ok(c) if google.connected() => c,
-        _ => return Ok(false),
-    };
-    if client.needs_reconnect() || google.0.projects_refreshing.swap(true, Ordering::SeqCst) {
+    if !google.configured() || google.0.projects_refreshing.swap(true, Ordering::SeqCst) {
         return Ok(false);
     }
-    let result = load_projects_inner(google, client, db).await;
+    let result = load_projects_inner(google, db).await;
     google.0.projects_refreshing.store(false, Ordering::SeqCst);
     result
 }
 
-async fn load_projects_inner(
-    google: &GoogleState,
-    client: &Client,
-    db: &AppDb,
-) -> Result<bool, String> {
-    let calendars = match client.list_calendars().await {
-        Ok(calendars) => calendars,
-        // The status now says `needsReconnect`.
-        Err(Error::MissingScope) => return Ok(true),
-        Err(e) => return Err(google.describe(&e)),
-    };
+async fn load_projects_inner(google: &GoogleState, db: &AppDb) -> Result<bool, String> {
+    let accounts = google.accounts();
+    let first = accounts
+        .first()
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
     let now = now_secs();
-    db.upsert_calendars(&calendars, now)?;
-    let time_min = series_time_min(jiff::Zoned::now().date(), &TimeZone::system())?;
-    let to_fetch = calendars_to_fetch(&db.calendars()?);
-    let mut found = Vec::new();
-    let mut first_error = None;
-    for calendar in to_fetch {
-        match client.list_series(&calendar, &time_min).await {
-            Ok(series) => found.push((calendar, series)),
-            Err(Error::MissingScope) => return Ok(true),
-            Err(e @ (Error::Disconnected | Error::NotConnected)) => {
-                return Err(google.describe(&e));
+    let mut attempted = false;
+    let mut list_error = None;
+    let mut listed = Vec::new();
+    for account in &accounts {
+        // The status says `needsReconnect` for it.
+        if account.client.needs_reconnect() {
+            continue;
+        }
+        attempted = true;
+        match account.client.list_calendars().await {
+            Ok(calendars) => {
+                let owner = (account.email != UNNAMED_ACCOUNT).then_some(account.email.as_str());
+                db.upsert_account_calendars(owner, account.email == first, &calendars, now)?;
+                listed.push(account);
             }
+            Err(Error::MissingScope) => {}
             Err(e) => {
-                eprintln!("series of calendar {calendar}: {e}");
-                first_error.get_or_insert(google.describe(&e));
+                eprintln!("calendars of {}: {e}", account.email);
+                list_error.get_or_insert(google.describe(&e));
             }
         }
     }
-    if found.is_empty()
-        && let Some(message) = first_error
-    {
-        return Err(message);
+    if !attempted {
+        return Ok(false);
+    }
+    if listed.is_empty() {
+        return list_error.map_or(Ok(true), Err);
+    }
+    // Calendars of an account that is no longer connected are archived, not deleted.
+    db.archive_calendars_except(&google.emails(), now)?;
+    let time_min = series_time_min(jiff::Zoned::now().date(), &TimeZone::system())?;
+    let calendars = db.calendars()?;
+    let mut found = Vec::new();
+    let mut first_error = None;
+    let mut missing_scope = false;
+    for account in listed {
+        for calendar in calendars_to_fetch(&calendars, &account.email, &first) {
+            match account.client.list_series(&calendar, &time_min).await {
+                Ok(series) => found.push((calendar, series)),
+                Err(Error::MissingScope) => missing_scope = true,
+                Err(e) => {
+                    eprintln!("series of calendar {calendar}: {e}");
+                    first_error.get_or_insert(google.describe(&e));
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        if let Some(message) = first_error {
+            return Err(message);
+        }
+        if missing_scope {
+            return Ok(true);
+        }
     }
     db.sync_series(&found, now)?;
     Ok(true)
@@ -902,6 +1453,8 @@ pub fn refresh_projects_in_background(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let google = app.state::<GoogleState>();
         let db = app.state::<AppDbHandle>();
+        // A connection from before several accounts gets its email first.
+        google.migrate_legacy_account().await;
         if let Err(e) = refresh_projects(&app, google.inner(), &db).await {
             eprintln!("loading calendars: {e}");
         }
@@ -925,6 +1478,7 @@ mod tests {
             project_key: None,
             project_id: None,
             color: String::new(),
+            tags: vec![],
         }
     }
 
@@ -1013,39 +1567,48 @@ mod tests {
 
     #[test]
     fn status_without_credentials_is_not_configured() {
-        let state = GoogleState(Arc::new(Inner {
-            client: None,
-            cancel: Mutex::new(None),
-            refreshing: Mutex::new(HashSet::new()),
-            connected: Mutex::new(None),
-            projects_refreshing: AtomicBool::new(false),
-            memory: Mutex::new(HashMap::new()),
-        }));
+        let state = bare();
         assert_eq!(
-            state.status(),
+            state.status(&[], None),
             GoogleStatus {
                 configured: false,
                 connected: false,
-                email: None,
-                needs_reconnect: false
+                accounts: vec![],
+                needs_reconnect: false,
+                new_event_calendar_id: None,
             }
         );
-        assert_eq!(state.client().err().as_deref(), Some(NOT_CONFIGURED));
-    }
-
-    fn with_client(client: Option<Client>) -> GoogleState {
-        GoogleState(Arc::new(Inner {
-            client,
-            cancel: Mutex::new(None),
-            refreshing: Mutex::new(HashSet::new()),
-            connected: Mutex::new(None),
-            projects_refreshing: AtomicBool::new(false),
-            memory: Mutex::new(HashMap::new()),
-        }))
+        assert!(!state.connected());
+        assert!(state.credentials().is_err());
+        assert_eq!(state.credentials().err().as_deref(), Some(NOT_CONFIGURED));
     }
 
     fn bare() -> GoogleState {
-        with_client(None)
+        GoogleState::with(None, Endpoints::default(), Arc::new(MemVault::default()))
+    }
+
+    /// A configured state whose accounts are already loaded (never the real keychain).
+    fn state_with(accounts: Vec<(&str, Client)>) -> GoogleState {
+        let state = GoogleState::with(
+            Some(creds()),
+            Endpoints::default(),
+            Arc::new(MemVault::default()),
+        );
+        *lock(&state.0.accounts) = Some(
+            accounts
+                .into_iter()
+                .map(|(email, client)| Account {
+                    email: email.into(),
+                    client: Arc::new(client),
+                })
+                .collect(),
+        );
+        state
+    }
+
+    /// A state talking to the fake server, with a vault the test can inspect.
+    fn state_on(base: &str, vault: Arc<MemVault>) -> GoogleState {
+        GoogleState::with(Some(creds()), endpoints(base), vault)
     }
 
     #[test]
@@ -1118,12 +1681,16 @@ mod tests {
         let status = GoogleStatus {
             configured: true,
             connected: true,
-            email: Some("a@b.c".into()),
+            accounts: vec![GoogleAccount {
+                email: "a@b.c".into(),
+                needs_reconnect: true,
+            }],
             needs_reconnect: true,
+            new_event_calendar_id: Some("a@b.c".into()),
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
-            serde_json::json!({"configured":true,"connected":true,"email":"a@b.c","needsReconnect":true})
+            serde_json::json!({"configured":true,"connected":true,"accounts":[{"email":"a@b.c","needsReconnect":true}],"needsReconnect":true,"newEventCalendarId":"a@b.c"})
         );
         let day = CalendarDay {
             events: vec![ev("a", 1, 2)],
@@ -1131,15 +1698,17 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&day).unwrap(),
-            serde_json::json!({"events":[{"id":"a","start":1,"end":2,"title":"a","projectKey":null,"projectId":null,"color":""}],"fetchedAt":5})
+            serde_json::json!({"events":[{"id":"a","start":1,"end":2,"title":"a","projectKey":null,"projectId":null,"color":"","tags":[]}],"fetchedAt":5})
         );
     }
 
     // ---- calendars and projects
 
     use crate::app_db::test_util::{add_series, cal, fixture};
-    use crate::google_client::TokenStore;
-    use crate::google_client::test_util::{MemStore, client as fake_client, fake_server};
+    use crate::google_client::test_util::{
+        MemStore, MemVault, client as fake_client, creds, endpoints, fake_server,
+    };
+    use crate::google_client::{TokenStore, Vault};
 
     fn calendar(id: i64, cal_id: &str, primary: bool, shown: bool, archived: bool) -> Calendar {
         Calendar {
@@ -1150,6 +1719,14 @@ mod tests {
             show_on_timeline: shown,
             is_primary: primary,
             archived,
+            account: None,
+        }
+    }
+
+    fn owned(account: &str, c: Calendar) -> Calendar {
+        Calendar {
+            account: Some(account.into()),
+            ..c
         }
     }
 
@@ -1190,13 +1767,14 @@ mod tests {
 
     #[test]
     fn timeline_fetches_primary_first_then_shown_live_calendars() {
-        assert_eq!(calendars_to_fetch(&calendars()), ["me@x", "mest@x"]);
-        assert_eq!(calendars_to_fetch(&[]), ["primary"]);
+        let fetch = |c: &[Calendar]| calendars_to_fetch(c, "me@x", "me@x");
+        assert_eq!(fetch(&calendars()), ["me@x", "mest@x"]);
+        assert_eq!(fetch(&[]), ["primary"]);
         // a primary the user hid is still fetched; an unknown primary falls back to the alias
         let only_others = vec![calendar(2, "mest@x", false, true, false)];
-        assert_eq!(calendars_to_fetch(&only_others), ["primary", "mest@x"]);
+        assert_eq!(fetch(&only_others), ["primary", "mest@x"]);
         let hidden_primary = vec![calendar(1, "me@x", true, false, false)];
-        assert_eq!(calendars_to_fetch(&hidden_primary), ["me@x"]);
+        assert_eq!(fetch(&hidden_primary), ["me@x"]);
     }
 
     fn ev_in(id: &str, calendar: &str) -> CalEvent {
@@ -1308,15 +1886,11 @@ mod tests {
         let c = connected_client(&base);
         let cals = vec!["me@x".to_string(), "mest@x".to_string()];
         let day = run(fetch_day(&c, &cals, "2026-10-21", &sp())).unwrap();
-        assert_eq!(day.events.len(), 1);
+        assert_eq!(day.len(), 1);
         assert_eq!(
-            (
-                day.events[0].title.as_str(),
-                day.events[0].calendar_id.as_str()
-            ),
+            (day[0].title.as_str(), day[0].calendar_id.as_str()),
             ("Primary copy", "me@x")
         );
-        assert_eq!(day.email.as_deref(), Some("me@example.com"));
         let reqs = seen.lock().unwrap();
         assert!(reqs[1].starts_with("GET /calendar/v3/calendars/me@x/events?"));
         assert!(reqs[2].starts_with("GET /calendar/v3/calendars/mest@x/events?"));
@@ -1329,7 +1903,6 @@ mod tests {
         let cals = vec!["me@x".to_string(), "mest@x".to_string()];
         let day = run(fetch_day(&c, &cals, "2026-10-21", &sp())).unwrap();
         let ids: Vec<_> = day
-            .events
             .iter()
             .map(|e| (e.id.as_str(), e.calendar_id.as_str()))
             .collect();
@@ -1343,7 +1916,7 @@ mod tests {
         let c = connected_client(&base);
         let cals = vec!["me@x".to_string(), "mest@x".to_string()];
         let day = run(fetch_day(&c, &cals, "2026-10-21", &sp())).unwrap();
-        assert_eq!(day.events.len(), 1);
+        assert_eq!(day.len(), 1);
         let (base, _) = fake_server(vec![tok(), boom]);
         let c = connected_client(&base);
         let err = run(fetch_day(&c, &cals, "2026-10-21", &sp())).unwrap_err();
@@ -1437,7 +2010,7 @@ mod tests {
                 r#"{"items":[{"id":"s3","summary":"Thesis","recurrence":["RRULE:FREQ=DAILY"]}]}"#.into(),
             ),
         ]);
-        let state = with_client(Some(connected_client(&base)));
+        let state = state_with(vec![("me@x", connected_client(&base))]);
         assert!(run(load_projects(&state, &f.db)).unwrap());
         assert_eq!(
             seen_series(&f),
@@ -1486,7 +2059,7 @@ mod tests {
             ),
             boom,
         ]);
-        let state = with_client(Some(connected_client(&base)));
+        let state = state_with(vec![("me@x", connected_client(&base))]);
         assert!(run(load_projects(&state, &f.db)).unwrap());
         let got = seen_series(&f);
         assert!(got.contains(&("Learn Rust".to_string(), "me@x".to_string(), false)));
@@ -1502,7 +2075,7 @@ mod tests {
         let f = fixture();
         let boom = (500, r#"{"error":{"message":"Backend Error"}}"#.to_string());
         let (base, _) = fake_server(vec![tok(), cal_list(CALS, None), boom.clone(), boom]);
-        let state = with_client(Some(connected_client(&base)));
+        let state = state_with(vec![("me@x", connected_client(&base))]);
         assert_eq!(
             run(load_projects(&state, &f.db)).unwrap_err(),
             "Backend Error"
@@ -1523,7 +2096,7 @@ mod tests {
             (200, r#"{"items":[]}"#.into()),
         ]);
         add_series(&f.db, "other@x", "s9", "Elsewhere");
-        let state = with_client(Some(connected_client(&base)));
+        let state = state_with(vec![("me@x", connected_client(&base))]);
         assert!(run(load_projects(&state, &f.db)).unwrap());
         assert!(!f.db.projects().unwrap()[0].archived);
     }
@@ -1534,16 +2107,16 @@ mod tests {
         // not connected
         let (base, seen) = fake_server(vec![]);
         let disconnected = fake_client(&base, Arc::new(MemStore::default()));
-        let state = with_client(Some(disconnected));
+        let state = state_with(vec![("me@x", disconnected)]);
         assert!(!run(load_projects(&state, &f.db)).unwrap());
         // connected, token without the list scope
         let store = Arc::new(MemStore::default());
         store.set_refresh_token("r").unwrap();
         store.set_scope(Some(crate::google::SCOPE));
-        let state = with_client(Some(fake_client(&base, store)));
+        let state = state_with(vec![("me@x", fake_client(&base, store))]);
         assert!(!run(load_projects(&state, &f.db)).unwrap());
         assert!(seen.lock().unwrap().is_empty());
-        assert!(state.status().needs_reconnect);
+        assert!(state.status(&[], None).needs_reconnect);
         // not configured
         assert!(!run(load_projects(&bare(), &f.db)).unwrap());
     }
@@ -1555,7 +2128,7 @@ mod tests {
             tok(),
             (500, r#"{"error":{"message":"Backend Error"}}"#.into()),
         ]);
-        let state = with_client(Some(connected_client(&base)));
+        let state = state_with(vec![("me@x", connected_client(&base))]);
         assert_eq!(
             run(load_projects(&state, &f.db)).unwrap_err(),
             "Backend Error"
@@ -1574,15 +2147,21 @@ mod tests {
                 r#"{"error":{"message":"Request had insufficient authentication scopes."}}"#.into(),
             ),
         ]);
-        let state = with_client(Some(connected_client(&base)));
+        let state = state_with(vec![("me@x", connected_client(&base))]);
         assert!(run(load_projects(&state, &f.db)).unwrap());
-        assert!(state.status().needs_reconnect);
+        assert!(state.status(&[], None).needs_reconnect);
     }
 
     #[test]
     fn primary_calendar_prefers_the_real_id() {
-        assert_eq!(primary_calendar(&calendars()), "me@x");
-        assert_eq!(primary_calendar(&[]), "primary");
+        assert_eq!(primary_calendar(&calendars(), "me@x"), "me@x");
+        assert_eq!(primary_calendar(&[], "me@x"), "primary");
+        // the first account's, not another account's primary
+        let two = vec![
+            owned("b@x", calendar(2, "b@x", true, true, false)),
+            owned("a@x", calendar(1, "a@x", true, true, false)),
+        ];
+        assert_eq!(primary_calendar(&two, "a@x"), "a@x");
     }
 
     #[test]
@@ -1661,5 +2240,924 @@ mod tests {
         let out = enrich(vec![ev_in("dentist", "me@x")], &known);
         assert_eq!(out[0].project_key.as_deref(), Some("event:dentist"));
         assert_eq!(out[0].project_id, Some(made[0].id));
+    }
+
+    // ---- several accounts and tags
+
+    fn db_handle(
+        f: crate::app_db::test_util::Fixture,
+    ) -> (AppDbHandle, crate::config::test_util::TempDir) {
+        let crate::app_db::test_util::Fixture { tmp, db, .. } = f;
+        (AppDbHandle(Ok(Arc::new(db))), tmp)
+    }
+
+    fn no_index() -> IndexHandle {
+        IndexHandle(Err("broken".into()))
+    }
+
+    /// A token response for the account with this access token.
+    fn tok_as(access: &str) -> (u16, String) {
+        (
+            200,
+            format!(r#"{{"access_token":"{access}","expires_in":3600}}"#),
+        )
+    }
+
+    fn client_for(base: &str, refresh: &str) -> Client {
+        let store = Arc::new(MemStore::default());
+        store.set_refresh_token(refresh).unwrap();
+        fake_client(base, store)
+    }
+
+    /// Two accounts on one fake server; their calendars are in the app database.
+    fn two_accounts(base: &str) -> (GoogleState, AppDbHandle, crate::config::test_util::TempDir) {
+        let f = fixture();
+        f.db.upsert_account_calendars(Some("a@x"), true, &[cal("a@x", "A", true, true)], 1)
+            .unwrap();
+        f.db.upsert_account_calendars(
+            Some("b@x"),
+            false,
+            &[
+                cal("b@x", "B", true, true),
+                cal("work@x", "Work", false, true),
+            ],
+            1,
+        )
+        .unwrap();
+        let state = state_with(vec![
+            ("a@x", client_for(base, "refresh-a")),
+            ("b@x", client_for(base, "refresh-b")),
+        ]);
+        let (db, tmp) = db_handle(f);
+        (state, db, tmp)
+    }
+
+    fn auth_of(req: &str) -> String {
+        req.to_ascii_lowercase()
+            .lines()
+            .find_map(|l| l.strip_prefix("authorization: bearer ").map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn calendars_belong_to_their_account_and_old_rows_to_the_first() {
+        let cals = vec![
+            owned("a@x", calendar(1, "a@x", true, true, false)),
+            owned("b@x", calendar(2, "b@x", true, true, false)),
+            owned("b@x", calendar(3, "work@x", false, true, false)),
+            owned("b@x", calendar(4, "hid@x", false, false, false)),
+            owned("b@x", calendar(5, "old@x", false, true, true)),
+            calendar(6, "legacy@x", false, true, false),
+        ];
+        assert_eq!(calendars_to_fetch(&cals, "a@x", "a@x"), ["a@x", "legacy@x"]);
+        assert_eq!(calendars_to_fetch(&cals, "b@x", "a@x"), ["b@x", "work@x"]);
+        // an account whose primary is not listed yet asks for its own `primary`
+        assert_eq!(calendars_to_fetch(&cals, "c@x", "a@x"), ["primary"]);
+    }
+
+    #[test]
+    fn the_new_block_calendar_is_the_choice_when_live_else_the_first_accounts_primary() {
+        let cals = vec![
+            owned("a@x", calendar(1, "a@x", true, true, false)),
+            owned("b@x", calendar(2, "b@x", true, true, false)),
+            owned("b@x", calendar(3, "work@x", false, true, false)),
+            owned("b@x", calendar(4, "old@x", false, true, true)),
+            owned("gone@x", calendar(5, "ghost@x", false, true, false)),
+        ];
+        let both = vec!["a@x".to_string(), "b@x".to_string()];
+        let pick = |chosen: Option<&str>| new_event_calendar(&cals, &both, chosen);
+        assert_eq!(pick(None).as_deref(), Some("a@x"));
+        assert_eq!(pick(Some("work@x")).as_deref(), Some("work@x"));
+        assert_eq!(pick(Some("old@x")).as_deref(), Some("a@x"), "archived");
+        assert_eq!(
+            pick(Some("ghost@x")).as_deref(),
+            Some("a@x"),
+            "disconnected account"
+        );
+        assert_eq!(pick(Some("nope")).as_deref(), Some("a@x"));
+        // the first account is gone: the next one's primary
+        let only_b = vec!["b@x".to_string()];
+        assert_eq!(
+            new_event_calendar(&cals, &only_b, Some("a@x")).as_deref(),
+            Some("b@x")
+        );
+        // nothing known yet / nothing connected
+        assert_eq!(new_event_calendar(&[], &both, None), None);
+        assert_eq!(new_event_calendar(&cals, &[], None), None);
+    }
+
+    #[test]
+    fn status_lists_accounts_in_order_with_their_reconnect_state() {
+        let (base, _) = fake_server(vec![]);
+        let revoked = fake_client(&base, Arc::new(MemStore::default()));
+        let state = state_with(vec![("a@x", client_for(&base, "r")), ("b@x", revoked)]);
+        let cals = vec![
+            owned("a@x", calendar(1, "a@x", true, true, false)),
+            owned("b@x", calendar(2, "work@x", false, true, false)),
+        ];
+        let status = state.status(&cals, Some("work@x"));
+        assert_eq!(
+            status,
+            GoogleStatus {
+                configured: true,
+                connected: true,
+                accounts: vec![
+                    GoogleAccount {
+                        email: "a@x".into(),
+                        needs_reconnect: false
+                    },
+                    GoogleAccount {
+                        email: "b@x".into(),
+                        needs_reconnect: true
+                    }
+                ],
+                needs_reconnect: true,
+                new_event_calendar_id: Some("work@x".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn writes_go_to_the_account_that_owns_the_calendar() {
+        let cals = vec![
+            owned("a@x", calendar(1, "a@x", true, true, false)),
+            owned("b@x", calendar(2, "work@x", false, true, false)),
+            calendar(3, "legacy@x", false, true, false),
+        ];
+        let (base, _) = fake_server(vec![]);
+        let accounts = vec![
+            Account {
+                email: "a@x".into(),
+                client: Arc::new(client_for(&base, "r")),
+            },
+            Account {
+                email: "b@x".into(),
+                client: Arc::new(client_for(&base, "r")),
+            },
+        ];
+        let who = |id: &str| account_for(&cals, id, &accounts).map(|a| a.email);
+        assert_eq!(who("work@x").unwrap(), "b@x");
+        assert_eq!(who("a@x").unwrap(), "a@x");
+        assert_eq!(who("legacy@x").unwrap(), "a@x", "no account yet: the first");
+        assert_eq!(who("primary").unwrap(), "a@x");
+        assert_eq!(who("unknown@x").unwrap(), "a@x");
+        // the owner is not connected
+        let only_a = &accounts[..1];
+        assert!(
+            account_for(&cals, "work@x", only_a)
+                .err()
+                .unwrap()
+                .contains("b@x")
+        );
+        assert!(account_for(&cals, "a@x", &[]).is_err());
+    }
+
+    fn evs(ids: &[(&str, &str)]) -> Vec<CalEvent> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, (id, cal))| CalEvent {
+                calendar_id: (*cal).into(),
+                ..ev(id, 100 * (i as u32 + 1), 100 * (i as u32 + 1) + 50)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merging_days_shows_a_shared_event_once_from_the_first_account() {
+        let a = evs(&[("same", "a@x"), ("a1", "a@x")]);
+        let b = evs(&[("same", "work@x"), ("b1", "work@x")]);
+        let out = merge_days(
+            vec![("a@x".into(), Ok(a)), ("b@x".into(), Ok(b))],
+            &[],
+            |_| String::new(),
+        );
+        assert!(out.failed.is_empty());
+        let got: Vec<_> = out
+            .events
+            .unwrap()
+            .iter()
+            .map(|e| (e.id.clone(), e.calendar_id.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("same".to_string(), "a@x".to_string()),
+                ("a1".to_string(), "a@x".to_string()),
+                ("b1".to_string(), "work@x".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failing_account_keeps_its_cached_events_and_never_hides_the_others() {
+        let previous = evs(&[("a-old", "a@x"), ("b-old", "work@x")]);
+        let owner = |e: &CalEvent| {
+            if e.calendar_id == "work@x" {
+                "b@x"
+            } else {
+                "a@x"
+            }
+            .to_string()
+        };
+        let out = merge_days(
+            vec![
+                ("a@x".into(), Ok(evs(&[("a-new", "a@x")]))),
+                ("b@x".into(), Err("Backend Error".into())),
+            ],
+            &previous,
+            owner,
+        );
+        assert_eq!(
+            out.failed,
+            [("b@x".to_string(), "Backend Error".to_string())]
+        );
+        let ids: Vec<_> = out.events.unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["a-new", "b-old"], "a-old is gone from A, b-old stays");
+        // every account failing leaves the cache alone
+        let out = merge_days(vec![("a@x".into(), Err("x".into()))], &previous, |_| {
+            String::new()
+        });
+        assert_eq!(out.events, None);
+        assert_eq!(out.failed.len(), 1);
+    }
+
+    #[test]
+    fn errors_name_the_account() {
+        assert_eq!(named("a@x", "Backend Error"), "a@x: Backend Error");
+        assert_eq!(named(UNNAMED_ACCOUNT, "Backend Error"), "Backend Error");
+    }
+
+    #[test]
+    fn the_day_is_fetched_from_every_account_with_real_calendar_ids() {
+        let (base, seen) = fake_server(vec![
+            tok_as("tokA"),
+            two_events("a1", "From A"),
+            tok_as("tokB"),
+            two_events("b1", "From B primary"),
+            two_events("b2", "From B work"),
+        ]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let day = run(fetch_all(
+            &state,
+            &known(&db).calendars,
+            &[],
+            "2026-10-21",
+            &sp(),
+        ));
+        assert!(day.failed.is_empty());
+        let got: Vec<_> = day
+            .events
+            .unwrap()
+            .iter()
+            .map(|e| (e.id.clone(), e.calendar_id.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a1".to_string(), "a@x".to_string()),
+                ("b1".to_string(), "b@x".to_string()),
+                ("b2".to_string(), "work@x".to_string())
+            ]
+        );
+        let reqs = seen.lock().unwrap();
+        assert!(reqs[1].starts_with("GET /calendar/v3/calendars/a@x/events?"));
+        assert_eq!(auth_of(&reqs[1]), "toka");
+        assert!(reqs[3].starts_with("GET /calendar/v3/calendars/b@x/events?"));
+        assert_eq!(auth_of(&reqs[3]), "tokb");
+        assert!(reqs[4].starts_with("GET /calendar/v3/calendars/work@x/events?"));
+        assert!(
+            !reqs.iter().any(|r| r.contains("/calendars/primary/")),
+            "never the literal primary once the real id is known"
+        );
+    }
+
+    #[test]
+    fn one_failing_account_is_reported_by_email_and_the_other_still_shows() {
+        let boom = (500, r#"{"error":{"message":"Backend Error"}}"#.to_string());
+        let (base, _) = fake_server(vec![
+            tok_as("tokA"),
+            boom,
+            tok_as("tokB"),
+            two_events("b1", "From B"),
+            two_events("b2", "From B work"),
+        ]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let day = run(fetch_all(
+            &state,
+            &known(&db).calendars,
+            &[],
+            "2026-10-21",
+            &sp(),
+        ));
+        assert_eq!(
+            day.failed,
+            [("a@x".to_string(), "Backend Error".to_string())]
+        );
+        assert_eq!(day.events.unwrap().len(), 2);
+        assert_eq!(
+            named(&day.failed[0].0, &day.failed[0].1),
+            "a@x: Backend Error"
+        );
+    }
+
+    #[test]
+    fn load_projects_reads_each_accounts_calendars_and_series() {
+        let f = fixture();
+        let (base, seen) = fake_server(vec![
+            tok_as("tokA"),
+            cal_list(
+                r##"{"id":"a@x","summary":"a@x","primary":true,"selected":true,"backgroundColor":"#111111"}"##,
+                None,
+            ),
+            tok_as("tokB"),
+            cal_list(
+                r##"{"id":"b@x","summary":"b@x","primary":true,"selected":true,"backgroundColor":"#222222"},{"id":"work@x","summary":"Work","selected":true,"backgroundColor":"#333333"}"##,
+                None,
+            ),
+            (
+                200,
+                r#"{"items":[{"id":"sa","summary":"Learn Rust","recurrence":["RRULE:FREQ=DAILY"]}]}"#.into(),
+            ),
+            (
+                200,
+                r#"{"items":[{"id":"sb","summary":"Standup","recurrence":["RRULE:FREQ=WEEKLY"]}]}"#.into(),
+            ),
+            (
+                200,
+                r#"{"items":[{"id":"sw","summary":"Thesis","recurrence":["RRULE:FREQ=DAILY"]}]}"#.into(),
+            ),
+        ]);
+        let state = state_with(vec![
+            ("a@x", client_for(&base, "refresh-a")),
+            ("b@x", client_for(&base, "refresh-b")),
+        ]);
+        assert!(run(load_projects(&state, &f.db)).unwrap());
+        let cals: Vec<_> =
+            f.db.calendars()
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.google_calendar_id, c.account, c.is_primary))
+                .collect();
+        assert_eq!(
+            cals,
+            [
+                ("a@x".to_string(), Some("a@x".to_string()), true),
+                ("b@x".to_string(), Some("b@x".to_string()), true),
+                ("work@x".to_string(), Some("b@x".to_string()), false),
+            ]
+        );
+        let names: Vec<_> =
+            f.db.projects()
+                .unwrap()
+                .into_iter()
+                .map(|p| p.name)
+                .collect();
+        assert_eq!(names, ["Learn Rust", "Standup", "Thesis"]);
+        let reqs = seen.lock().unwrap();
+        // every account's calendar list first, then the series of each account's calendars
+        assert!(reqs[1].starts_with("GET /calendar/v3/users/me/calendarList?"));
+        assert_eq!(auth_of(&reqs[1]), "toka");
+        assert_eq!(auth_of(&reqs[3]), "tokb");
+        assert!(reqs[4].starts_with("GET /calendar/v3/calendars/a@x/events?"));
+        assert_eq!(auth_of(&reqs[4]), "toka");
+        assert!(reqs[5].starts_with("GET /calendar/v3/calendars/b@x/events?"));
+        assert_eq!(auth_of(&reqs[5]), "tokb");
+        assert!(reqs[6].starts_with("GET /calendar/v3/calendars/work@x/events?"));
+    }
+
+    #[test]
+    fn an_account_that_cannot_be_read_does_not_stop_the_others_or_lose_its_calendars() {
+        let f = fixture();
+        f.db.upsert_account_calendars(Some("b@x"), false, &[cal("b@x", "B", true, true)], 1)
+            .unwrap();
+        let boom = (500, r#"{"error":{"message":"Backend Error"}}"#.to_string());
+        let (base, _) = fake_server(vec![
+            tok_as("tokA"),
+            boom,
+            tok_as("tokB"),
+            cal_list(
+                r##"{"id":"b@x","summary":"b@x","primary":true,"selected":true}"##,
+                None,
+            ),
+            (200, r#"{"items":[]}"#.into()),
+        ]);
+        let state = state_with(vec![
+            ("a@x", client_for(&base, "ra")),
+            ("b@x", client_for(&base, "rb")),
+        ]);
+        assert!(run(load_projects(&state, &f.db)).unwrap());
+        assert_eq!(f.db.calendars().unwrap().len(), 1);
+        // every account failing is an error
+        let (base, _) = fake_server(vec![
+            tok_as("tokA"),
+            (500, r#"{"error":{"message":"Backend Error"}}"#.into()),
+            tok_as("tokB"),
+            (500, r#"{"error":{"message":"Backend Error"}}"#.into()),
+        ]);
+        let state = state_with(vec![
+            ("a@x", client_for(&base, "ra")),
+            ("b@x", client_for(&base, "rb")),
+        ]);
+        assert_eq!(
+            run(load_projects(&state, &f.db)).unwrap_err(),
+            "Backend Error"
+        );
+    }
+
+    #[test]
+    fn calendars_of_an_account_that_left_the_list_are_archived_by_the_refresh() {
+        let f = fixture();
+        f.db.upsert_account_calendars(Some("gone@x"), false, &[cal("g@x", "G", true, true)], 1)
+            .unwrap();
+        let (base, _) = fake_server(vec![
+            tok_as("tokA"),
+            cal_list(
+                r##"{"id":"a@x","summary":"a@x","primary":true,"selected":true}"##,
+                None,
+            ),
+            (200, r#"{"items":[]}"#.into()),
+        ]);
+        let state = state_with(vec![("a@x", client_for(&base, "ra"))]);
+        assert!(run(load_projects(&state, &f.db)).unwrap());
+        let g =
+            f.db.calendars()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.google_calendar_id == "g@x")
+                .unwrap();
+        assert!(g.archived);
+    }
+
+    #[test]
+    fn creating_goes_to_the_chosen_calendar_of_its_account_and_carries_the_tags() {
+        let created = r#"{"id":"n1","summary":"Deep","start":{"dateTime":"2026-10-21T09:00:00-03:00"},"end":{"dateTime":"2026-10-21T10:00:00-03:00"},"extendedProperties":{"private":{"catengaTags":"rust"}}}"#;
+        let (base, seen) = fake_server(vec![
+            tok_as("tokA"),
+            (200, created.to_string()),
+            tok_as("tokB"),
+            (200, created.to_string()),
+        ]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let tags = vec!["rust".to_string()];
+        let new_block = || {
+            run(create_event(
+                &state,
+                &no_index(),
+                &db,
+                ("2026-10-21", 540, 600),
+                "Deep",
+                &tags,
+            ))
+            .unwrap()
+        };
+        // by default: the primary calendar of the first account
+        assert_eq!(new_block().calendar_id, "a@x");
+        // after choosing the work calendar of the second account the block lands there
+        let status = set_new_event_calendar(&state, &db, "work@x").unwrap();
+        assert_eq!(status.new_event_calendar_id.as_deref(), Some("work@x"));
+        let e = new_block();
+        assert_eq!(
+            (e.calendar_id.as_str(), e.tags.as_slice()),
+            ("work@x", ["rust".to_string()].as_slice())
+        );
+        let reqs = seen.lock().unwrap();
+        assert!(
+            reqs[1].starts_with("POST /calendar/v3/calendars/a@x/events "),
+            "{}",
+            reqs[1]
+        );
+        assert_eq!(auth_of(&reqs[1]), "toka");
+        assert!(
+            reqs[3].starts_with("POST /calendar/v3/calendars/work@x/events "),
+            "{}",
+            reqs[3]
+        );
+        assert_eq!(auth_of(&reqs[3]), "tokb");
+        assert_eq!(
+            body_json(&reqs[3])["extendedProperties"]["private"]["catengaTags"],
+            "rust"
+        );
+    }
+
+    fn body_json(req: &str) -> serde_json::Value {
+        serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn choosing_a_calendar_that_is_not_available_is_refused() {
+        let (base, _) = fake_server(vec![]);
+        let (state, db, _tmp) = two_accounts(&base);
+        assert!(set_new_event_calendar(&state, &db, "stranger@x").is_err());
+        assert_eq!(db.get().unwrap().meta(NEW_EVENT_CALENDAR).unwrap(), None);
+        set_new_event_calendar(&state, &db, "b@x").unwrap();
+        assert_eq!(
+            state.status_with(&db).new_event_calendar_id.as_deref(),
+            Some("b@x")
+        );
+        // the choice survives a restart (it is in the database) but not a disconnection of its account
+        let only_a = state_with(vec![("a@x", client_for(&base, "ra"))]);
+        assert_eq!(
+            only_a.status_with(&db).new_event_calendar_id.as_deref(),
+            Some("a@x")
+        );
+    }
+
+    #[test]
+    fn update_and_delete_use_the_account_of_the_cached_events_calendar() {
+        let updated = r#"{"id":"w1","summary":"Moved","start":{"dateTime":"2026-10-21T09:00:00-03:00"},"end":{"dateTime":"2026-10-21T10:00:00-03:00"}}"#;
+        let (base, seen) = fake_server(vec![
+            tok_as("tokB"),
+            (200, updated.to_string()),
+            (204, String::new()),
+        ]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let index = no_index();
+        state.cache_put(&index, "2026-10-21", &[ev_in("w1", "work@x")], 5);
+        let tags = vec!["go".to_string()];
+        let e = run(update_event(
+            &state,
+            &index,
+            &db,
+            ("2026-10-21", "w1"),
+            (540, 600),
+            "Moved",
+            &tags,
+        ))
+        .unwrap();
+        assert_eq!(e.calendar_id, "work@x");
+        run(delete_event(&state, &index, &db, "2026-10-21", "w1")).unwrap();
+        let reqs = seen.lock().unwrap();
+        assert!(reqs[1].starts_with("PATCH /calendar/v3/calendars/work@x/events/w1 "));
+        assert_eq!(auth_of(&reqs[1]), "tokb");
+        assert_eq!(
+            body_json(&reqs[1])["extendedProperties"]["private"]["catengaTags"],
+            "go"
+        );
+        assert!(reqs[2].starts_with("DELETE /calendar/v3/calendars/work@x/events/w1 "));
+        assert_eq!(auth_of(&reqs[2]), "tokb");
+        assert!(state.cache_get(&index, "2026-10-21").unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn tags_on_an_instance_patch_the_master_then_the_instance_and_the_cached_day() {
+        let instance_resp = r#"{"id":"s1_2026","recurringEventId":"s1","summary":"Learn Rust","start":{"dateTime":"2026-10-21T09:00:00-03:00"},"end":{"dateTime":"2026-10-21T10:00:00-03:00"},"extendedProperties":{"private":{"catengaTags":"rust mestrado"}}}"#;
+        let master_resp = r#"{"id":"s1","summary":"Learn Rust","start":{"dateTime":"2026-01-05T09:00:00-03:00"},"end":{"dateTime":"2026-01-05T10:00:00-03:00"}}"#;
+        let (base, seen) = fake_server(vec![
+            tok_as("tokB"),
+            (200, master_resp.to_string()),
+            (200, instance_resp.to_string()),
+        ]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let index = no_index();
+        let mut other = instance("s1_other", "work@x", "s1");
+        other.start = 700;
+        other.end = 800;
+        let mut unrelated = ev_in("x", "work@x");
+        unrelated.start = 900;
+        unrelated.end = 950;
+        state.cache_put(
+            &index,
+            "2026-10-21",
+            &[instance("s1_2026", "work@x", "s1"), other, unrelated],
+            7,
+        );
+        let tags = vec!["rust".to_string(), "#mestrado".to_string()];
+        let e = run(set_event_tags(
+            &state,
+            &index,
+            &db,
+            ("2026-10-21", "s1_2026"),
+            &tags,
+        ))
+        .unwrap();
+        assert_eq!(e.tags, ["rust", "mestrado"]);
+        assert_eq!(e.project_key.as_deref(), Some("series:s1"));
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert!(
+            reqs[1].starts_with("PATCH /calendar/v3/calendars/work@x/events/s1 "),
+            "{}",
+            reqs[1]
+        );
+        assert!(
+            reqs[2].starts_with("PATCH /calendar/v3/calendars/work@x/events/s1_2026 "),
+            "{}",
+            reqs[2]
+        );
+        for r in &reqs[1..] {
+            assert_eq!(auth_of(r), "tokb");
+            assert_eq!(
+                body_json(r),
+                serde_json::json!({"extendedProperties":{"private":{"catengaTags":"rust mestrado"}}})
+            );
+        }
+        let (cached, at) = state.cache_get(&index, "2026-10-21").unwrap();
+        assert_eq!(at, 7);
+        let tags_of = |id: &str| cached.iter().find(|e| e.id == id).unwrap().tags.clone();
+        assert_eq!(tags_of("s1_2026"), ["rust", "mestrado"]);
+        assert_eq!(
+            tags_of("s1_other"),
+            ["rust", "mestrado"],
+            "same series, same day"
+        );
+        assert!(tags_of("x").is_empty());
+    }
+
+    #[test]
+    fn tags_on_a_one_off_event_patch_only_that_event_and_can_be_cleared() {
+        let resp = r#"{"id":"one","summary":"Dentist","start":{"dateTime":"2026-10-21T09:00:00-03:00"},"end":{"dateTime":"2026-10-21T10:00:00-03:00"}}"#;
+        let (base, seen) = fake_server(vec![tok_as("tokA"), (200, resp.to_string())]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let index = no_index();
+        let mut tagged = ev_in("one", "a@x");
+        tagged.tags = vec!["old".into()];
+        state.cache_put(&index, "2026-10-21", &[tagged], 7);
+        let e = run(set_event_tags(
+            &state,
+            &index,
+            &db,
+            ("2026-10-21", "one"),
+            &[],
+        ))
+        .unwrap();
+        assert!(e.tags.is_empty());
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "no master to patch");
+        assert!(reqs[1].starts_with("PATCH /calendar/v3/calendars/a@x/events/one "));
+        assert_eq!(
+            body_json(&reqs[1]),
+            serde_json::json!({"extendedProperties":{"private":{"catengaTags":""}}})
+        );
+        assert!(
+            state.cache_get(&index, "2026-10-21").unwrap().0[0]
+                .tags
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tags_need_a_cached_event_and_valid_input() {
+        let (base, seen) = fake_server(vec![]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let index = no_index();
+        let err = |date: &str, id: &str| {
+            run(set_event_tags(&state, &index, &db, (date, id), &[])).unwrap_err()
+        };
+        assert_eq!(
+            err("2026-10-21", "nope"),
+            "Event not found; refresh the day and try again"
+        );
+        assert_eq!(err("nope", "x"), "invalid date nope");
+        assert_eq!(err("2026-10-21", ""), "missing event id");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn connecting_names_the_account_by_its_primary_calendar_and_saves_it_under_that_email() {
+        let consent = r#"{"access_token":"a","expires_in":3600,"refresh_token":"NEW","scope":"https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly"}"#;
+        let list = cal_list(
+            r##"{"id":"me@work.com","summary":"Me","primary":true}"##,
+            None,
+        );
+        let (base, seen) = fake_server(vec![(200, consent.into()), list.clone()]);
+        let vault = Arc::new(MemVault::default());
+        let state = state_on(&base, vault.clone());
+        let email = run(connect_with_code(
+            &state,
+            "4/code",
+            "verifier",
+            "http://127.0.0.1:9/callback",
+        ))
+        .unwrap();
+        assert_eq!(email, "me@work.com");
+        assert_eq!(vault.accounts(), ["me@work.com"]);
+        let store = vault.store("me@work.com");
+        assert_eq!(store.refresh_token().unwrap().as_deref(), Some("NEW"));
+        assert!(crate::google::has_list_scope(&store.scope().unwrap()));
+        assert_eq!(state.emails(), ["me@work.com"]);
+        assert!(!state.status(&[], None).needs_reconnect);
+        assert!(seen.lock().unwrap()[0].contains("grant_type=authorization_code"));
+
+        // a second account is added after the first
+        let consent2 = consent.replace("NEW", "SECOND");
+        let list2 = cal_list(
+            r##"{"id":"me@home.com","summary":"Me","primary":true}"##,
+            None,
+        );
+        let (base, _) = fake_server(vec![(200, consent2), list2]);
+        let state2 = state_on(&base, vault.clone());
+        run(connect_with_code(
+            &state2,
+            "c",
+            "v",
+            "http://127.0.0.1:9/callback",
+        ))
+        .unwrap();
+        assert_eq!(vault.accounts(), ["me@work.com", "me@home.com"]);
+        assert_eq!(state2.emails(), ["me@work.com", "me@home.com"]);
+
+        // connecting an email that is already there replaces its token and keeps its place
+        let consent3 = consent.replace("NEW", "RECONNECTED");
+        let (base, _) = fake_server(vec![(200, consent3), list]);
+        let state3 = state_on(&base, vault.clone());
+        assert_eq!(state3.emails().len(), 2);
+        run(connect_with_code(
+            &state3,
+            "c",
+            "v",
+            "http://127.0.0.1:9/callback",
+        ))
+        .unwrap();
+        assert_eq!(vault.accounts(), ["me@work.com", "me@home.com"]);
+        assert_eq!(
+            vault
+                .store("me@work.com")
+                .refresh_token()
+                .unwrap()
+                .as_deref(),
+            Some("RECONNECTED")
+        );
+        assert_eq!(state3.emails(), ["me@work.com", "me@home.com"]);
+    }
+
+    #[test]
+    fn a_failed_connection_saves_nothing() {
+        // no refresh token in the answer
+        let (base, _) = fake_server(vec![tok_as("a")]);
+        let vault = Arc::new(MemVault::default());
+        let state = state_on(&base, vault.clone());
+        assert!(
+            run(connect_with_code(
+                &state,
+                "c",
+                "v",
+                "http://127.0.0.1:9/callback"
+            ))
+            .is_err()
+        );
+        assert!(vault.accounts().is_empty() && state.emails().is_empty());
+        // the account cannot be named
+        let consent = r#"{"access_token":"a","expires_in":3600,"refresh_token":"NEW"}"#;
+        let (base, _) = fake_server(vec![
+            (200, consent.into()),
+            cal_list("", None),
+            (200, "{}".into()),
+        ]);
+        let state = state_on(&base, vault.clone());
+        assert!(
+            run(connect_with_code(
+                &state,
+                "c",
+                "v",
+                "http://127.0.0.1:9/callback"
+            ))
+            .is_err()
+        );
+        assert!(vault.accounts().is_empty());
+        assert!(vault.stores.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn disconnecting_one_account_keeps_the_other_and_archives_its_calendars() {
+        let (base, seen) = fake_server(vec![(200, "{}".into())]);
+        let vault = Arc::new(MemVault::default());
+        vault
+            .set_accounts(&["a@x".to_string(), "b@x".to_string()])
+            .unwrap();
+        vault.account("a@x").set_refresh_token("ra").unwrap();
+        vault.account("b@x").set_refresh_token("rb").unwrap();
+        let state = state_on(&base, vault.clone());
+        let f = fixture();
+        f.db.upsert_account_calendars(Some("a@x"), true, &[cal("a@x", "A", true, true)], 1)
+            .unwrap();
+        f.db.upsert_account_calendars(Some("b@x"), false, &[cal("b@x", "B", true, true)], 1)
+            .unwrap();
+        let (db, _tmp) = db_handle(f);
+        let index = no_index();
+        state.cache_put(
+            &index,
+            "2026-10-21",
+            &[ev_in("a1", "a@x"), ev_in("b1", "b@x")],
+            5,
+        );
+        assert_eq!(state.emails(), ["a@x", "b@x"]);
+
+        run(disconnect_account(&state, &index, &db, "b@x")).unwrap();
+        assert!(seen.lock().unwrap()[0].starts_with("POST /revoke?token=rb"));
+        assert_eq!(vault.accounts(), ["a@x"]);
+        assert_eq!(vault.store("b@x").refresh_token().unwrap(), None);
+        assert_eq!(
+            vault.store("a@x").refresh_token().unwrap().as_deref(),
+            Some("ra")
+        );
+        assert_eq!(state.emails(), ["a@x"]);
+        let cals = db.get().unwrap().calendars().unwrap();
+        assert!(
+            cals.iter()
+                .find(|c| c.google_calendar_id == "b@x")
+                .unwrap()
+                .archived
+        );
+        assert!(
+            !cals
+                .iter()
+                .find(|c| c.google_calendar_id == "a@x")
+                .unwrap()
+                .archived
+        );
+        // its events no longer show
+        let shown = enrich(
+            state.cache_get(&index, "2026-10-21").unwrap().0,
+            &known(&db),
+        );
+        assert_eq!(
+            shown.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["a1"]
+        );
+        assert!(state.status_with(&db).connected);
+
+        // the last one: everything goes, the cache too
+        let (base, _) = fake_server(vec![(200, "{}".into())]);
+        let state = state_on(&base, vault.clone());
+        run(disconnect_account(&state, &index, &db, "a@x")).unwrap();
+        assert!(vault.accounts().is_empty());
+        assert!(!state.status_with(&db).connected);
+        assert_eq!(state.cache_get(&index, "2026-10-21"), None);
+        // an unknown account is an error
+        assert!(run(disconnect_account(&state, &index, &db, "zzz@x")).is_err());
+    }
+
+    #[test]
+    fn a_single_account_install_moves_to_the_per_account_entries_without_losing_the_token() {
+        let vault = Arc::new(MemVault::default());
+        vault
+            .legacy_store
+            .set_refresh_token("legacy-refresh")
+            .unwrap();
+        vault.legacy_store.set_scope(Some("scope-a scope-b"));
+        *vault.legacy_email.lock().unwrap() = Some("me@x".into());
+        let (base, _) = fake_server(vec![]);
+        let state = state_on(&base, vault.clone());
+        assert_eq!(state.emails(), ["me@x"]);
+        assert_eq!(vault.accounts(), ["me@x"]);
+        assert_eq!(
+            vault.store("me@x").refresh_token().unwrap().as_deref(),
+            Some("legacy-refresh")
+        );
+        assert!(vault.legacy().is_none());
+        assert!(state.client_of("me@x").unwrap().is_connected());
+    }
+
+    #[test]
+    fn a_legacy_token_without_an_email_is_named_in_the_background_and_kept_when_that_fails() {
+        let vault = Arc::new(MemVault::default());
+        vault
+            .legacy_store
+            .set_refresh_token("legacy-refresh")
+            .unwrap();
+        *vault.legacy_email.lock().unwrap() = Some("Ismael's calendar".into());
+        // naming fails (offline): the legacy token keeps working as an unnamed account
+        let (base, _) = fake_server(vec![
+            tok_as("t"),
+            (500, r#"{"error":{"message":"Backend Error"}}"#.into()),
+            (500, r#"{"error":{"message":"Backend Error"}}"#.into()),
+        ]);
+        let state = state_on(&base, vault.clone());
+        assert_eq!(state.emails(), [UNNAMED_ACCOUNT]);
+        assert!(state.status(&[], None).connected);
+        run(state.migrate_legacy_account());
+        assert_eq!(state.emails(), [UNNAMED_ACCOUNT]);
+        assert!(
+            vault.legacy().is_some(),
+            "never deleted before the new entries exist"
+        );
+        assert!(vault.accounts().is_empty());
+        // the next start names it
+        let (base, _) = fake_server(vec![
+            tok_as("t"),
+            cal_list(r##"{"id":"me@x","summary":"me@x","primary":true}"##, None),
+        ]);
+        let state = state_on(&base, vault.clone());
+        assert_eq!(state.emails(), [UNNAMED_ACCOUNT]);
+        run(state.migrate_legacy_account());
+        assert_eq!(state.emails(), ["me@x"]);
+        assert_eq!(vault.accounts(), ["me@x"]);
+        assert_eq!(
+            vault.store("me@x").refresh_token().unwrap().as_deref(),
+            Some("legacy-refresh")
+        );
+        assert!(vault.legacy().is_none());
+    }
+
+    #[test]
+    fn nothing_is_read_without_credentials() {
+        let vault = Arc::new(MemVault::default());
+        vault
+            .legacy_store
+            .set_refresh_token("legacy-refresh")
+            .unwrap();
+        let state = GoogleState::with(None, Endpoints::default(), vault.clone());
+        assert!(state.emails().is_empty() && !state.connected());
+        assert!(vault.legacy().is_some(), "left alone");
     }
 }

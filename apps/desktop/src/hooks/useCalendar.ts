@@ -4,6 +4,7 @@ import {
   calendarDelete,
   calendarDay,
   calendarRefresh,
+  calendarSetTags,
   calendarUpdate,
   onCalendarChanged,
   onCalendarError,
@@ -123,7 +124,7 @@ export function useCalendar(
     };
   }, [enabled, read]);
 
-  /** Mirrors a block edit into Google (create/update); writes run one at a time. */
+  /** Mirrors a block edit into Google (create/update/tags); writes run one at a time. */
   const sync = useCallback(
     (prev: CalBlock[], next: CalBlock[]) => {
       if (!enabledRef.current) return;
@@ -139,18 +140,28 @@ export function useCalendar(
               e.id === eventId ? { ...e, start: block.start, end: block.end, title: block.title.trim() } : e,
             ),
           );
+        } else if (op.kind === "tags") {
+          const { eventId, block } = op;
+          setEvents(
+            forDate,
+            eventsRef.current.map((e) => (e.id === eventId ? { ...e, tags: block.tags } : e)),
+          );
         }
         chain.current = chain.current.then(async () => {
           try {
+            const { block } = op;
+            const title = block.title.trim();
             const event =
               op.kind === "create"
-                ? await calendarCreate(forDate, op.block.start, op.block.end, op.block.title.trim())
-                : await calendarUpdate(forDate, op.eventId, op.block.start, op.block.end, op.block.title.trim());
+                ? await calendarCreate(forDate, block.start, block.end, title, block.tags)
+                : op.kind === "update"
+                  ? await calendarUpdate(forDate, op.eventId, block.start, block.end, title, block.tags)
+                  : await calendarSetTags(forDate, op.eventId, block.tags);
             setEvents(forDate, upsert(eventsRef.current, event));
           } catch (e) {
             noticeRef.current(`Couldn't update Google Calendar: ${message(e)}`);
             // Drop the optimistic change.
-            if (op.kind === "update") await read(forDate);
+            if (op.kind !== "create") await read(forDate);
           }
         });
       }

@@ -7,6 +7,7 @@ const event = (id: string, start: number, end: number, title: string): CalEvent 
   id,
   start,
   end,
+  tags: [],
   title,
   projectKey: null,
   projectId: null,

@@ -1073,14 +1073,22 @@ pub(crate) mod tests {
         let cals = d.db.calendars().unwrap();
         assert_eq!(cals.len(), 1);
         assert!(!cals[0].show_on_timeline && cals[0].archived);
-        // The next Google refresh names and un-archives it, keeping the choice.
-        d.db.upsert_calendars(&[cal("mest@x", "Mestrado", false, true)], 3)
-            .unwrap();
+        assert_eq!(cals[0].account, None, "no account until one lists it");
+        // The next Google refresh of an account names, un-archives and claims it,
+        // keeping the choice.
+        d.db.upsert_account_calendars(
+            Some("me@x"),
+            true,
+            &[cal("mest@x", "Mestrado", false, true)],
+            3,
+        )
+        .unwrap();
         let c = &d.db.calendars().unwrap()[0];
         assert_eq!(
             (c.name.as_str(), c.show_on_timeline, c.archived),
             ("Mestrado", false, false)
         );
+        assert_eq!(c.account.as_deref(), Some("me@x"));
         assert_eq!(d.db.projects().unwrap()[0].name, "Dentist");
         let tags = d.db.saved_tags().unwrap();
         let by: Vec<_> = tags

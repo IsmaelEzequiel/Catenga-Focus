@@ -121,13 +121,23 @@ export const getAccountToken = () => invoke<string | null>("get_account_token");
 export const setAccountToken = (token: string) => invoke<void>("set_account_token", { token });
 export const clearAccountToken = () => invoke<void>("clear_account_token");
 
+export interface GoogleAccount {
+  email: string;
+  /** Granted before calendars became projects: the token lacks the calendar-list scope. */
+  needsReconnect: boolean;
+}
+
 export interface GoogleStatus {
   /** false when this build has no Google client credentials */
   configured: boolean;
+  /** at least one account */
   connected: boolean;
-  email: string | null;
-  /** Granted before calendars became projects: the token lacks the calendar-list scope. */
+  /** in connection order */
+  accounts: GoogleAccount[];
+  /** any account needs it */
   needsReconnect: boolean;
+  /** `googleCalendarId` new blocks are created in (the default already resolved) */
+  newEventCalendarId: string | null;
 }
 
 export interface CalEvent {
@@ -136,6 +146,8 @@ export interface CalEvent {
   start: number;
   end: number;
   title: string;
+  /** Kept hidden on the Google event; without '#' */
+  tags: string[];
   /** "series:<recurringEventId>" for an occurrence of a repeating event, "event:<id>" for a one-off made a project, else null */
   projectKey: string | null;
   /** `Project.id` when the project row exists */
@@ -151,20 +163,26 @@ export interface CalendarDay {
 }
 
 export const googleStatus = () => invoke<GoogleStatus>("google_status");
-/** Opens the browser on Google's consent page; resolves once connected. */
+/** Opens the browser on Google's consent page; resolves once connected. Adds an account (or reconnects one). */
 export const googleConnect = (codeChallenge: string, codeVerifier: string, state: string) =>
   invoke<GoogleStatus>("google_connect", { codeChallenge, codeVerifier, state });
 export const googleCancelConnect = () => invoke<void>("google_cancel_connect");
-export const googleDisconnect = () => invoke<GoogleStatus>("google_disconnect");
+export const googleDisconnect = (email: string) => invoke<GoogleStatus>("google_disconnect", { email });
+/** Where new blocks are created (a `Calendar.googleCalendarId`). */
+export const googleSetNewEventCalendar = (googleCalendarId: string) =>
+  invoke<GoogleStatus>("google_set_new_event_calendar", { googleCalendarId });
 /** Cached events only; empty when not connected. */
 export const calendarDay = (date: string) => invoke<CalendarDay>("calendar_day", { date });
 /** Fetches in the background; the result arrives as "calendar-changed" / "calendar-error". */
 export const calendarRefresh = (date: string) => invoke<void>("calendar_refresh", { date });
-/** Creates the event in the primary calendar. */
-export const calendarCreate = (date: string, start: number, end: number, title: string) =>
-  invoke<CalEvent>("calendar_create", { date, start, end, title });
-export const calendarUpdate = (date: string, eventId: string, start: number, end: number, title: string) =>
-  invoke<CalEvent>("calendar_update", { date, eventId, start, end, title });
+/** Creates the event in the "new blocks go to" calendar. */
+export const calendarCreate = (date: string, start: number, end: number, title: string, tags: string[]) =>
+  invoke<CalEvent>("calendar_create", { date, start, end, title, tags });
+export const calendarUpdate = (date: string, eventId: string, start: number, end: number, title: string, tags: string[]) =>
+  invoke<CalEvent>("calendar_update", { date, eventId, start, end, title, tags });
+/** Keeps the tags hidden on the event (the whole series for a repeating one); title and time are untouched. */
+export const calendarSetTags = (date: string, eventId: string, tags: string[]) =>
+  invoke<CalEvent>("calendar_set_tags", { date, eventId, tags });
 /** Deletes the event in Google Calendar (only that occurrence of a repeating series); already gone counts as done. */
 export const calendarDelete = (date: string, eventId: string) => invoke<void>("calendar_delete", { date, eventId });
 
@@ -327,6 +345,8 @@ export interface Calendar {
   color: string;
   showOnTimeline: boolean;
   isPrimary: boolean;
+  /** Email of the Google account that owns it; null until the next calendar refresh fills it */
+  account: string | null;
   /** The calendar is no longer in the user's Google list */
   archived: boolean;
 }

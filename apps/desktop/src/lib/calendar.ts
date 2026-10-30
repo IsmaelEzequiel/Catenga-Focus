@@ -8,11 +8,23 @@ export type { CalEvent };
 export interface CalBlock extends Range {
   key: string;
   title: string;
+  /** Without '#'. */
+  tags: string[];
 }
 
 export type CalendarOp =
   | { kind: "create"; block: CalBlock }
-  | { kind: "update"; eventId: string; block: CalBlock };
+  | { kind: "update"; eventId: string; block: CalBlock }
+  | { kind: "tags"; eventId: string; block: CalBlock };
+
+const tagSet = (tags: string[]) => new Set(tags.map((t) => t.toLowerCase()));
+
+/** Tags compared the way Google writes see them: case-insensitive, order-insensitive, duplicates dropped. */
+export function sameTags(a: string[], b: string[]): boolean {
+  const x = tagSet(a);
+  const y = tagSet(b);
+  return x.size === y.size && [...x].every((t) => y.has(t));
+}
 
 const sameSlot = (b: CalBlock, e: CalEvent) =>
   b.start === e.start && b.end === e.end && b.title.trim() === e.title.trim();
@@ -50,6 +62,7 @@ export function calendarOps<B extends CalBlock>(prev: B[], next: B[], events: Ca
       if (old.start !== block.start || old.end !== block.end || old.title.trim() !== block.title.trim()) {
         ops.push({ kind: "update", eventId: event.id, block });
       }
+      if (!sameTags(old.tags, block.tags)) ops.push({ kind: "tags", eventId: event.id, block });
     } else if ((!old || old.title.trim() === "") && !nextMatch.has(block.key)) {
       ops.push({ kind: "create", block });
     }

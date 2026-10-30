@@ -23,6 +23,15 @@
   gap: var(--space-5);
 }
 
+.goalspage__hint {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-ink-muted);
+}
+
 /* Project picker (goal form, notes panel) */
 .projpick {
   position: relative;
@@ -268,9 +277,8 @@
   gap: var(--space-3);
 }
 
-.projtags__h {
-  margin: 0;
-  font: 600 var(--text-xl) / 1.2 var(--font-display);
+.projtags__field {
+  padding: var(--space-2) 0;
 }
 
 .card__head.projtags__head {

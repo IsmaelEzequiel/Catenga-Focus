@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CalEvent, Project } from "../api";
+import type { CalEvent, GoogleStatus, Project } from "../api";
 import {
   blockProject,
   blockProjectKey,
@@ -27,6 +27,7 @@ const event = (over: Partial<CalEvent> = {}): CalEvent => ({
   start: 540,
   end: 600,
   title: "Study",
+  tags: [],
   projectKey: "series:abc",
   projectId: 1,
   color: "#3d6fb6",
@@ -113,10 +114,11 @@ describe("projectHint", () => {
 });
 
 describe("reconnect hints", () => {
-  const status = (over: Partial<{ configured: boolean; connected: boolean; needsReconnect: boolean }>) => ({
+  const status = (over: Partial<GoogleStatus>): GoogleStatus => ({
     configured: true,
     connected: true,
-    email: null,
+    accounts: [],
+    newEventCalendarId: null,
     needsReconnect: false,
     ...over,
   });

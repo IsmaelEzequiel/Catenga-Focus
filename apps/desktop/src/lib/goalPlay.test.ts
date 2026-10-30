@@ -24,6 +24,7 @@ const event = (id: string, start: number, end: number, title: string, projectKey
   id,
   start,
   end,
+  tags: [],
   title,
   projectKey,
   projectId: projectKey ? 1 : null,

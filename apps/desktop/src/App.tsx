@@ -13,6 +13,7 @@ import { RecapView } from "./components/RecapView";
 import { QuickAdd } from "./components/QuickAdd";
 import { ShortcutsHelp } from "./components/ShortcutsHelp";
 import { Settings } from "./components/Settings";
+import type { SettingsTab } from "./lib/settingsTabs";
 import { timerReadout } from "./components/TimerBar";
 import { Banner } from "./components/ui/Banner";
 import { Button } from "./components/ui/Button";
@@ -63,6 +64,7 @@ function App() {
   const [view, setView] = useState<View>(DAY_VIEW);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [helpOpen, setHelpOpen] = useState(false);
   const [quickAddOpen, setQuickAddOpen] = useState(false);
   /** The slot quick-add's text parses to, drawn as a ghost on the grid. */
@@ -525,7 +527,7 @@ function App() {
       project = projectKeyOf(found.key);
     } else {
       // Same as clicking a ghost: the block takes the existing event, so no new Google event is made.
-      const base = { start: target.event.start, end: target.event.end, title: target.event.title, tags: [], body: "" };
+      const base = { start: target.event.start, end: target.event.end, title: target.event.title, tags: target.event.tags, body: "" };
       block = { ...base, key: crypto.randomUUID() };
       project = target.event.projectKey;
       commitBlocks([...day.blocks, { ...base, key: block.key }]);
@@ -556,7 +558,7 @@ function App() {
     } else {
       // Same as clicking a ghost: the block takes the existing event, so no new Google event is made.
       key = crypto.randomUUID();
-      commitBlocks([...day.blocks, { key, start: target.event.start, end: target.event.end, title: target.event.title, tags: [], body: "" }]);
+      commitBlocks([...day.blocks, { key, start: target.event.start, end: target.event.end, title: target.event.title, tags: target.event.tags, body: "" }]);
     }
     onSelect(key, { focusNote: true });
     setReveal((r) => ({ minute: nowItem.start, token: (r?.token ?? 0) + 1 }));
@@ -588,7 +590,7 @@ function App() {
       if (project === null) project = goal.project?.key ?? null;
     } else {
       // Same as clicking a ghost: the block takes the existing event, so no new Google event is made.
-      const base = { start: target.event.start, end: target.event.end, title: target.event.title, tags: [], body: "" };
+      const base = { start: target.event.start, end: target.event.end, title: target.event.title, tags: target.event.tags, body: "" };
       block = { ...base, key: crypto.randomUUID() };
       project = target.event.projectKey;
       commitBlocks([...day.blocks, { ...base, key: block.key }]);
@@ -747,7 +749,10 @@ function App() {
         onNav={navigate}
         onQuickAdd={openQuickAdd}
         onSearch={openSearch}
-        onSettings={() => setSettingsOpen(true)}
+        onSettings={() => {
+          setSettingsTab("general");
+          setSettingsOpen(true);
+        }}
       />
       {banner && (
         <Banner onDismiss={dismiss}>{banner}</Banner>
@@ -798,7 +803,10 @@ function App() {
           <GoalsView
             projects={projects}
             google={google.status}
-            onConnect={google.connect}
+            onOpenSettings={(tab) => {
+              setSettingsTab(tab);
+              setSettingsOpen(true);
+            }}
             timerStatus={timer.status}
             nowMs={timer.nowMs}
             onPlay={playGoal}
@@ -929,7 +937,10 @@ function App() {
           google={google}
           onGoogleConnect={google.connect}
           onGoogleCancel={google.cancel}
-          onGoogleDisconnect={google.disconnect}
+          onGoogleDisconnect={(email) => void google.disconnect(email)}
+          onGoogleSetNewEventCalendar={(id) => void google.setNewEventCalendar(id)}
+          projects={projects}
+          initialTab={settingsTab}
           onApplyNotesFolder={(path) => applyNotesFolder(dayRef.current, path, setNotesDir, appRestart)}
           onClose={() => setSettingsOpen(false)}
           onShowShortcuts={() => {

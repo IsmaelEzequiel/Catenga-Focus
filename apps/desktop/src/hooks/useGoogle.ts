@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { googleCancelConnect, googleConnect, googleDisconnect, googleStatus, onCalendarsChanged, onProjectsChanged, type GoogleStatus } from "../api";
+import { googleCancelConnect, googleConnect, googleDisconnect, googleSetNewEventCalendar, googleStatus, onCalendarsChanged, onProjectsChanged, type GoogleStatus } from "../api";
 import { createPkce, randomState } from "../lib/pkce";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -81,15 +81,26 @@ export function useGoogle() {
     googleCancelConnect().catch(() => {});
   }, []);
 
-  const disconnect = useCallback(async () => {
+  /** Disconnects one account; the others stay connected. */
+  const disconnect = useCallback(async (email: string) => {
     attempt.current++;
     setError(null);
     try {
-      setStatus(await googleDisconnect());
+      setStatus(await googleDisconnect(email));
     } catch (e) {
       setError(message(e));
     }
   }, []);
 
-  return { status, connecting, error, connect, cancel, disconnect, recheck };
+  /** Chooses the calendar new blocks are created in. */
+  const setNewEventCalendar = useCallback(async (googleCalendarId: string) => {
+    setError(null);
+    try {
+      setStatus(await googleSetNewEventCalendar(googleCalendarId));
+    } catch (e) {
+      setError(message(e));
+    }
+  }, []);
+
+  return { status, connecting, error, connect, cancel, disconnect, setNewEventCalendar, recheck };
 }
