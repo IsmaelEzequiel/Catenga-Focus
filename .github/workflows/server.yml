@@ -58,4 +58,5 @@ jobs:
       - if: env.FLY_API_TOKEN != ''
         uses: superfly/flyctl-actions/setup-flyctl@master
       - if: env.FLY_API_TOKEN != ''
-        run: flyctl deploy --config server/fly.toml --image ghcr.io/${{ github.repository }}-server:sha-${GITHUB_SHA::7}
+        # metadata-action pushes the image under a lowercase name; ghcr refs must match it.
+        run: flyctl deploy --config server/fly.toml --image "ghcr.io/${GITHUB_REPOSITORY,,}-server:sha-${GITHUB_SHA::7}"
