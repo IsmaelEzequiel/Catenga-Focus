@@ -327,6 +327,15 @@ describe("files content", () => {
     expect(big.status).toBe(413);
   });
 
+  it("answers 500 (not 400) when blob storage fails, so the app retries", async () => {
+    onPut = async () => {
+      throw new Error("R2 put failed with status 403");
+    };
+    const res = await put(tokenA, P, blob(1), sha("x"));
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe("Server error");
+  });
+
   it("requires sign-in on every route", async () => {
     expect((await put(null, P, blob(1), sha("x"))).status).toBe(401);
     expect((await get(null, P)).status).toBe(401);

@@ -380,8 +380,9 @@ function SyncRows({
     <>
       {line.error ? (
         <Banner tone="error" variant="inline" actions={syncButton}>
-          <span title={line.text}>
-            Couldn't reach the sync server.
+          <span>
+            {/* "offline" never reaches here: the server answered with this error. */}
+            Couldn't sync: {line.text.replace(/\.$/, "")}.
             {waiting > 0 ? ` ${waitingText}` : ""}
           </span>
         </Banner>
