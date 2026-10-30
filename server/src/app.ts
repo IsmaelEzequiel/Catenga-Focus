@@ -378,8 +378,14 @@ export function createApp({ db, mailer, baseUrl, blobs, notesKek, now = Date.now
 
   app.use("/api", (err: unknown, _req: Request, res: Response, next: (e?: unknown) => void) => {
     if (res.headersSent) return next(err);
-    const status = typeof err === "object" && err !== null && "status" in err && err.status === 413 ? 413 : 400;
-    res.status(status).json({ error: "Invalid request" });
+    // Body-parser errors carry a 4xx status; anything else (D1, R2) is ours: log it and let the app retry.
+    const status = typeof err === "object" && err !== null && "status" in err ? err.status : undefined;
+    if (typeof status === "number" && status >= 400 && status < 500) {
+      res.status(status === 413 ? 413 : 400).json({ error: "Invalid request" });
+      return;
+    }
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
   });
 
   app.use((err: unknown, _req: Request, res: Response, next: (e?: unknown) => void) => {
