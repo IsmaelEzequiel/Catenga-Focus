@@ -12,6 +12,7 @@ use serde::Serialize;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+#[cfg(target_os = "macos")]
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
@@ -344,7 +345,7 @@ pub fn start(app: &AppHandle) -> tauri::Result<()> {
     // Windows and Linux trays are often dark: the colored app icon reads on both.
     #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(Image::from(icon.clone()));
+        builder = builder.icon(icon.clone());
     }
     let tray = builder.build(app)?;
     app.manage(TrayReady);
