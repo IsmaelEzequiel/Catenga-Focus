@@ -194,7 +194,8 @@
   box-sizing: border-box;
 }
 
-.goalring svg {
+/* Only the ring itself: the check icon inside __center is an svg too. */
+.goalring > svg {
   position: absolute;
   inset: 0;
 }
@@ -223,6 +224,7 @@
 }
 
 .goalring__check {
+  display: block;
   width: 24px;
   height: 24px;
   color: var(--color-sun-ink);
