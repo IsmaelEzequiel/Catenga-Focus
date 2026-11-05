@@ -11,6 +11,10 @@
 
 ---
 
+[![Desktop](https://github.com/IsmaelEzequiel/Catenga-Focus/actions/workflows/desktop.yml/badge.svg)](https://github.com/IsmaelEzequiel/Catenga-Focus/actions/workflows/desktop.yml)
+
+---
+
 *Catenga* is a Northeast Brazil word for the small lizards (calangos) that bask in the sun. The app is built around one idea: **every note you write for a block of time lives in a markdown file you own**, is searchable, and can be browsed by day, title or tag — instead of being stuck to a moment you can never find again.
 
 > **Status:** in active development, used daily by its author. Expect rough edges and breaking changes before 1.0. See [Roadmap](#roadmap).
