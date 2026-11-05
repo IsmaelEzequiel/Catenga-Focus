@@ -3,6 +3,7 @@ import {
   goalCreate,
   goalDelete,
   goalSetArchived,
+  goalSetCount,
   goalUpdate,
   goals,
   goalsArchived,
@@ -80,5 +81,6 @@ export function useGoals() {
     update: (id: number, d: GoalDraft) => write(() => goalUpdate(id, d)),
     setArchived: (id: number, v: boolean) => write(() => goalSetArchived(id, v)),
     remove: (id: number) => write(() => goalDelete(id)),
+    setCount: (id: number, date: string, amount: number) => write(() => goalSetCount(id, date, amount)),
   };
 }

@@ -246,6 +246,7 @@ pub fn run() {
             commands::goal_update,
             commands::goal_set_archived,
             commands::goal_delete,
+            commands::goal_set_count,
             commands::calendars,
             commands::calendar_set_shown,
             commands::projects,

@@ -149,6 +149,21 @@ const V5: &str = "
 ALTER TABLE calendars ADD COLUMN account TEXT;
 ";
 
+/// v6: goals get a kind (`time` | `count`), a name (cards no longer need a project to
+/// have a title) and, for count goals, an amount per day and a unit; what a count goal
+/// got each day lives in `goal_counts` (synced inside its goal's row). Count goals keep a
+/// placeholder in `minutes_per_day`, whose CHECK can't change without rebuilding `goals`.
+const V6: &str = "
+ALTER TABLE goals ADD COLUMN kind TEXT NOT NULL DEFAULT 'time';
+ALTER TABLE goals ADD COLUMN name TEXT;
+ALTER TABLE goals ADD COLUMN target_count INTEGER;
+ALTER TABLE goals ADD COLUMN unit TEXT;
+CREATE TABLE goal_counts(goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                         date TEXT NOT NULL,
+                         amount INTEGER NOT NULL CHECK (amount > 0),
+                         PRIMARY KEY (goal_id, date));
+";
+
 fn migrations() -> Vec<String> {
     vec![
         V1.to_string(),
@@ -156,6 +171,7 @@ fn migrations() -> Vec<String> {
         v3(),
         V4.to_string(),
         V5.to_string(),
+        V6.to_string(),
     ]
 }
 
@@ -841,7 +857,7 @@ mod tests {
     #[test]
     fn fresh_database_gets_the_latest_schema_and_no_backup() {
         let f = fixture();
-        assert_eq!(user_version(&f.path), 5);
+        assert_eq!(user_version(&f.path), 6);
         for table in [
             "meta",
             "calendars",
@@ -849,6 +865,7 @@ mod tests {
             "tags",
             "goals",
             "goal_tags",
+            "goal_counts",
         ] {
             let n: i64 =
                 f.db.with_conn("t", |c| {
@@ -961,7 +978,7 @@ mod tests {
         let path = tmp.0.join("catenga.sqlite");
         build_v1(&path);
         let db = AppDb::open(&path).unwrap();
-        assert_eq!(user_version(&path), 5);
+        assert_eq!(user_version(&path), 6);
 
         // The old projects are the calendars, ids and choices intact.
         let cals = db.calendars().unwrap();
@@ -1067,7 +1084,7 @@ mod tests {
         drop(AppDb::open(&path).unwrap());
         let db = AppDb::open(&path).unwrap();
         assert_eq!(db.calendars().unwrap().len(), 2);
-        assert_eq!(user_version(&path), 5);
+        assert_eq!(user_version(&path), 6);
     }
 
     /// A real v2 file with data of every kind the v3 migration touches.
@@ -1095,7 +1112,7 @@ mod tests {
         let path = tmp.0.join("catenga.sqlite");
         build_v2(&path);
         let db = AppDb::open(&path).unwrap();
-        assert_eq!(user_version(&path), 5);
+        assert_eq!(user_version(&path), 6);
         // Backup of v2, untouched, without the new columns.
         let bak = backup_path(&path, 2);
         assert_eq!(user_version(&bak), 2);
@@ -1164,6 +1181,7 @@ mod tests {
                 minutes_per_day: 20,
                 start: "2026-10-03".into(),
                 days: None,
+                ..Default::default()
             },
             1,
         )
@@ -1226,7 +1244,7 @@ mod tests {
         let path = tmp.0.join("catenga.sqlite");
         build_v3(&path);
         let db = AppDb::open(&path).unwrap();
-        assert_eq!(user_version(&path), 5);
+        assert_eq!(user_version(&path), 6);
         let cols: Vec<String> = db
             .with_conn("t", |c| {
                 c.prepare("SELECT name FROM pragma_table_info('file_sync') ORDER BY cid")?
@@ -1367,6 +1385,7 @@ mod tests {
                     v3(),
                     V4.to_string(),
                     V5.to_string(),
+                    V6.to_string(),
                     "SELECT 1;".to_string(),
                 ],
             )
@@ -1376,7 +1395,7 @@ mod tests {
         let err = AppDb::open(&path).err().expect("must fail");
         assert!(err.contains("newer version"), "{err}");
         assert_eq!(fs::read(&path).unwrap(), before);
-        assert_eq!(user_version(&path), 6);
+        assert_eq!(user_version(&path), 7);
     }
 
     #[test]
@@ -1729,7 +1748,7 @@ mod tests {
         let path = tmp.0.join("catenga.sqlite");
         build_v4(&path);
         let db = AppDb::open(&path).unwrap();
-        assert_eq!(user_version(&path), 5);
+        assert_eq!(user_version(&path), 6);
         let cals = db.calendars().unwrap();
         assert_eq!(cals.len(), 2);
         assert!(cals.iter().all(|c| c.account.is_none()));

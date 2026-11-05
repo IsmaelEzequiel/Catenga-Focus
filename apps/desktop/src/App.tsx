@@ -29,7 +29,7 @@ import { useNow } from "./hooks/useNow";
 import { useSessions, useTimer } from "./hooks/useTimer";
 import { useTimerSetup } from "./hooks/useTimerSetup";
 import { defaultPlan, loadPlan, safeStorage } from "./lib/focus";
-import { findGoalBlock } from "./lib/goalPlay";
+import { findGoalBlock, newGoalBlock } from "./lib/goalPlay";
 import { goalSubjectText, matchesGoal } from "./lib/goals";
 import { matchBlocks } from "./lib/calendar";
 import { startNowTarget } from "./lib/startNow";
@@ -571,7 +571,8 @@ function App() {
     const at = new Date();
     const nowMinute = at.getHours() * 60 + at.getMinutes();
     const target = findGoalBlock(day.blocks, calendar.events, goal, nowMinute);
-    if (target.kind === "none") {
+    const made = target.kind === "none" ? newGoalBlock(goal, nowMinute) : null;
+    if (target.kind === "none" && !made) {
       setNotice(
         goal.project
           ? `No “${goal.project.name}” in your calendar today.`
@@ -581,19 +582,26 @@ function App() {
     }
     let block: { key: string; start: number; end: number; title: string; tags: string[] };
     let project: string | null;
-    if (target.kind === "block") {
+    if (made) {
+      // A goal without a project: a new block from now (it becomes a Google event like a dragged one).
+      block = { ...made, key: crypto.randomUUID() };
+      project = null;
+      commitBlocks([...day.blocks, { ...block, body: "" }]);
+    } else if (target.kind === "block") {
       const found = day.blocks.find((b) => b.key === target.key);
       if (!found) return;
       block = found;
       project = projectKeyOf(found.key);
       // The M8d fallback block (no event of its own) still belongs to the goal's project.
       if (project === null) project = goal.project?.key ?? null;
-    } else {
+    } else if (target.kind === "event") {
       // Same as clicking a ghost: the block takes the existing event, so no new Google event is made.
       const base = { start: target.event.start, end: target.event.end, title: target.event.title, tags: target.event.tags, body: "" };
       block = { ...base, key: crypto.randomUUID() };
       project = target.event.projectKey;
       commitBlocks([...day.blocks, { ...base, key: block.key }]);
+    } else {
+      return;
     }
     onSelect(block.key);
     const plan = loadPlan(safeStorage(), block.title, planDefaults);
@@ -871,6 +879,7 @@ function App() {
               onNotice={onNotice}
               canDeleteEvents={google.status?.connected ?? false}
               onDeleteEvent={calendar.remove}
+              onDeleteSessions={sessions.removeMany}
               onStartTimer={(key) => {
                 const block = day.blocks.find((b) => b.key === key);
                 if (!block) return;

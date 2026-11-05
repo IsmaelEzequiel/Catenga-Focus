@@ -5,7 +5,7 @@
 //! `sync_client`, the Tauri half `sync_commands`.
 
 use crate::app_db::AppDb;
-use crate::goals::check_numbers;
+use crate::goals::{GoalKind, MAX_AMOUNT, check_count, check_numbers};
 use crate::search::norm_tag;
 use crate::tags::{self, COLORS, DEFAULT_COLOR};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -172,9 +172,12 @@ fn collect_dirty(conn: &Connection) -> rusqlite::Result<Vec<Item>> {
                 COALESCE((SELECT p.kind || ':' || p.google_id FROM projects p
                            WHERE p.id = g.project_id), g.pending_project_key),
                 g.title, g.minutes_per_day, g.start, g.days, g.archived,
-                g.changed_at, g.deleted_at IS NOT NULL
+                g.changed_at, g.deleted_at IS NOT NULL,
+                g.kind, g.name, g.target_count, g.unit
          FROM goals g WHERE g.dirty = 1 AND g.uid IS NOT NULL ORDER BY g.id",
     )?;
+    let mut counts_of =
+        conn.prepare("SELECT date, amount FROM goal_counts WHERE goal_id = ?1 ORDER BY date")?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -188,20 +191,38 @@ fn collect_dirty(conn: &Connection) -> rusqlite::Result<Vec<Item>> {
                 r.get::<_, bool>(7)?,
                 r.get::<_, i64>(8)?,
                 r.get::<_, bool>(9)?,
+                (
+                    r.get::<_, String>(10)?,
+                    r.get::<_, Option<String>>(11)?,
+                    r.get::<_, Option<i64>>(12)?,
+                    r.get::<_, Option<String>>(13)?,
+                ),
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, uid, project, title, minutes, start, days, archived, changed_at, deleted) in rows {
+    for (id, uid, project, title, minutes, start, days, archived, changed_at, deleted, extra) in
+        rows
+    {
+        let (kind, name, target_count, unit) = extra;
         let data = if deleted {
             None
         } else {
             let names = tag_names
                 .query_map([id], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut counts = serde_json::Map::new();
+            for row in
+                counts_of.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            {
+                let (date, amount) = row?;
+                counts.insert(date, json!(amount));
+            }
+            // Older apps read only the first fields and see a count goal as a time goal.
             Some(json!({
                 "projectKey": project, "tagNames": names, "title": title,
                 "minutesPerDay": minutes, "start": start, "days": days,
-                "archived": archived
+                "archived": archived, "kind": kind, "name": name,
+                "targetCount": target_count, "unit": unit, "counts": counts
             }))
         };
         out.push(Item {
@@ -486,6 +507,12 @@ fn tag_for_goal(tx: &Connection, name: &str) -> rusqlite::Result<i64> {
 }
 
 struct GoalData {
+    kind: GoalKind,
+    name: Option<String>,
+    target_count: Option<u32>,
+    unit: Option<String>,
+    /// `(date, amount)`, amounts > 0.
+    counts: Vec<(String, i64)>,
     project_key: Option<String>,
     tag_names: Vec<String>,
     title: Option<String>,
@@ -511,11 +538,46 @@ fn parse_goal(d: &Value) -> Option<GoalData> {
     for v in d.get("tagNames")?.as_array()? {
         tag_names.push(tags::clean_name(v.as_str()?).ok()?);
     }
-    let title = match d.get("title") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(v.as_str()?.to_string()),
+    let opt_str = |key: &str| -> Option<Option<String>> {
+        match d.get(key) {
+            None | Some(Value::Null) => Some(None),
+            Some(v) => Some(Some(v.as_str()?.to_string())),
+        }
     };
+    let title = opt_str("title")?;
+    let name = opt_str("name")?;
+    let unit = opt_str("unit")?;
+    let kind = match d.get("kind") {
+        None | Some(Value::Null) => GoalKind::Time,
+        Some(v) => GoalKind::parse(v.as_str()?)?,
+    };
+    let target_count = match kind {
+        GoalKind::Time => None,
+        GoalKind::Count => {
+            let n = u32::try_from(d.get("targetCount")?.as_u64()?).ok()?;
+            Some(check_count(Some(n)).ok()?)
+        }
+    };
+    let mut counts = Vec::new();
+    if kind == GoalKind::Count
+        && let Some(map) = d.get("counts").and_then(Value::as_object)
+    {
+        for (date, v) in map {
+            let amount = v.as_i64()?;
+            if date.len() != 10 || date.parse::<jiff::civil::Date>().is_err() {
+                return None;
+            }
+            if (1..=MAX_AMOUNT).contains(&amount) {
+                counts.push((date.clone(), amount));
+            }
+        }
+    }
     Some(GoalData {
+        kind,
+        name,
+        target_count,
+        unit,
+        counts,
         project_key,
         tag_names,
         title,
@@ -551,11 +613,13 @@ fn apply_goal(tx: &Connection, it: &Item) -> rusqlite::Result<bool> {
         };
         tx.execute(
             "UPDATE goals SET deleted_at = COALESCE(deleted_at, ?2), changed_at = ?2, dirty = 0,
-                              project_id = NULL, pending_project_key = NULL, title = NULL
+                              project_id = NULL, pending_project_key = NULL, title = NULL,
+                              name = NULL, unit = NULL
              WHERE id = ?1",
             params![id, it.changed_at],
         )?;
         tx.execute("DELETE FROM goal_tags WHERE goal_id = ?1", [id])?;
+        tx.execute("DELETE FROM goal_counts WHERE goal_id = ?1", [id])?;
         return Ok(!was_deleted);
     }
     let Some(g) = it.data.as_ref().and_then(parse_goal) else {
@@ -579,7 +643,8 @@ fn apply_goal(tx: &Connection, it: &Item) -> rusqlite::Result<bool> {
             tx.execute(
                 "UPDATE goals SET project_id = ?2, pending_project_key = ?3, title = ?4,
                                   minutes_per_day = ?5, start = ?6, days = ?7, archived = ?8,
-                                  deleted_at = NULL, changed_at = ?9, dirty = 0, updated_at = ?10
+                                  deleted_at = NULL, changed_at = ?9, dirty = 0, updated_at = ?10,
+                                  kind = ?11, name = ?12, target_count = ?13, unit = ?14
                  WHERE id = ?1",
                 params![
                     id,
@@ -591,7 +656,11 @@ fn apply_goal(tx: &Connection, it: &Item) -> rusqlite::Result<bool> {
                     g.days,
                     g.archived,
                     it.changed_at,
-                    secs(it.changed_at)
+                    secs(it.changed_at),
+                    g.kind.as_str(),
+                    g.name,
+                    g.target_count,
+                    g.unit
                 ],
             )?;
             id
@@ -599,8 +668,9 @@ fn apply_goal(tx: &Connection, it: &Item) -> rusqlite::Result<bool> {
         None => {
             tx.execute(
                 "INSERT INTO goals(project_id, pending_project_key, title, minutes_per_day, start,
-                                   days, archived, created_at, updated_at, uid, changed_at, dirty)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, 0)",
+                                   days, archived, created_at, updated_at, uid, changed_at, dirty,
+                                   kind, name, target_count, unit)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14)",
                 params![
                     project_id,
                     pending,
@@ -611,12 +681,23 @@ fn apply_goal(tx: &Connection, it: &Item) -> rusqlite::Result<bool> {
                     g.archived,
                     secs(it.changed_at),
                     it.key,
-                    it.changed_at
+                    it.changed_at,
+                    g.kind.as_str(),
+                    g.name,
+                    g.target_count,
+                    g.unit
                 ],
             )?;
             tx.last_insert_rowid()
         }
     };
+    tx.execute("DELETE FROM goal_counts WHERE goal_id = ?1", [id])?;
+    for (date, amount) in &g.counts {
+        tx.execute(
+            "INSERT INTO goal_counts(goal_id, date, amount) VALUES (?1, ?2, ?3)",
+            params![id, date, amount],
+        )?;
+    }
     tx.execute("DELETE FROM goal_tags WHERE goal_id = ?1", [id])?;
     for name in &g.tag_names {
         let tag_id = tag_for_goal(tx, name)?;
@@ -782,6 +863,7 @@ pub(crate) mod tests {
             minutes_per_day: 60,
             start: "2026-10-01".into(),
             days: Some(30),
+            ..Default::default()
         }
     }
 
@@ -842,7 +924,8 @@ pub(crate) mod tests {
             Some(
                 json!({"projectKey": null, "tagNames": ["rust"], "title": "Rust",
                         "minutesPerDay": 60, "start": "2026-10-01", "days": 30,
-                        "archived": false})
+                        "archived": false, "kind": "time", "name": null,
+                        "targetCount": null, "unit": null, "counts": {}})
             )
         );
         assert_eq!(items[0].data, Some(json!({"name": "rust", "color": "sun"})));
@@ -1220,5 +1303,71 @@ pub(crate) mod tests {
         let mut names: Vec<_> = v.tags.iter().map(|t| t.name.clone()).collect();
         names.sort();
         assert_eq!(names, ["go", "rust"]);
+    }
+
+    #[test]
+    fn count_goals_sync_their_check_ins_and_a_check_in_marks_the_goal_changed() {
+        let c = clock();
+        let (a, b) = (dev(&c), dev(&c));
+        let id =
+            a.db.goal_create(
+                &GoalDraft {
+                    kind: GoalKind::Count,
+                    name: Some("Read".into()),
+                    target_count: Some(10),
+                    unit: Some("pages".into()),
+                    start: "2026-10-01".into(),
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap()
+            .id;
+        a.db.goal_set_count(id, "2026-10-02", 5, 2).unwrap();
+        let items = a.db.sync_collect().unwrap();
+        let goal = items.iter().find(|i| i.kind == "goal").unwrap();
+        let data = goal.data.as_ref().unwrap();
+        assert_eq!(data["kind"], "count");
+        assert_eq!(data["counts"], json!({"2026-10-02": 5}));
+        b.db.sync_apply(items.clone()).unwrap();
+        let v = &b.db.goal_views(false).unwrap()[0];
+        assert_eq!(v.goal.kind, GoalKind::Count);
+        assert_eq!(
+            (v.goal.name.as_deref(), v.goal.unit.as_deref()),
+            (Some("Read"), Some("pages"))
+        );
+        assert_eq!(v.goal.target_count, Some(10));
+        assert_eq!(v.counts.values().copied().collect::<Vec<_>>(), [5]);
+
+        // A new check-in on B travels back and replaces A's days.
+        a.db.sync_ack(
+            &items,
+            &items
+                .iter()
+                .map(|i| KeyRef {
+                    kind: i.kind.clone(),
+                    key: i.key.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let bid = v.goal.id;
+        b.db.goal_set_count(bid, "2026-10-03", 7, 3).unwrap();
+        let from_b: Vec<_> =
+            b.db.sync_collect()
+                .unwrap()
+                .into_iter()
+                .filter(|i| i.kind == "goal")
+                .collect();
+        assert_eq!(from_b.len(), 1);
+        a.db.sync_apply(from_b).unwrap();
+        let v = &a.db.goal_views(false).unwrap()[0];
+        assert_eq!(v.counts.len(), 2);
+
+        // Bad counts payloads are ignored, never half-applied.
+        let mut bad = goal.clone();
+        bad.changed_at += 1_000_000;
+        bad.data.as_mut().unwrap()["targetCount"] = json!(0);
+        assert!(!b.db.sync_apply(vec![bad]).unwrap().goals);
     }
 }

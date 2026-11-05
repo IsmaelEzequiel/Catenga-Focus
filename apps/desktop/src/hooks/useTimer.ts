@@ -166,5 +166,20 @@ export function useSessions(date: string, onNotice: (message: string) => void) {
     }
   }, []);
 
-  return { sessions: state?.date === date ? state.sessions : [], remove };
+  /** Deletes the given sessions of the open day, one by one; stops at the first failure (told as a notice). */
+  const removeMany = useCallback(async (starts: string[]): Promise<boolean> => {
+    const forDate = dateRef.current;
+    for (const start of starts) {
+      try {
+        const sessions = await timerDeleteSession(forDate, start);
+        if (forDate === dateRef.current) setState({ date: forDate, sessions });
+      } catch (e) {
+        noticeRef.current(`Couldn't delete the session: ${message(e)}`);
+        return false;
+      }
+    }
+    return true;
+  }, []);
+
+  return { sessions: state?.date === date ? state.sessions : [], remove, removeMany };
 }

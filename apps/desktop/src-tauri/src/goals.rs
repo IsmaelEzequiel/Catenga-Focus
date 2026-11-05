@@ -1,7 +1,8 @@
-//! Goals: rows of `catenga.sqlite` (a project and/or tags and/or a title, hours
-//! per day, N days or indefinite), their validation, the one-time import of the
-//! old `goals.json`, and the pure progress calculation over finished timer
-//! minutes.
+//! Goals: rows of `catenga.sqlite`, their validation, the one-time import of the
+//! old `goals.json`, and the pure progress calculation. A **time** goal (a project
+//! and/or tags and/or a title or its name, minutes per day) counts finished timer
+//! minutes; a **count** goal (a name, an amount per day such as 10 pages) counts
+//! what the user checks in each day (`goal_counts`). Both run N days or indefinitely.
 
 use crate::app_db::{AppDb, Project, ProjectRow, flag_in, read_projects, set_flag_in};
 use crate::search::norm;
@@ -19,31 +20,95 @@ pub const LEGACY_FILE: &str = "goals.json";
 const IMPORTED: &str = "imported_goals_json";
 const MIN_MINUTES: u32 = 5;
 const MAX_MINUTES: u32 = 720;
+const MAX_COUNT: u32 = 100_000;
+/// What a day's check-in may hold (more than the target is fine: 15 of 10 pages).
+pub const MAX_AMOUNT: i64 = 1_000_000;
+/// `minutes_per_day` of a count goal: unused, but the column's CHECK (5–720) predates count goals.
+pub const COUNT_PLACEHOLDER_MINUTES: u32 = 60;
+const MAX_NAME: usize = 80;
+const MAX_UNIT: usize = 24;
 const STRIP_DAYS: i64 = 14;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GoalKind {
+    /// Minutes of timer sessions per day.
+    #[default]
+    Time,
+    /// An amount the user checks in per day (pages, reps…).
+    Count,
+}
+
+impl GoalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GoalKind::Time => "time",
+            GoalKind::Count => "count",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<GoalKind> {
+        match s {
+            "time" => Some(GoalKind::Time),
+            "count" => Some(GoalKind::Count),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Goal {
     pub id: i64,
+    pub kind: GoalKind,
+    /// What the card is called; for a time goal with no project, tag or title it is also
+    /// the block title that counts.
+    pub name: Option<String>,
     pub project_id: Option<i64>,
     pub tag_ids: Vec<i64>,
     pub title: Option<String>,
     pub minutes_per_day: u32,
+    /// Count goals: the amount per day.
+    pub target_count: Option<u32>,
+    /// Count goals: what is counted ("pages"), if given.
+    pub unit: Option<String>,
     pub start: String,
     pub days: Option<u32>,
     pub archived: bool,
 }
 
+impl Goal {
+    /// The daily target in the goal's unit (minutes, or the count).
+    pub fn target(&self) -> i64 {
+        match self.kind {
+            GoalKind::Time => i64::from(self.minutes_per_day),
+            GoalKind::Count => i64::from(self.target_count.unwrap_or(1).max(1)),
+        }
+    }
+}
+
 /// Tags by name: unknown names are created.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalDraft {
+    #[serde(default)]
+    pub kind: GoalKind,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub project_id: Option<i64>,
     #[serde(default)]
     pub tag_names: Vec<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Time goals only.
+    #[serde(default)]
     pub minutes_per_day: u32,
+    /// Count goals only.
+    #[serde(default)]
+    pub target_count: Option<u32>,
+    #[serde(default)]
+    pub unit: Option<String>,
     pub start: String,
     pub days: Option<u32>,
 }
@@ -57,6 +122,8 @@ pub struct GoalView {
     /// (until the next Google refresh); sessions are still matched by this key.
     pub pending_project_key: Option<String>,
     pub tags: Vec<Tag>,
+    /// Count goals: the checked-in amount per day.
+    pub counts: BTreeMap<Date, i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,6 +137,7 @@ pub enum Status {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DayCell {
     pub date: String,
+    /// Minutes, or the count for a count goal.
     pub minutes: i64,
     pub met: bool,
 }
@@ -81,10 +149,18 @@ pub struct GoalProgress {
     pub project: Option<Project>,
     pub tags: Vec<Tag>,
     pub status: Status,
+    /// Minutes, or the count for a count goal (same for `total_minutes`).
     pub today_minutes: i64,
     pub elapsed_days: i64,
+    /// Days that reached the target.
     pub met_days: i64,
+    /// Days with any progress (they keep the streak going).
+    pub done_days: i64,
+    /// Sum over elapsed days of the share of the target reached, in thousandths
+    /// (capped at 1000 a day): success rate = score / (elapsed days × 1000).
+    pub score: i64,
     pub total_minutes: i64,
+    /// Consecutive days with any progress (a minute, a page).
     pub current_streak: i64,
     pub longest_streak: i64,
     pub end: Option<String>,
@@ -128,9 +204,48 @@ struct Clean {
     project_id: Option<i64>,
     tag_names: Vec<String>,
     title: Option<String>,
+    name: Option<String>,
+    minutes: u32,
+    target_count: Option<u32>,
+    unit: Option<String>,
+}
+
+/// Trimmed, `None` when blank; too long is an error.
+fn clean_text(s: Option<&str>, max: usize, what: &str) -> Result<Option<String>, String> {
+    let Some(t) = s.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if t.chars().count() > max {
+        return Err(format!("{what} can be at most {max} characters"));
+    }
+    Ok(Some(t.to_string()))
+}
+
+pub(crate) fn check_count(target: Option<u32>) -> Result<u32, String> {
+    match target {
+        Some(n) if (1..=MAX_COUNT).contains(&n) => Ok(n),
+        _ => Err(format!("Amount per day must be 1–{MAX_COUNT}")),
+    }
 }
 
 fn validate(draft: &GoalDraft) -> Result<Clean, String> {
+    let name = clean_text(draft.name.as_deref(), MAX_NAME, "Name")?;
+    if draft.kind == GoalKind::Count {
+        let Some(name) = name else {
+            return Err("Give the goal a name".into());
+        };
+        let target = check_count(draft.target_count)?;
+        check_numbers(COUNT_PLACEHOLDER_MINUTES, draft.days, &draft.start)?;
+        return Ok(Clean {
+            project_id: None,
+            tag_names: Vec::new(),
+            title: None,
+            name: Some(name),
+            minutes: COUNT_PLACEHOLDER_MINUTES,
+            target_count: Some(target),
+            unit: clean_text(draft.unit.as_deref(), MAX_UNIT, "Unit")?,
+        });
+    }
     let mut tag_names: Vec<String> = Vec::new();
     for name in &draft.tag_names {
         let name = tags::clean_name(name)?;
@@ -144,14 +259,18 @@ fn validate(draft: &GoalDraft) -> Result<Clean, String> {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_string);
-    if draft.project_id.is_none() && tag_names.is_empty() && title.is_none() {
-        return Err("Pick a project, a tag or a title".into());
+    if draft.project_id.is_none() && tag_names.is_empty() && title.is_none() && name.is_none() {
+        return Err("Give the goal a name, a project or a tag".into());
     }
     check_numbers(draft.minutes_per_day, draft.days, &draft.start)?;
     Ok(Clean {
         project_id: draft.project_id,
         tag_names,
         title,
+        name,
+        minutes: draft.minutes_per_day,
+        target_count: None,
+        unit: None,
     })
 }
 
@@ -198,19 +317,26 @@ fn read_views(conn: &Connection, archived: bool) -> rusqlite::Result<Vec<GoalVie
          FROM goal_tags g JOIN tags t ON t.id = g.tag_id
          WHERE g.goal_id = ?1 ORDER BY t.name_norm",
     )?;
+    let mut all_counts = conn.prepare("SELECT date, amount FROM goal_counts WHERE goal_id = ?1")?;
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, title, minutes_per_day, start, days, archived, pending_project_key
+        "SELECT id, project_id, title, minutes_per_day, start, days, archived, pending_project_key,
+                kind, name, target_count, unit
          FROM goals WHERE archived = ?1 AND deleted_at IS NULL ORDER BY id",
     )?;
     let rows = stmt
         .query_map([archived], |r| {
+            let kind: String = r.get(8)?;
             Ok((
                 Goal {
                     id: r.get(0)?,
+                    kind: GoalKind::parse(&kind).unwrap_or_default(),
+                    name: r.get(9)?,
                     project_id: r.get(1)?,
                     tag_ids: Vec::new(),
                     title: r.get(2)?,
                     minutes_per_day: r.get(3)?,
+                    target_count: r.get(10)?,
+                    unit: r.get(11)?,
                     start: r.get(4)?,
                     days: r.get(5)?,
                     archived: r.get(6)?,
@@ -236,11 +362,23 @@ fn read_views(conn: &Connection, archived: bool) -> rusqlite::Result<Vec<GoalVie
         let project = goal
             .project_id
             .and_then(|id| projects.iter().find(|p| p.project.id == id).cloned());
+        let mut counts = BTreeMap::new();
+        if goal.kind == GoalKind::Count {
+            for row in all_counts.query_map([goal.id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })? {
+                let (date, amount) = row?;
+                if let Some(day) = parse_date(&date) {
+                    counts.insert(day, amount);
+                }
+            }
+        }
         out.push(GoalView {
             goal,
             project,
             pending_project_key,
             tags,
+            counts,
         });
     }
     Ok(out)
@@ -258,18 +396,23 @@ impl AppDb {
             let uid = crate::app_db::new_uuid(&tx)?;
             tx.execute(
                 "INSERT INTO goals(project_id, title, minutes_per_day, start, days, archived,
-                                   created_at, updated_at, uid, changed_at, dirty)
+                                   created_at, updated_at, uid, changed_at, dirty,
+                                   kind, name, target_count, unit)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6,
-                         ?7, ?8, 1)",
+                         ?7, ?8, 1, ?9, ?10, ?11, ?12)",
                 params![
                     clean.project_id,
                     clean.title,
-                    draft.minutes_per_day,
+                    clean.minutes,
                     draft.start,
                     draft.days,
                     now,
                     uid,
-                    ms
+                    ms,
+                    draft.kind.as_str(),
+                    clean.name,
+                    clean.target_count,
+                    clean.unit
                 ],
             )?;
             let id = tx.last_insert_rowid();
@@ -291,21 +434,30 @@ impl AppDb {
             let changed = tx.execute(
                 "UPDATE goals SET project_id = ?2, title = ?3, minutes_per_day = ?4, start = ?5,
                                   days = ?6, updated_at = ?7, pending_project_key = NULL,
-                                  changed_at = max(?8, changed_at + 1), dirty = 1
+                                  changed_at = max(?8, changed_at + 1), dirty = 1,
+                                  kind = ?9, name = ?10, target_count = ?11, unit = ?12
                  WHERE id = ?1 AND deleted_at IS NULL",
                 params![
                     id,
                     clean.project_id,
                     clean.title,
-                    draft.minutes_per_day,
+                    clean.minutes,
                     draft.start,
                     draft.days,
                     now,
-                    ms
+                    ms,
+                    draft.kind.as_str(),
+                    clean.name,
+                    clean.target_count,
+                    clean.unit
                 ],
             )?;
             if changed == 0 {
                 return Ok(Err("Goal not found".to_string()));
+            }
+            if draft.kind == GoalKind::Time {
+                // A count goal turned into a time goal: its check-ins no longer mean anything.
+                tx.execute("DELETE FROM goal_counts WHERE goal_id = ?1", [id])?;
             }
             let created = set_goal_tags(&tx, id, &clean.tag_names, now, ms)?;
             tx.commit()?;
@@ -323,6 +475,8 @@ impl AppDb {
                 .query_row(
                     "SELECT project_id IS NOT NULL
                          OR (title IS NOT NULL AND trim(title) <> '')
+                         OR (name IS NOT NULL AND trim(name) <> '')
+                         OR kind = 'count'
                          OR EXISTS (SELECT 1 FROM goal_tags WHERE goal_id = goals.id)
                      FROM goals WHERE id = ?1 AND deleted_at IS NULL",
                     [id],
@@ -336,7 +490,7 @@ impl AppDb {
             let result = match has_subject {
                 None => Err("Goal not found".to_string()),
                 Some(false) if !archived => {
-                    Err("Pick a project, a tag or a title before restoring this goal".to_string())
+                    Err("Give this goal a name, a project or a tag before restoring it".to_string())
                 }
                 Some(_) => {
                     tx.execute(
@@ -361,11 +515,13 @@ impl AppDb {
             let tx = conn.transaction()?;
             let changed = tx.execute(
                 "UPDATE goals SET deleted_at = ?2, changed_at = max(?2, changed_at + 1), dirty = 1,
-                                  project_id = NULL, pending_project_key = NULL, title = NULL
+                                  project_id = NULL, pending_project_key = NULL, title = NULL,
+                                  name = NULL, unit = NULL
                  WHERE id = ?1 AND deleted_at IS NULL",
                 params![id, ms],
             )?;
             tx.execute("DELETE FROM goal_tags WHERE goal_id = ?1", [id])?;
+            tx.execute("DELETE FROM goal_counts WHERE goal_id = ?1", [id])?;
             tx.commit()?;
             Ok(changed)
         })?;
@@ -373,6 +529,56 @@ impl AppDb {
             return Err("Goal not found".into());
         }
         Ok(())
+    }
+
+    /// Sets what a count goal got on `date` (0 clears the day). Not for time goals.
+    pub fn goal_set_count(&self, id: i64, date: &str, amount: i64, now: i64) -> Result<(), String> {
+        if parse_date(date).is_none() {
+            return Err("Date must be YYYY-MM-DD".into());
+        }
+        if !(0..=MAX_AMOUNT).contains(&amount) {
+            return Err(format!("Amount must be 0–{MAX_AMOUNT}"));
+        }
+        let ms = self.ms();
+        self.with_conn("saving check-in", |conn| {
+            let tx = conn.transaction()?;
+            let kind: Option<String> = tx
+                .query_row(
+                    "SELECT kind FROM goals WHERE id = ?1 AND deleted_at IS NULL",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })?;
+            match kind.as_deref() {
+                None => return Ok(Err("Goal not found".to_string())),
+                Some("count") => {}
+                Some(_) => return Ok(Err("Only count goals take a check-in".to_string())),
+            }
+            if amount == 0 {
+                tx.execute(
+                    "DELETE FROM goal_counts WHERE goal_id = ?1 AND date = ?2",
+                    params![id, date],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT INTO goal_counts(goal_id, date, amount) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(goal_id, date) DO UPDATE SET amount = excluded.amount",
+                    params![id, date, amount],
+                )?;
+            }
+            // Check-ins sync inside their goal's row.
+            tx.execute(
+                "UPDATE goals SET updated_at = ?2, changed_at = max(?3, changed_at + 1), dirty = 1
+                 WHERE id = ?1",
+                params![id, now, ms],
+            )?;
+            tx.commit()?;
+            Ok(Ok(()))
+        })?
     }
 
     /// The archived (or the live) goals with their project and tags, by id.
@@ -517,14 +723,24 @@ fn parse_legacy(bytes: &[u8]) -> Result<Vec<LegacyGoal>, String> {
 
 // ------------------------------------------------------------------ progress
 
-fn met(minutes: &BTreeMap<Date, i64>, day: Date, target: i64) -> bool {
-    minutes.get(&day).copied().unwrap_or(0) >= target
+fn done(minutes: &BTreeMap<Date, i64>, day: Date) -> bool {
+    minutes.get(&day).copied().unwrap_or(0) > 0
 }
 
-/// Progress of `goal` as of `today`; `minutes` are finished-session minutes per
-/// local day (the session's start day) matching the goal's subject.
+/// Share of the target reached on a day, in thousandths (at most 1000).
+fn day_score(amount: i64, target: i64) -> i64 {
+    if target <= 0 {
+        return 0;
+    }
+    (amount.max(0).saturating_mul(1000) / target).min(1000)
+}
+
+/// Progress of `goal` as of `today`; `minutes` are, per local day, the finished-session
+/// minutes matching the goal's subject (the session's start day), or a count goal's
+/// check-ins. Any progress on a day keeps the streak going (owner rule); the target
+/// decides "met" and the success score.
 pub fn progress(goal: &Goal, minutes: &BTreeMap<Date, i64>, today: Date) -> GoalProgress {
-    let target = i64::from(goal.minutes_per_day);
+    let target = goal.target();
     // Goals read from the file are validated, so the start parses.
     let start = parse_date(&goal.start).unwrap_or(today);
     let end = goal.days.map(|d| start + (i64::from(d) - 1).days());
@@ -543,6 +759,8 @@ pub fn progress(goal: &Goal, minutes: &BTreeMap<Date, i64>, today: Date) -> Goal
         today_minutes: 0,
         elapsed_days: 0,
         met_days: 0,
+        done_days: 0,
+        score: 0,
         total_minutes: 0,
         current_streak: 0,
         longest_streak: 0,
@@ -560,8 +778,12 @@ pub fn progress(goal: &Goal, minutes: &BTreeMap<Date, i64>, today: Date) -> Goal
         let day = day_at(i);
         let m = minutes.get(&day).copied().unwrap_or(0);
         p.total_minutes += m;
+        p.score += day_score(m, target);
         if m >= target {
             p.met_days += 1;
+        }
+        if m > 0 {
+            p.done_days += 1;
             run += 1;
             p.longest_streak = p.longest_streak.max(run);
         } else {
@@ -570,10 +792,10 @@ pub fn progress(goal: &Goal, minutes: &BTreeMap<Date, i64>, today: Date) -> Goal
     }
     // Same rule as M7 streaks: a day still in progress does not break the run.
     let mut cursor = last;
-    if !met(minutes, last, target) && last == today {
+    if !done(minutes, last) && last == today {
         cursor = last - 1.day();
     }
-    while cursor >= start && met(minutes, cursor, target) {
+    while cursor >= start && done(minutes, cursor) {
         p.current_streak += 1;
         cursor -= 1.day();
     }
@@ -612,6 +834,13 @@ impl GoalView {
     /// the project only (its occurrence counts whatever its tags/title); tags and title
     /// only filter goals without a project.
     pub fn filter(&self) -> Filter {
+        if self.goal.kind == GoalKind::Count {
+            // Never used (count goals don't read sessions), but never "match everything".
+            return Filter {
+                project_key: Some(String::new()),
+                ..Filter::default()
+            };
+        }
         if let Some(p) = &self.project {
             return Filter {
                 project_key: Some(p.project.key.clone()),
@@ -633,7 +862,17 @@ impl GoalView {
                 .iter()
                 .map(|t| crate::search::norm_tag(&t.name))
                 .collect(),
-            title_norm: self.goal.title.as_deref().map(norm),
+            title_norm: self
+                .goal
+                .title
+                .as_deref()
+                .or(if self.tags.is_empty() {
+                    // Only a name: blocks with that title count.
+                    self.goal.name.as_deref()
+                } else {
+                    None
+                })
+                .map(norm),
         }
     }
 }
@@ -685,8 +924,11 @@ pub fn load(
 ) -> rusqlite::Result<Vec<GoalProgress>> {
     let mut out = Vec::new();
     for view in goals {
-        let minutes = minutes_by_day(conn, &view.filter())?;
-        let mut p = progress(&view.goal, &minutes, today);
+        let mut p = if view.goal.kind == GoalKind::Count {
+            progress(&view.goal, &view.counts, today)
+        } else {
+            progress(&view.goal, &minutes_by_day(conn, &view.filter())?, today)
+        };
         p.project = view.project.as_ref().map(|r| r.project.clone());
         p.tags = view.tags.clone();
         out.push(p);
@@ -729,10 +971,14 @@ mod tests {
     fn goal(start: &str, days: Option<u32>, per_day: u32) -> Goal {
         Goal {
             id: 1,
+            kind: GoalKind::Time,
+            name: None,
             project_id: None,
             tag_ids: vec![],
             title: Some("Rust".into()),
             minutes_per_day: per_day,
+            target_count: None,
+            unit: None,
             start: start.into(),
             days,
             archived: false,
@@ -753,19 +999,23 @@ mod tests {
         assert_eq!(p.status, Status::Active);
         assert_eq!(p.elapsed_days, 3);
         assert_eq!(p.met_days, 2);
+        assert_eq!(p.done_days, 3);
+        assert_eq!(p.score, 2500, "1 + 0.5 + 1 (capped)");
         assert_eq!(p.total_minutes, 160);
         assert_eq!(p.today_minutes, 70);
-        assert_eq!(p.current_streak, 1);
-        assert_eq!(p.longest_streak, 1);
+        // Any time on a day keeps the streak (30 of 60 counts).
+        assert_eq!(p.current_streak, 3);
+        assert_eq!(p.longest_streak, 3);
         assert_eq!(p.end.as_deref(), Some("2026-11-17"));
     }
 
     #[test]
     fn today_not_met_yet_keeps_the_streak_alive() {
         let g = goal("2026-10-19", None, 60);
-        let m = mins(&[("2026-10-19", 60), ("2026-10-20", 60), ("2026-10-21", 10)]);
+        // 1 minute today already counts.
+        let m = mins(&[("2026-10-19", 60), ("2026-10-20", 60), ("2026-10-21", 1)]);
         let p = progress(&g, &m, d("2026-10-21"));
-        assert_eq!(p.current_streak, 2);
+        assert_eq!(p.current_streak, 3);
         let p = progress(
             &g,
             &mins(&[("2026-10-19", 60), ("2026-10-20", 60)]),
@@ -942,6 +1192,7 @@ mod tests {
             minutes_per_day: 60,
             start: "2026-10-21".into(),
             days: Some(30),
+            ..Default::default()
         }
     }
 
@@ -990,9 +1241,29 @@ mod tests {
         let err = |d: GoalDraft| f.db.goal_create(&d, 1).unwrap_err();
         let mut d = draft();
         d.tag_names = vec![];
-        assert_eq!(err(d.clone()), "Pick a project, a tag or a title");
+        assert_eq!(err(d.clone()), "Give the goal a name, a project or a tag");
         d.title = Some("   ".into());
-        assert_eq!(err(d), "Pick a project, a tag or a title");
+        d.name = Some("  ".into());
+        assert_eq!(err(d), "Give the goal a name, a project or a tag");
+        let mut d = draft();
+        d.name = Some("x".repeat(81));
+        assert_eq!(err(d), "Name can be at most 80 characters");
+        let count = |target: Option<u32>, name: Option<&str>| GoalDraft {
+            kind: GoalKind::Count,
+            name: name.map(str::to_string),
+            target_count: target,
+            start: "2026-10-21".into(),
+            ..Default::default()
+        };
+        assert_eq!(err(count(Some(10), None)), "Give the goal a name");
+        assert_eq!(
+            err(count(None, Some("Read"))),
+            "Amount per day must be 1–100000"
+        );
+        assert_eq!(
+            err(count(Some(0), Some("Read"))),
+            "Amount per day must be 1–100000"
+        );
         let mut d = draft();
         d.minutes_per_day = 4;
         assert_eq!(err(d), "Minutes per day must be 5–720");
@@ -1111,13 +1382,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&p).unwrap(),
             serde_json::json!({
-                "goal": {"id": 1, "projectId": 1, "tagIds": [1], "title": null,
-                         "minutesPerDay": 60, "start": "2026-10-21", "days": 30, "archived": false},
+                "goal": {"id": 1, "kind": "time", "name": null, "projectId": 1, "tagIds": [1],
+                         "title": null, "minutesPerDay": 60, "targetCount": null, "unit": null,
+                         "start": "2026-10-21", "days": 30, "archived": false},
                 "project": {"id": 1, "kind": "series", "key": "series:mest", "name": "Mestrado",
                             "color": "#16a765", "calendarName": "Work", "archived": false},
                 "tags": [{"id": 1, "name": "rust", "color": "sun", "saved": true, "goalCount": 1}],
                 "status": "active", "todayMinutes": 36, "elapsedDays": 1, "metDays": 0,
-                "totalMinutes": 36, "currentStreak": 0, "longestStreak": 0, "end": "2026-11-19",
+                "doneDays": 1, "score": 600,
+                "totalMinutes": 36, "currentStreak": 1, "longestStreak": 1, "end": "2026-11-19",
                 "last14": [{"date": "2026-10-21", "minutes": 36, "met": false}]
             })
         );
@@ -1309,10 +1582,14 @@ mod tests {
         let view = GoalView {
             goal: Goal {
                 id: 1,
+                kind: GoalKind::Time,
+                name: None,
                 project_id: Some(26),
                 tag_ids: vec![1],
                 title: Some("Teoria da Computação".into()),
                 minutes_per_day: 60,
+                target_count: None,
+                unit: None,
                 start: "2026-10-20".into(),
                 days: None,
                 archived: false,
@@ -1338,6 +1615,7 @@ mod tests {
                 saved: true,
                 goal_count: 1,
             }],
+            counts: BTreeMap::new(),
         };
         let f = view.filter();
         assert_eq!(f.project_key.as_deref(), Some("series:tc"));
@@ -1508,7 +1786,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             f.db.goal_set_archived(id, false, 2).unwrap_err(),
-            "Pick a project, a tag or a title before restoring this goal"
+            "Give this goal a name, a project or a tag before restoring it"
         );
         assert!(f.db.goal_views(true).unwrap()[0].goal.archived);
         // giving it a subject (edit) makes restoring possible
@@ -1575,5 +1853,128 @@ mod tests {
         assert_eq!(out[1].today_minutes, 40, "tag goal counted it too");
         assert_eq!(out[1].tags[0].name, "rust");
         assert_eq!(out[2].today_minutes, 0);
+    }
+
+    fn count_draft(name: &str, target: u32) -> GoalDraft {
+        GoalDraft {
+            kind: GoalKind::Count,
+            name: Some(name.into()),
+            target_count: Some(target),
+            unit: Some(" pages ".into()),
+            // Ignored for count goals.
+            project_id: Some(999),
+            tag_names: vec!["rust".into()],
+            title: Some("Rust".into()),
+            start: "2026-10-19".into(),
+            days: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn count_goals_store_check_ins_and_score_partial_days() {
+        let f = fixture();
+        let id = f.db.goal_create(&count_draft("Read", 10), 1).unwrap().id;
+        let v = &f.db.goal_views(false).unwrap()[0];
+        assert_eq!(v.goal.kind, GoalKind::Count);
+        assert_eq!(v.goal.name.as_deref(), Some("Read"));
+        assert_eq!(v.goal.unit.as_deref(), Some("pages"));
+        assert_eq!((v.goal.target_count, v.goal.target()), (Some(10), 10));
+        assert_eq!((v.goal.project_id, v.goal.title.as_deref()), (None, None));
+        assert!(v.tags.is_empty(), "count goals take no filters");
+
+        f.db.goal_set_count(id, "2026-10-19", 10, 2).unwrap();
+        f.db.goal_set_count(id, "2026-10-20", 5, 2).unwrap();
+        f.db.goal_set_count(id, "2026-10-21", 3, 2).unwrap();
+        f.db.goal_set_count(id, "2026-10-21", 15, 2).unwrap();
+        assert_eq!(
+            f.db.goal_set_count(id, "2026-10-21", -1, 2).unwrap_err(),
+            "Amount must be 0–1000000"
+        );
+        assert_eq!(
+            f.db.goal_set_count(id, "21/10", 1, 2).unwrap_err(),
+            "Date must be YYYY-MM-DD"
+        );
+        let env = Env::new();
+        let idx = indexed(&env, &[]);
+        let views = f.db.goal_views(false).unwrap();
+        let p = &idx.goals(&views, d_("2026-10-21")).unwrap()[0];
+        assert_eq!(
+            p.today_minutes, 15,
+            "the day's value is replaced, not added"
+        );
+        assert_eq!((p.met_days, p.done_days, p.elapsed_days), (2, 3, 3));
+        assert_eq!(p.score, 2500, "10/10 + 5/10 + 15/10 capped");
+        assert_eq!(p.current_streak, 3);
+
+        // 0 clears a day, which breaks the run.
+        f.db.goal_set_count(id, "2026-10-20", 0, 3).unwrap();
+        let views = f.db.goal_views(false).unwrap();
+        let p = &idx.goals(&views, d_("2026-10-21")).unwrap()[0];
+        assert_eq!((p.done_days, p.current_streak, p.longest_streak), (2, 1, 1));
+
+        // Archiving and restoring a count goal is fine (its name is its subject).
+        f.db.goal_set_archived(id, true, 4).unwrap();
+        f.db.goal_set_archived(id, false, 4).unwrap();
+        f.db.goal_delete(id).unwrap();
+        let left: i64 =
+            f.db.with_conn("t", |c| {
+                c.query_row("SELECT count(*) FROM goal_counts", [], |r| r.get(0))
+            })
+            .unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(
+            f.db.goal_set_count(id, "2026-10-21", 1, 5).unwrap_err(),
+            "Goal not found"
+        );
+    }
+
+    #[test]
+    fn time_goals_take_no_check_in_and_turning_count_into_time_drops_them() {
+        let f = fixture();
+        let time = f.db.goal_create(&draft(), 1).unwrap().id;
+        assert_eq!(
+            f.db.goal_set_count(time, "2026-10-21", 1, 2).unwrap_err(),
+            "Only count goals take a check-in"
+        );
+        let id = f.db.goal_create(&count_draft("Read", 1), 1).unwrap().id;
+        f.db.goal_set_count(id, "2026-10-21", 1, 2).unwrap();
+        let mut d = draft();
+        d.name = Some("Read".into());
+        f.db.goal_edit(id, &d, 3).unwrap();
+        let v =
+            f.db.goal_views(false)
+                .unwrap()
+                .into_iter()
+                .find(|v| v.goal.id == id)
+                .unwrap();
+        assert_eq!(v.goal.kind, GoalKind::Time);
+        assert!(v.counts.is_empty());
+        assert_eq!(v.goal.target_count, None);
+    }
+
+    #[test]
+    fn a_time_goal_with_only_a_name_counts_blocks_with_that_title() {
+        let f = fixture();
+        let env = Env::new();
+        let mut d = draft();
+        d.tag_names = vec![];
+        d.name = Some("Inglês".into());
+        f.db.goal_create(&d, 1).unwrap();
+        let rows = [
+            sess("2026-10-21", "09:00", 20, "inglês", &[], None),
+            sess("2026-10-21", "10:00", 30, "Other", &[], None),
+        ];
+        let idx = indexed(&env, &rows);
+        let views = f.db.goal_views(false).unwrap();
+        assert_eq!(views[0].filter().title_norm.as_deref(), Some("inglês"));
+        let p = &idx.goals(&views, d_("2026-10-21")).unwrap()[0];
+        assert_eq!(p.today_minutes, 20);
+        // With tags, the name is only a label.
+        let mut d = draft();
+        d.name = Some("Inglês".into());
+        f.db.goal_create(&d, 1).unwrap();
+        let views = f.db.goal_views(false).unwrap();
+        assert_eq!(views[1].filter().title_norm, None);
     }
 }

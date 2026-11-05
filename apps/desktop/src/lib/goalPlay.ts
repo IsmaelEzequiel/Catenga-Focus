@@ -2,7 +2,7 @@
 import type { CalEvent, GoalProgress } from "../api";
 import type { UiBlock } from "../hooks/useDay";
 import { ghostEvents, matchBlocks } from "./calendar";
-import { matchesGoal } from "./goals";
+import { goalTarget, matchesGoal } from "./goals";
 
 export type GoalTarget =
   | { kind: "block"; key: string }
@@ -55,4 +55,27 @@ export function findGoalBlock(
     if (event) return { kind: "event", event };
   }
   return { kind: "none" };
+}
+
+const SLOT = 15;
+const DAY_END = 24 * 60;
+
+/**
+ * Goal without a project and no block for it today (owner decision, 2026-11-04): Start makes one from now, as long as
+ * the day's target (rounded up to 15 min), titled so the goal matches it again and a second Start reuses it. Like a
+ * block dragged on the grid, it also becomes a Google event. Project goals never get one (their occurrence decides).
+ */
+export function newGoalBlock(
+  p: Pick<GoalProgress, "goal" | "project" | "tags">,
+  nowMinute: number,
+): { start: number; end: number; title: string; tags: string[] } | null {
+  const { goal } = p;
+  if (goal.kind === "count" || goal.projectId !== null) return null;
+  const tags = p.tags.map((t) => t.name);
+  const title = goal.title?.trim() || goal.name?.trim() || "";
+  if (title === "" && tags.length === 0) return null;
+  const start = Math.min(Math.floor(nowMinute / SLOT) * SLOT, DAY_END - SLOT);
+  const length = Math.max(SLOT, Math.ceil(goalTarget(goal) / SLOT) * SLOT);
+  const block = { start, end: Math.min(DAY_END, start + length), title, tags };
+  return matchesGoal(p, { ...block, project: null }) ? block : null;
 }

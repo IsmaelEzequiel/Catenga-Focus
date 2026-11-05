@@ -1,17 +1,19 @@
 import { describe, expect, it } from "vitest";
 import type { CalEvent, GoalProgress, Project, Tag } from "../api";
-import { findGoalBlock } from "./goalPlay";
+import { findGoalBlock, newGoalBlock } from "./goalPlay";
 
 const project: Project = { id: 1, kind: "series", key: "series:tc", name: "Teoria", color: "#3d6fb6", calendarName: "Mestrado", archived: false };
 const tag = (id: number, name: string): Tag => ({ id, name, color: "sun", saved: true, goalCount: 1 });
 const goal = (over: Partial<GoalProgress> = {}, g: Partial<GoalProgress["goal"]> = {}): GoalProgress => ({
-  goal: { id: 1, projectId: null, tagIds: [], title: null, minutesPerDay: 60, start: "2026-10-10", days: null, archived: false, ...g },
+  goal: { id: 1, kind: "time", name: null, projectId: null, tagIds: [], title: null, minutesPerDay: 60, targetCount: null, unit: null, start: "2026-10-10", days: null, archived: false, ...g },
   project: null,
   tags: [],
   status: "active",
   todayMinutes: 0,
   elapsedDays: 1,
   metDays: 0,
+  doneDays: 0,
+  score: 0,
   totalMinutes: 0,
   currentStreak: 0,
   longestStreak: 0,
@@ -91,5 +93,29 @@ describe("findGoalBlock", () => {
   });
   it("finds nothing when nothing matches", () => {
     expect(findGoalBlock([block("a", 540, 600, "Other")], [], byTitle, 560)).toEqual({ kind: "none" });
+  });
+});
+
+describe("newGoalBlock", () => {
+  it("makes_a_block_from_now_for_the_target_titled_by_the_name", () => {
+    const b = newGoalBlock(goal({}, { name: "English", minutesPerDay: 50 }), 9 * 60 + 7);
+    expect(b).toEqual({ start: 540, end: 600, title: "English", tags: [] });
+  });
+  it("uses_the_title_filter_and_tags_so_the_goal_matches_it_again", () => {
+    const p = goal({ tags: [tag(1, "rust")] }, { name: "Learn", title: "Book", tagIds: [1], minutesPerDay: 30 });
+    const b = newGoalBlock(p, 600);
+    expect(b).toEqual({ start: 600, end: 630, title: "Book", tags: ["rust"] });
+    expect(findGoalBlock([{ key: "k", body: "", ...b! }], [], p, 610)).toEqual({ kind: "block", key: "k" });
+  });
+  it("only_tags_gives_an_untitled_block_with_the_tags", () => {
+    const b = newGoalBlock(goal({ tags: [tag(1, "rust")] }, { tagIds: [1] }), 600);
+    expect(b).toMatchObject({ title: "", tags: ["rust"] });
+  });
+  it("stays_inside_the_day", () => {
+    expect(newGoalBlock(goal({}, { name: "Late", minutesPerDay: 120 }), 23 * 60 + 50)).toMatchObject({ start: 1425, end: 1440 });
+  });
+  it("never_for_project_or_count_goals", () => {
+    expect(newGoalBlock(goal({ project }, { projectId: 1, name: "x" }), 600)).toBeNull();
+    expect(newGoalBlock(goal({}, { kind: "count", targetCount: 1, name: "Read" }), 600)).toBeNull();
   });
 });

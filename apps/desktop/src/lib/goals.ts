@@ -1,11 +1,32 @@
 /** Pure helpers for goals (see `docs/plans/M8-goals.md` §1.4 and `docs/plans/M8b-projects.md` §1.4-§1.5). */
-import type { BlockRef, GoalDay, GoalDraft, GoalProgress, TimerStatus } from "../api";
+import type { BlockRef, Goal, GoalDay, GoalDraft, GoalKind, GoalProgress, TimerStatus } from "../api";
 import { fmtDuration } from "./dashboard";
 import { cleanTagNames } from "./tags";
 import { addDays } from "./time";
 
 export const MIN_PER_DAY = 5;
 export const MAX_PER_DAY = 720;
+export const MAX_COUNT = 100_000;
+const MAX_NAME = 80;
+/** `minutesPerDay` sent for a count goal (the backend ignores it). */
+const COUNT_PLACEHOLDER_MINUTES = 60;
+
+/** The daily target in the goal's own unit: minutes, or the count. */
+export const goalTarget = (goal: Pick<Goal, "kind" | "minutesPerDay" | "targetCount">): number =>
+  goal.kind === "count" ? Math.max(1, goal.targetCount ?? 1) : goal.minutesPerDay;
+
+/** `5 pages`, `1 page`… a plain number when the goal has no unit. */
+export function fmtCount(n: number, unit: string | null): string {
+  const u = unit?.trim();
+  if (!u) return String(n);
+  // Crude singular for the common English case ("1 pages" reads wrong); other units stay as typed.
+  const one = n === 1 && u.length > 1 && u.endsWith("s") && !u.endsWith("ss") ? u.slice(0, -1) : u;
+  return `${n} ${one}`;
+}
+
+/** A day's amount in the goal's unit: `45 min` / `5 pages`. */
+export const fmtGoalAmount = (goal: Pick<Goal, "kind" | "unit">, n: number): string =>
+  goal.kind === "count" ? fmtCount(n, goal.unit) : fmtDuration(n);
 
 export const toMinutes = (h: number, min: number) => h * 60 + min;
 export const fromMinutes = (minutes: number) => ({ h: Math.floor(minutes / 60), min: minutes % 60 });
@@ -14,6 +35,11 @@ const normTag = (s: string) => s.trim().replace(/^#+/, "").trim().toLowerCase();
 const normTitle = (s: string) => s.trim().toLowerCase();
 
 export interface DraftInput {
+  kind: GoalKind;
+  name: string;
+  /** Count goals. */
+  count: number;
+  unit: string;
   projectId: number | null;
   /** Tag names, with or without `#`. */
   tags: string[];
@@ -35,21 +61,57 @@ const isDate = (s: string) => {
 
 /** Form values to a draft, or the same plain-text error the backend would give. */
 export function buildDraft(input: DraftInput): { draft: GoalDraft } | { error: string } {
+  const name = input.name.trim();
+  if ([...name].length > MAX_NAME) return { error: `Name can be at most ${MAX_NAME} characters` };
+  const span = () => {
+    if (!input.endless && (!Number.isInteger(input.days) || input.days < 1)) return "Days must be at least 1";
+    if (!isDate(input.start)) return "Start must be a date";
+    return null;
+  };
+  if (input.kind === "count") {
+    if (name === "") return { error: "Give the goal a name" };
+    if (!Number.isInteger(input.count) || input.count < 1 || input.count > MAX_COUNT) {
+      return { error: `Amount per day must be 1–${MAX_COUNT}` };
+    }
+    const err = span();
+    if (err) return { error: err };
+    const unit = input.unit.trim();
+    return {
+      draft: {
+        kind: "count",
+        name,
+        projectId: null,
+        tagNames: [],
+        title: null,
+        minutesPerDay: COUNT_PLACEHOLDER_MINUTES,
+        targetCount: input.count,
+        unit: unit === "" ? null : unit,
+        start: input.start,
+        days: input.endless ? null : input.days,
+      },
+    };
+  }
   const tagNames = cleanTagNames(input.tags);
   const title = input.title.trim();
-  if (input.projectId === null && tagNames.length === 0 && title === "") return { error: "Pick a project, a tag or a title" };
+  if (input.projectId === null && tagNames.length === 0 && title === "" && name === "") {
+    return { error: "Give the goal a name, a project or a tag" };
+  }
   const minutes = toMinutes(input.h, input.min);
   if (!Number.isInteger(minutes) || minutes < MIN_PER_DAY || minutes > MAX_PER_DAY) {
     return { error: `Minutes per day must be ${MIN_PER_DAY}–${MAX_PER_DAY}` };
   }
-  if (!input.endless && (!Number.isInteger(input.days) || input.days < 1)) return { error: "Days must be at least 1" };
-  if (!isDate(input.start)) return { error: "Start must be a date" };
+  const err = span();
+  if (err) return { error: err };
   return {
     draft: {
+      kind: "time",
+      name: name === "" ? null : name,
       projectId: input.projectId,
       tagNames,
       title: title === "" ? null : title,
       minutesPerDay: minutes,
+      targetCount: null,
+      unit: null,
       start: input.start,
       days: input.endless ? null : input.days,
     },
@@ -58,26 +120,30 @@ export function buildDraft(input: DraftInput): { draft: GoalDraft } | { error: s
 
 /**
  * Same matching as the backend. A goal with a project matches by the project only (project wins; compares project keys
- * `series:…` / `event:…`). Otherwise tags (any, lowercase, no `#`) AND the title (trimmed, case-insensitive) must hold.
+ * `series:…` / `event:…`). Otherwise tags (any, lowercase, no `#`) AND the title (trimmed, case-insensitive) must hold;
+ * a goal with only a name counts blocks with that title. Count goals never match blocks (they are checked in by hand).
  */
 export function matchesGoal(p: Pick<GoalProgress, "goal" | "project" | "tags">, block: Pick<BlockRef, "title" | "tags" | "project">): boolean {
   const { goal } = p;
+  if (goal.kind === "count") return false;
   const hasTags = goal.tagIds.length > 0 || p.tags.length > 0;
-  const hasTitle = goal.title !== null && goal.title.trim() !== "";
+  const titleFilter = goal.title?.trim() || (!hasTags ? goal.name?.trim() : "") || "";
+  const hasTitle = titleFilter !== "";
   if (goal.projectId === null && !hasTags && !hasTitle) return false;
   if (goal.projectId !== null) return p.project !== null && block.project === p.project.key;
   if (hasTags) {
     const have = new Set(block.tags.map(normTag));
     if (!p.tags.some((t) => have.has(normTag(t.name)))) return false;
   }
-  if (hasTitle && normTitle(block.title) !== normTitle(goal.title ?? "")) return false;
+  if (hasTitle && normTitle(block.title) !== normTitle(titleFilter)) return false;
   return true;
 }
 
 /** `Mestrado · #rust #go · Book`, for labels and tooltips. */
 export function goalSubjectText(p: GoalProgress): string {
   const parts: string[] = [];
-  if (p.project) parts.push(p.project.name);
+  if (p.goal.name) parts.push(p.goal.name);
+  if (p.project && p.project.name !== p.goal.name) parts.push(p.project.name);
   if (p.tags.length > 0) parts.push(p.tags.map((t) => `#${t.name}`).join(" "));
   if (p.goal.title) parts.push(p.goal.title);
   return parts.length > 0 ? parts.join(" · ") : "Goal";
@@ -91,22 +157,32 @@ export function liveFocusMinutes(status: TimerStatus, nowMs: number): number {
   return status.focusMinutes ? Math.min(minutes, status.focusMinutes) : minutes;
 }
 
-/** Adds running-timer minutes to today's numbers (active goals only). Returns the same object when nothing changes. */
+/** A day's share of the target in thousandths, capped at 1000 (same as the backend's score). */
+export const dayScore = (amount: number, target: number): number =>
+  target <= 0 ? 0 : Math.min(1000, Math.floor((Math.max(0, amount) * 1000) / target));
+
+/**
+ * Adds running-timer minutes to today's numbers (active time goals only). The first live minute already counts for the
+ * streak (any progress keeps it). Returns the same object when nothing changes.
+ */
 export function applyLive(p: GoalProgress, live: number, today: string): GoalProgress {
-  if (live <= 0 || p.status !== "active") return p;
-  const target = p.goal.minutesPerDay;
+  if (live <= 0 || p.status !== "active" || p.goal.kind === "count") return p;
+  const target = goalTarget(p.goal);
   const todayMinutes = p.todayMinutes + live;
   const newlyMet = p.todayMinutes < target && todayMinutes >= target;
+  const newlyDone = p.todayMinutes <= 0;
   const hasToday = p.last14.some((d) => d.date === today);
   const last14: GoalDay[] = hasToday
     ? p.last14.map((d) => (d.date === today ? { ...d, minutes: d.minutes + live, met: d.minutes + live >= target } : d))
     : [...p.last14, { date: today, minutes: live, met: live >= target }];
-  const currentStreak = newlyMet ? p.currentStreak + 1 : p.currentStreak;
+  const currentStreak = newlyDone ? p.currentStreak + 1 : p.currentStreak;
   return {
     ...p,
     todayMinutes,
     totalMinutes: p.totalMinutes + live,
     metDays: newlyMet ? p.metDays + 1 : p.metDays,
+    doneDays: newlyDone ? p.doneDays + 1 : p.doneDays,
+    score: p.score - dayScore(p.todayMinutes, target) + dayScore(todayMinutes, target),
     currentStreak,
     longestStreak: Math.max(p.longestStreak, currentStreak),
     last14,
@@ -133,7 +209,7 @@ const fmtShort = (date: string) => {
 /** `1h a day · day 12 of 30`, `… · since 21 Oct`, `… · starts 22 Oct`, `… · 30 days · ended 20 Nov`; with `today`, "today" / "tomorrow" replace the date. */
 export function goalSummary(p: GoalProgress, today?: string): string {
   const { goal } = p;
-  const base = `${fmtDuration(goal.minutesPerDay)} a day`;
+  const base = `${fmtGoalAmount(goal, goalTarget(goal))} a day`;
   const when = (date: string) =>
     today && date === today ? "today" : today && date === addDays(today, 1) ? "tomorrow" : fmtShort(date);
   if (p.status === "upcoming") return `${base} · starts ${when(goal.start)}`;
@@ -150,8 +226,10 @@ export function groupGoals(list: GoalProgress[]): { active: GoalProgress[]; upco
   };
 }
 
-/** The one subject a card is titled with: the project, else the title filter, else the tags (`#a #b`). */
+/** The one subject a card is titled with: its name, else the project, else the title filter, else the tags (`#a #b`). */
 export function goalTitle(p: GoalProgress): string {
+  const name = p.goal.name?.trim();
+  if (name) return name;
   if (p.project) return p.project.name;
   const title = p.goal.title?.trim();
   if (title) return title;
@@ -159,15 +237,20 @@ export function goalTitle(p: GoalProgress): string {
   return "Goal";
 }
 
-/** What the card shows besides its headline: the title filter (if the project is the headline and the title differs) and tag names. */
-export function goalExtras(p: GoalProgress): { title: string | null; tags: string[] } {
+/**
+ * What the card shows besides its headline: the project (when the name is the headline), the title filter (when it is
+ * not the headline) and tag names (unless they are the headline).
+ */
+export function goalExtras(p: GoalProgress): { project: string | null; title: string | null; tags: string[] } {
+  const headline = goalTitle(p);
   const title = p.goal.title?.trim() || null;
-  if (p.project) {
-    const same = title !== null && normTitle(title) === normTitle(p.project.name);
-    return { title: same ? null : title, tags: p.tags.map((t) => t.name) };
-  }
-  if (title) return { title: null, tags: p.tags.map((t) => t.name) };
-  return { title: null, tags: [] };
+  const differs = (s: string | null) => (s !== null && normTitle(s) !== normTitle(headline) ? s : null);
+  const tagsHeadline = p.tags.length > 0 && headline === p.tags.map((t) => `#${t.name}`).join(" ");
+  return {
+    project: differs(p.project?.name ?? null),
+    title: differs(title),
+    tags: tagsHeadline ? [] : p.tags.map((t) => t.name),
+  };
 }
 
 /** `1h a day · day 2 of 30`, `1h a day · since today`. */
@@ -207,23 +290,30 @@ const fmtAmount = (minutes: number, unit: "hours" | "min") =>
  * `logged` = all focus minutes today (every session, plus the live one).
  */
 export function goalsSummary(active: GoalProgress[], logged: number): { today: Kpi; success: Kpi; streak: Kpi; logged: Kpi } {
-  const done = active.reduce((n, p) => n + p.todayMinutes, 0);
-  const target = active.reduce((n, p) => n + p.goal.minutesPerDay, 0);
+  const timed = active.filter((p) => p.goal.kind !== "count");
+  const done = timed.reduce((n, p) => n + p.todayMinutes, 0);
+  const target = timed.reduce((n, p) => n + p.goal.minutesPerDay, 0);
   const met = active.reduce((n, p) => n + p.metDays, 0);
   const elapsed = active.reduce((n, p) => n + p.elapsedDays, 0);
+  // Partial days count for their share: 5 of 10 pages is half a day.
+  const score = active.reduce((n, p) => n + p.score, 0);
   const best = Math.max(0, ...active.map((p) => p.longestStreak));
   const current = Math.max(0, ...active.map((p) => p.currentStreak));
   const none = active.length === 0;
   const unit = target < 60 ? "min" : "hours";
+  const metToday = active.filter((p) => p.todayMinutes >= goalTarget(p.goal)).length;
   return {
-    today: {
-      value: `${fmtAmount(done, unit)}/${fmtAmount(target, unit)} ${unit}`,
-      sub: none ? "no active goals" : `${Math.round((done / target) * 100)}% of target`,
-    },
+    today:
+      timed.length === 0 && !none
+        ? { value: `${metToday}/${active.length} goals`, sub: "met today" }
+        : {
+            value: `${fmtAmount(done, unit)}/${fmtAmount(target, unit)} ${unit}`,
+            sub: none ? "no active goals" : `${Math.round((done / target) * 100)}% of target`,
+          },
     success:
-      met === 0
-        ? { value: "—", sub: none ? "no active goals" : "no complete days yet" }
-        : { value: `${Math.round((met / elapsed) * 100)}%`, sub: `${met} of ${elapsed} days met` },
+      score === 0
+        ? { value: "—", sub: none ? "no active goals" : "nothing done yet" }
+        : { value: `${Math.round(score / (elapsed * 10))}%`, sub: `${met} of ${elapsed} days met` },
     streak: { value: String(best), sub: none ? "no active goals" : `current ${current}` },
     logged: { value: fmtDuration(logged), sub: "all focus today" },
   };

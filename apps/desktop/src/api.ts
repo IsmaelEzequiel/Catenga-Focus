@@ -373,13 +373,23 @@ export interface Tag {
   saved: boolean;
   goalCount: number;
 }
+/** `time`: minutes of timer sessions a day; `count`: an amount checked in by hand each day (pages, reps). */
+export type GoalKind = "time" | "count";
 export interface Goal {
   id: number;
+  kind: GoalKind;
+  /** The card's name; for a time goal with no project, tag or title it is also the block title that counts. */
+  name: string | null;
   projectId: number | null;
   tagIds: number[];
   /** Optional title filter. */
   title: string | null;
+  /** Time goals (a placeholder on count goals). */
   minutesPerDay: number;
+  /** Count goals: the amount per day. */
+  targetCount: number | null;
+  /** Count goals: what is counted ("pages"). */
+  unit: string | null;
   /** YYYY-MM-DD */
   start: string;
   /** Null = no end. */
@@ -388,15 +398,20 @@ export interface Goal {
 }
 /** Tags by name: unknown names are created. */
 export interface GoalDraft {
+  kind: GoalKind;
+  name: string | null;
   projectId: number | null;
   tagNames: string[];
   title: string | null;
   minutesPerDay: number;
+  targetCount: number | null;
+  unit: string | null;
   start: string;
   days: number | null;
 }
 export interface GoalDay {
   date: string;
+  /** Minutes, or the count for a count goal. */
   minutes: number;
   met: boolean;
 }
@@ -405,10 +420,17 @@ export interface GoalProgress {
   project: Project | null;
   tags: Tag[];
   status: "upcoming" | "active" | "finished";
+  /** Minutes, or the count for a count goal (same for `totalMinutes`). */
   todayMinutes: number;
   elapsedDays: number;
+  /** Days that reached the target. */
   metDays: number;
+  /** Days with any progress; they keep the streak going. */
+  doneDays: number;
+  /** Sum of each elapsed day's share of the target, in thousandths (≤ 1000 a day). */
+  score: number;
   totalMinutes: number;
+  /** Consecutive days with any progress. */
   currentStreak: number;
   longestStreak: number;
   /** Last day of the goal; null if it has no end. */
@@ -438,6 +460,9 @@ export const goalUpdate = (id: number, draft: GoalDraft) => invoke<GoalProgress[
 export const goalSetArchived = (id: number, archived: boolean) =>
   invoke<GoalProgress[]>("goal_set_archived", { id, archived });
 export const goalDelete = (id: number) => invoke<GoalProgress[]>("goal_delete", { id });
+/** What a count goal got on `date` (0 clears the day). */
+export const goalSetCount = (id: number, date: string, amount: number) =>
+  invoke<GoalProgress[]>("goal_set_count", { id, date, amount });
 export const onGoalsChanged = (callback: () => void): Promise<UnlistenFn> =>
   listen<Record<string, never>>("goals-changed", () => callback());
 export const onProjectsChanged = (callback: () => void): Promise<UnlistenFn> =>

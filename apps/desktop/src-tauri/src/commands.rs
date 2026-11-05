@@ -266,6 +266,24 @@ pub async fn goal_delete(
     .await
 }
 
+/// What a count goal got on `date` (0 clears the day).
+#[tauri::command]
+pub async fn goal_set_count(
+    app: AppHandle,
+    store: State<'_, Arc<DayStore>>,
+    db: State<'_, AppDbHandle>,
+    index: State<'_, IndexHandle>,
+    id: i64,
+    date: String,
+    amount: i64,
+) -> Result<Vec<GoalProgress>, String> {
+    goal_write(app, &store, &db, &index, move |db| {
+        db.goal_set_count(id, &date, amount, now_secs())
+            .map(|()| false)
+    })
+    .await
+}
+
 // ------------------------------------------------- calendars, projects & tags
 
 #[tauri::command]

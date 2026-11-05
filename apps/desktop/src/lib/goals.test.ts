@@ -4,11 +4,14 @@ import {
   applyLive,
   buildDraft,
   cellFill,
+  fmtCount,
+  fmtGoalAmount,
   fromMinutes,
   goalExtras,
   goalMetaLine,
   goalSubjectText,
   goalSummary,
+  goalTarget,
   goalTitle,
   goalsSummary,
   groupGoals,
@@ -32,13 +35,15 @@ const project = (over: Partial<Project> = {}): Project => ({
 const tag = (id: number, name: string): Tag => ({ id, name, color: "sun", saved: true, goalCount: 1 });
 
 const goal = (over: Partial<GoalProgress> = {}, g: Partial<GoalProgress["goal"]> = {}): GoalProgress => ({
-  goal: { id: 1, projectId: null, tagIds: [], title: "Rust", minutesPerDay: 60, start: "2026-10-10", days: 30, archived: false, ...g },
+  goal: { id: 1, kind: "time", name: null, projectId: null, tagIds: [], title: "Rust", minutesPerDay: 60, targetCount: null, unit: null, start: "2026-10-10", days: 30, archived: false, ...g },
   project: null,
   tags: [],
   status: "active",
   todayMinutes: 0,
   elapsedDays: 12,
   metDays: 9,
+  doneDays: 0,
+  score: 0,
   totalMinutes: 600,
   currentStreak: 2,
   longestStreak: 4,
@@ -76,11 +81,25 @@ describe("h+min conversion", () => {
 });
 
 describe("buildDraft", () => {
-  const ok = { projectId: null, tags: ["rust"], title: "", h: 1, min: 0, start: "2026-10-21", endless: false, days: 30 };
+  const ok = { kind: "time" as const, name: "", count: 1, unit: "", projectId: null, tags: ["rust"], title: "", h: 1, min: 0, start: "2026-10-21", endless: false, days: 30 };
   it("builds_a_tag_draft_with_null_title", () => {
     expect(buildDraft(ok)).toEqual({
-      draft: { projectId: null, tagNames: ["rust"], title: null, minutesPerDay: 60, start: "2026-10-21", days: 30 },
+      draft: { kind: "time", name: null, projectId: null, tagNames: ["rust"], title: null, minutesPerDay: 60, targetCount: null, unit: null, start: "2026-10-21", days: 30 },
     });
+  });
+  it("accepts_only_a_name", () => {
+    const r = buildDraft({ ...ok, tags: [], name: "  English " });
+    expect("draft" in r && r.draft.name).toBe("English");
+  });
+  it("builds_a_count_draft_without_filters", () => {
+    expect(buildDraft({ ...ok, kind: "count", name: "Read", count: 10, unit: " pages ", projectId: 3, title: "x" })).toEqual({
+      draft: { kind: "count", name: "Read", projectId: null, tagNames: [], title: null, minutesPerDay: 60, targetCount: 10, unit: "pages", start: "2026-10-21", days: 30 },
+    });
+  });
+  it("count_needs_a_name_and_an_amount", () => {
+    expect(buildDraft({ ...ok, kind: "count", count: 10 })).toEqual({ error: "Give the goal a name" });
+    expect(buildDraft({ ...ok, kind: "count", name: "Read", count: 0 })).toEqual({ error: "Amount per day must be 1–100000" });
+    expect(buildDraft({ ...ok, kind: "count", name: "Read", count: 1.5 })).toEqual({ error: "Amount per day must be 1–100000" });
   });
   it("accepts_only_a_project", () => {
     const r = buildDraft({ ...ok, projectId: 3, tags: [] });
@@ -95,7 +114,7 @@ describe("buildDraft", () => {
     expect("draft" in r && r.draft.tagNames).toEqual(["Rust", "Go"]);
   });
   it("rejects_no_project_tag_or_title", () => {
-    const msg = "Pick a project, a tag or a title";
+    const msg = "Give the goal a name, a project or a tag";
     expect(buildDraft({ ...ok, tags: [] })).toEqual({ error: msg });
     expect(buildDraft({ ...ok, tags: ["#"], title: "   " })).toEqual({ error: msg });
   });
@@ -208,13 +227,25 @@ describe("applyLive", () => {
     expect(r.last14[1].minutes).toBe(50);
     expect(r.metDays).toBe(9);
   });
-  it("crossing_target_marks_met_and_bumps_streaks", () => {
-    const r = applyLive(goal({ todayMinutes: 40, currentStreak: 4, longestStreak: 4 }), 25, today);
+  it("crossing_target_marks_met_without_bumping_a_streak_today_already_counted", () => {
+    const r = applyLive(goal({ todayMinutes: 40, currentStreak: 4, longestStreak: 4, score: 666 }), 25, today);
     expect(r.todayMinutes).toBe(65);
     expect(r.metDays).toBe(10);
+    expect(r.currentStreak).toBe(4);
+    expect(r.score).toBe(1000);
+    expect(r.last14[1].met).toBe(true);
+  });
+  it("the_first_live_minute_bumps_the_streak", () => {
+    const r = applyLive(goal({ todayMinutes: 0, currentStreak: 4, longestStreak: 4, doneDays: 7 }), 1, today);
+    expect(r.metDays).toBe(9);
     expect(r.currentStreak).toBe(5);
     expect(r.longestStreak).toBe(5);
-    expect(r.last14[1].met).toBe(true);
+    expect(r.doneDays).toBe(8);
+    expect(r.score).toBe(16);
+  });
+  it("count_goals_are_never_live", () => {
+    const g = goal({}, { kind: "count", targetCount: 10 });
+    expect(applyLive(g, 30, today)).toBe(g);
   });
   it("already_met_is_not_counted_twice", () => {
     const r = applyLive(goal({ todayMinutes: 70, metDays: 10, last14: [{ date: today, minutes: 70, met: true }] }), 5, today);
@@ -300,13 +331,19 @@ describe("goalTitle", () => {
 describe("goalExtras", () => {
   it("lists the title filter only when it differs from the project name", () => {
     const base = { project: project({ name: "Mestrado" }), tags: [tag(1, "rust")] };
-    expect(goalExtras(goal(base, { projectId: 1, title: "Mestrado" }))).toEqual({ title: null, tags: ["rust"] });
-    expect(goalExtras(goal(base, { projectId: 1, title: " book " }))).toEqual({ title: "book", tags: ["rust"] });
+    expect(goalExtras(goal(base, { projectId: 1, title: "Mestrado" }))).toEqual({ project: null, title: null, tags: ["rust"] });
+    expect(goalExtras(goal(base, { projectId: 1, title: " book " }))).toEqual({ project: null, title: "book", tags: ["rust"] });
+  });
+  it("shows the project when the name is the headline", () => {
+    const base = { project: project({ name: "Mestrado" }), tags: [] };
+    const p = goal(base, { projectId: 1, title: null, name: "Thesis" });
+    expect(goalTitle(p)).toBe("Thesis");
+    expect(goalExtras(p)).toEqual({ project: "Mestrado", title: null, tags: [] });
   });
   it("does not repeat what the headline already shows", () => {
-    expect(goalExtras(goal({}, { title: "Rust" }))).toEqual({ title: null, tags: [] });
-    expect(goalExtras(goal({ tags: [tag(1, "rust")] }, { title: null }))).toEqual({ title: null, tags: [] });
-    expect(goalExtras(goal({ tags: [tag(1, "rust")] }, { title: "Book" }))).toEqual({ title: null, tags: ["rust"] });
+    expect(goalExtras(goal({}, { title: "Rust" }))).toEqual({ project: null, title: null, tags: [] });
+    expect(goalExtras(goal({ tags: [tag(1, "rust")] }, { title: null }))).toEqual({ project: null, title: null, tags: [] });
+    expect(goalExtras(goal({ tags: [tag(1, "rust")] }, { title: "Book" }))).toEqual({ project: null, title: null, tags: ["rust"] });
   });
 });
 
@@ -344,9 +381,34 @@ describe("stripCells", () => {
   });
 });
 
+describe("count goals", () => {
+  it("format_amounts_in_their_unit", () => {
+    expect(fmtCount(1, "pages")).toBe("1 page");
+    expect(fmtCount(5, "pages")).toBe("5 pages");
+    expect(fmtCount(3, null)).toBe("3");
+    const read = goal({}, { kind: "count", targetCount: 10, unit: "pages", name: "Read", title: null });
+    expect(goalTarget(read.goal)).toBe(10);
+    expect(fmtGoalAmount(read.goal, 5)).toBe("5 pages");
+    expect(goalSummary(read)).toBe("10 pages a day · day 12 of 30");
+    expect(goalTitle(read)).toBe("Read");
+  });
+  it("never_match_blocks", () => {
+    const read = goal({}, { kind: "count", targetCount: 1, name: "Read", title: "Read" });
+    expect(matchesGoal(read, { title: "Read", tags: [], project: null })).toBe(false);
+  });
+  it("a_time_goal_with_only_a_name_matches_blocks_with_that_title", () => {
+    const p = goal({}, { title: null, name: "English" });
+    expect(matchesGoal(p, { title: " english ", tags: [], project: null })).toBe(true);
+    expect(matchesGoal(p, { title: "Other", tags: [], project: null })).toBe(false);
+    // With tags the name is only a label.
+    const tagged = goal({ tags: [tag(1, "lang")] }, { title: null, name: "English", tagIds: [1] });
+    expect(matchesGoal(tagged, { title: "Other", tags: ["lang"], project: null })).toBe(true);
+  });
+});
+
 describe("goalsSummary", () => {
-  const g = (today: number, perDay: number, met: number, elapsed: number, cur: number, best: number) =>
-    goal({ todayMinutes: today, metDays: met, elapsedDays: elapsed, currentStreak: cur, longestStreak: best }, { minutesPerDay: perDay });
+  const g = (today: number, perDay: number, met: number, elapsed: number, cur: number, best: number, score = met * 1000) =>
+    goal({ todayMinutes: today, metDays: met, elapsedDays: elapsed, currentStreak: cur, longestStreak: best, score }, { minutesPerDay: perDay });
 
   it("sums today over the goals", () => {
     const s = goalsSummary([g(90, 180, 3, 4, 2, 5), g(0, 120, 1, 4, 1, 3)], 80);
@@ -355,11 +417,18 @@ describe("goalsSummary", () => {
     expect(s.streak).toEqual({ value: "5", sub: "current 2" });
     expect(s.logged).toEqual({ value: "1h 20m", sub: "all focus today" });
   });
+  it("partial days count for their share in the success rate", () => {
+    // 5 of 10 pages on the only day = 50%.
+    const read = goal({ todayMinutes: 5, metDays: 0, elapsedDays: 1, score: 500 }, { kind: "count", targetCount: 10 });
+    const s = goalsSummary([read], 0);
+    expect(s.success).toEqual({ value: "50%", sub: "0 of 1 days met" });
+    expect(s.today).toEqual({ value: "0/1 goals", sub: "met today" });
+  });
   it("uses minutes under an hour and allows more than 100%", () => {
     expect(goalsSummary([g(54, 45, 0, 1, 0, 0)], 0).today).toEqual({ value: "54/45 min", sub: "120% of target" });
   });
   it("has no success rate before a complete day", () => {
-    expect(goalsSummary([g(0, 60, 0, 3, 0, 0)], 0).success).toEqual({ value: "—", sub: "no complete days yet" });
+    expect(goalsSummary([g(0, 60, 0, 3, 0, 0)], 0).success).toEqual({ value: "—", sub: "nothing done yet" });
   });
   it("copes with no active goals", () => {
     const s = goalsSummary([], 0);

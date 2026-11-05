@@ -76,20 +76,24 @@ export const isSeriesInstance = (e: CalEvent): boolean => e.projectKey?.startsWi
 export type BlockDeletePlan =
   | { kind: "delete" }
   | { kind: "confirm"; event: CalEvent }
-  | { kind: "refuse"; reason: "sessions" | "notes"; event: CalEvent | null };
+  /** Its sessions and/or note go too: always asked, never silent. */
+  | { kind: "confirm-data"; sessions: boolean; note: boolean; event: CalEvent | null }
+  | { kind: "refuse"; reason: "running"; event: CalEvent | null };
 
 /**
- * What deleting a block does (`docs/plans/M8e-play-delete.md` §1.4). A block with sessions or a note is never deleted
- * (`event` then says whether the Google event can be offered for deletion instead); an empty one backed by an event asks.
+ * What deleting a block does (`docs/plans/M8e-play-delete.md` §1.4, changed 2026-11-04 by the owner): a block with timer
+ * sessions or a note can be deleted after a confirmation that says they go too; one whose timer is running can't (stop
+ * it first). An empty one backed by an event asks whether the event goes too. `event` is null when it can't be deleted.
  */
 export function blockDeletePlan(p: {
   hasSessions: boolean;
   hasNote: boolean;
+  running: boolean;
   event: CalEvent | undefined;
   canDeleteEvent: boolean;
 }): BlockDeletePlan {
   const event = p.canDeleteEvent && p.event ? p.event : null;
-  if (p.hasSessions) return { kind: "refuse", reason: "sessions", event };
-  if (p.hasNote) return { kind: "refuse", reason: "notes", event };
+  if (p.running) return { kind: "refuse", reason: "running", event };
+  if (p.hasSessions || p.hasNote) return { kind: "confirm-data", sessions: p.hasSessions, note: p.hasNote, event };
   return event ? { kind: "confirm", event } : { kind: "delete" };
 }

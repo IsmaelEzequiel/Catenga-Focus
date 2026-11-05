@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ArrowsPointingOutIcon, CheckIcon, EllipsisHorizontalIcon, PlayIcon, PlusIcon } from "@heroicons/react/20/solid";
-import type { GoalDraft, GoalProgress, Project, Tag, TimerStatus } from "../api";
+import type { GoalDraft, GoalKind, GoalProgress, Project, Tag, TimerStatus } from "../api";
 import { useGoals } from "../hooks/useGoals";
 import { useLoggedToday } from "../hooks/useLoggedToday";
 import { fmtDuration } from "../lib/dashboard";
@@ -8,8 +8,11 @@ import {
   applyLive,
   buildDraft,
   cellFill,
+  fmtCount,
+  fmtGoalAmount,
   fromMinutes,
   goalExtras,
+  goalTarget,
   goalMetaLine,
   goalSummary,
   goalSubjectText,
@@ -31,6 +34,7 @@ import { ListRow } from "./ui/ListRow";
 import { StatTile } from "./ui/StatTile";
 import "../card.css";
 import "../field.css";
+import "../segmented.css";
 import "../goals.css";
 
 interface Props {
@@ -76,6 +80,7 @@ export function GoalsSection({ projects, tags, timerStatus, nowMs, onPlay }: Pro
       today={today}
       running={timed !== null && matchesGoal(p, timed)}
       onPlay={() => onPlay(p)}
+      onCheck={(amount) => g.setCount(p.goal.id, today, amount)}
       onEdit={() => setForm({ goal: p })}
       onArchive={() => void g.setArchived(p.goal.id, true)}
       onDelete={() => g.remove(p.goal.id)}
@@ -124,7 +129,7 @@ export function GoalsSection({ projects, tags, timerStatus, nowMs, onPlay }: Pro
 
       {g.list !== null && total === 0 && !form && (
         <div className="goals__empty card">
-          <p>Set a goal, for example Mestrado, 1h a day for 30 days.</p>
+          <p>Set a goal, for example Mestrado, 1h a day for 30 days, or Read, 10 pages a day.</p>
           <Button variant="primary" icon={PlusIcon} onClick={() => setForm({ goal: null })}>
             New goal
           </Button>
@@ -171,11 +176,11 @@ export function GoalsSection({ projects, tags, timerStatus, nowMs, onPlay }: Pro
   );
 }
 
-function Ring({ minutes, target }: { minutes: number; target: number }) {
+function Ring({ minutes, target, fmt }: { minutes: number; target: number; fmt: (n: number) => string }) {
   const met = minutes >= target;
   const frac = ringFraction(minutes, target);
   return (
-    <span className="goalring" data-met={met} role="img" aria-label={`${fmtDuration(minutes)} of ${fmtDuration(target)} today`}>
+    <span className="goalring" data-met={met} role="img" aria-label={`${fmt(minutes)} of ${fmt(target)} today`}>
       <svg viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
         <circle className="goalring__track" cx="32" cy="32" r={RING_R} />
         <circle
@@ -189,7 +194,7 @@ function Ring({ minutes, target }: { minutes: number; target: number }) {
         />
       </svg>
       <span className="goalring__center">
-        {met ? <CheckIcon className="goalring__check" aria-hidden="true" /> : minutes > 0 ? fmtDuration(minutes) : `${Math.round(frac * 100)}%`}
+        {met ? <CheckIcon className="goalring__check" aria-hidden="true" /> : minutes > 0 ? fmt(minutes) : `${Math.round(frac * 100)}%`}
       </span>
     </span>
   );
@@ -201,22 +206,32 @@ function GoalCard(props: {
   today: string;
   running: boolean;
   onPlay: () => void;
+  onCheck: (amount: number) => Promise<string | null>;
   onEdit: () => void;
   onArchive: () => void;
   onDelete: () => Promise<string | null>;
 }) {
   const { p, today } = props;
-  const target = p.goal.minutesPerDay;
+  const target = goalTarget(p.goal);
+  const isCount = p.goal.kind === "count";
+  const fmt = (n: number) => fmtGoalAmount(p.goal, n);
   const active = p.status === "active";
   const [confirm, setConfirm] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const extras = goalExtras(p);
   const cells = stripCells(p.last14, p.goal.start, today);
   const playHint = active ? undefined : p.status === "upcoming" ? "This goal hasn't started yet" : "This goal has ended";
-  const meta = [goalMetaLine(p, today), extras.title, ...extras.tags.map((name) => `#${name}`)].filter(Boolean).join(" · ");
+  const meta = [goalMetaLine(p, today), extras.project, extras.title, ...extras.tags.map((name) => `#${name}`)].filter(Boolean).join(" · ");
+  const check = async (amount: number) => {
+    const e = await props.onCheck(amount);
+    setErr(e);
+    if (!e) setChecking(false);
+  };
+  const checkedToday = p.todayMinutes > 0;
   return (
     <article className="goal card" data-status={p.status}>
-      {active ? <Ring minutes={p.todayMinutes} target={target} /> : <span className="goalring goalring--idle" aria-hidden="true" />}
+      {active ? <Ring minutes={p.todayMinutes} target={target} fmt={fmt} /> : <span className="goalring goalring--idle" aria-hidden="true" />}
       <div className="goal__main">
         <h4 className="goal__name" title={goalSubjectText(p)} style={projectStyle(p.project?.color ?? null)}>
           {p.project && <ProjectDot color={p.project.color} />}
@@ -236,8 +251,8 @@ function GoalCard(props: {
                 key={d.date}
                 className={`goalstrip__cell${d.date === today ? " goalstrip__cell--today" : ""}`}
                 data-state={d.placeholder ? "placeholder" : c.state}
-                title={d.placeholder ? `${d.date} · before the start` : `${d.date} · ${fmtDuration(d.minutes)}`}
-                aria-label={d.placeholder ? `${d.date}, before the start` : `${d.date}, ${fmtDuration(d.minutes)}${d.met ? ", met" : ""}`}
+                title={d.placeholder ? `${d.date} · before the start` : `${d.date} · ${fmt(d.minutes)}`}
+                aria-label={d.placeholder ? `${d.date}, before the start` : `${d.date}, ${fmt(d.minutes)}${d.met ? ", met" : ""}`}
               >
                 <i style={{ height: `${c.fill * 100}%` }} />
               </li>
@@ -250,24 +265,53 @@ function GoalCard(props: {
       </div>
       <div className="goal__side">
         <div className="goal__actions">
-          <Button
-            variant={props.running ? "secondary" : "primary"}
-            icon={props.running ? ArrowsPointingOutIcon : PlayIcon}
-            disabled={!active}
-            title={playHint}
-            aria-label={props.running ? `Open focus screen for ${goalTitle(p)}` : `Start ${goalTitle(p)}`}
-            onClick={props.onPlay}
-          >
-            {props.running ? "Open" : "Start"}
-          </Button>
+          {isCount ? (
+            <Button
+              variant={checkedToday ? "secondary" : "primary"}
+              icon={CheckIcon}
+              disabled={!active}
+              title={playHint}
+              aria-label={`Check in ${goalTitle(p)} for today`}
+              aria-expanded={target > 1 ? checking : undefined}
+              onClick={() => {
+                // A goal of 1 a day is a plain check; anything more asks how much.
+                if (target === 1 && !checkedToday) void check(1);
+                else setChecking((v) => !v);
+              }}
+            >
+              {checkedToday ? "Edit" : "Check"}
+            </Button>
+          ) : (
+            <Button
+              variant={props.running ? "secondary" : "primary"}
+              icon={props.running ? ArrowsPointingOutIcon : PlayIcon}
+              disabled={!active}
+              title={playHint}
+              aria-label={props.running ? `Open focus screen for ${goalTitle(p)}` : `Start ${goalTitle(p)}`}
+              onClick={props.onPlay}
+            >
+              {props.running ? "Open" : "Start"}
+            </Button>
+          )}
           {!confirm && <GoalMenu onEdit={props.onEdit} onArchive={props.onArchive} onDelete={() => setConfirm(true)} />}
         </div>
         {active && (
           <p className="goal__today">
-            {Math.round(p.todayMinutes)} / {Math.round(target)} min today
+            {isCount
+              ? `${p.todayMinutes} / ${fmtCount(target, p.goal.unit)} today`
+              : `${Math.round(p.todayMinutes)} / ${Math.round(target)} min today`}
           </p>
         )}
       </div>
+      {checking && active && (
+        <CheckIn
+          initial={p.todayMinutes > 0 ? p.todayMinutes : target}
+          unit={p.goal.unit}
+          canClear={checkedToday}
+          onSave={check}
+          onCancel={() => setChecking(false)}
+        />
+      )}
       {confirm && (
         <div className="goal__confirm" role="group" aria-label="Confirm delete">
           <span>Delete this goal?</span>
@@ -294,6 +338,59 @@ function GoalCard(props: {
         </div>
       )}
     </article>
+  );
+}
+
+/** How much a count goal got today: the day's total (it replaces, never adds). */
+function CheckIn(props: {
+  initial: number;
+  unit: string | null;
+  canClear: boolean;
+  onSave: (amount: number) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(String(props.initial));
+  const [busy, setBusy] = useState(false);
+  const amount = Number(value);
+  const valid = value.trim() !== "" && Number.isInteger(amount) && amount >= 0;
+  const save = async (n: number) => {
+    setBusy(true);
+    await props.onSave(n);
+    setBusy(false);
+  };
+  return (
+    <form
+      className="goal__checkin"
+      aria-label="Check in for today"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (valid) void save(amount);
+      }}
+    >
+      <span>Today I did</span>
+      <input
+        className="field__input goalform__num"
+        type="number"
+        min={0}
+        autoFocus
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => e.key === "Escape" && props.onCancel()}
+        aria-label="Amount today"
+      />
+      {props.unit && <span>{props.unit}</span>}
+      <Button type="submit" size="sm" variant="primary" disabled={!valid || busy}>
+        Save
+      </Button>
+      {props.canClear && (
+        <Button size="sm" disabled={busy} onClick={() => void save(0)}>
+          Clear today
+        </Button>
+      )}
+      <Button size="sm" variant="ghost" disabled={busy} onClick={props.onCancel}>
+        Cancel
+      </Button>
+    </form>
   );
 }
 
@@ -404,7 +501,11 @@ function GoalForm(props: {
   onSave: (draft: GoalDraft) => Promise<string | null>;
 }) {
   const goal = props.p?.goal ?? null;
-  const init = fromMinutes(goal?.minutesPerDay ?? 60);
+  const init = fromMinutes(goal && goal.kind === "time" ? goal.minutesPerDay : 60);
+  const [kind, setKind] = useState<GoalKind>(goal?.kind ?? "time");
+  const [name, setName] = useState(goal?.name ?? "");
+  const [count, setCount] = useState(goal?.targetCount ?? 1);
+  const [unit, setUnit] = useState(goal?.unit ?? "");
   const [projectId, setProjectId] = useState<number | null>(goal?.projectId ?? null);
   const [tagNames, setTagNames] = useState<string[]>(props.p?.tags.map((t) => t.name) ?? []);
   const [title, setTitle] = useState(goal?.title ?? "");
@@ -420,7 +521,7 @@ function GoalForm(props: {
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    const r = buildDraft({ projectId, tags: tagNames, title, h, min, start, endless, days });
+    const r = buildDraft({ kind, name, count, unit, projectId, tags: tagNames, title, h, min, start, endless, days });
     if ("error" in r) {
       setError(r.error);
       return;
@@ -435,18 +536,48 @@ function GoalForm(props: {
 
   return (
     <form className="goalform card" onSubmit={submit} aria-label={goal ? "Edit goal" : "New goal"}>
-      <div className="goalform__line">
-        <span className="goalform__word">Track</span>
-        <ProjectPicker projects={props.projects} value={projectId} onChange={setProjectId} noneLabel="No project" label="Project" />
-        <span className="goalform__word">and tags</span>
-        <div className="goalform__grow">
-          <TagInput value={tagNames} onChange={setTagNames} known={props.tags} label="Tags" placeholder="#mestrado or a tag…" />
+      <div className="goalform__head">
+        <label className="field goalform__name">
+          <span className="field__label">Name</span>
+          <input
+            className="field__input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={kind === "count" ? "Read" : "Mestrado, English…"}
+            aria-label="Goal name"
+          />
+        </label>
+        <div className="seg" role="group" aria-label="Goal type">
+          <button type="button" className="seg__item" aria-pressed={kind === "time"} onClick={() => setKind("time")}>
+            Time
+          </button>
+          <button type="button" className="seg__item" aria-pressed={kind === "count"} onClick={() => setKind("count")}>
+            Count
+          </button>
         </div>
-        <span className="goalform__word">for</span>
-        <input className="field__input goalform__num" type="number" min={0} max={12} value={h} onChange={(e) => setH(num(e.target.value))} aria-label="Hours per day" />
-        <span className="goalform__word">h</span>
-        <input className="field__input goalform__num" type="number" min={0} max={59} value={min} onChange={(e) => setMin(num(e.target.value))} aria-label="Minutes per day" />
-        <span className="goalform__word">min a day, for</span>
+      </div>
+      <div className="goalform__line">
+        {kind === "time" ? (
+          <>
+            <span className="goalform__word">Track</span>
+            <ProjectPicker projects={props.projects} value={projectId} onChange={setProjectId} noneLabel="No project" label="Project" />
+            <span className="goalform__word">and tags</span>
+            <div className="goalform__grow">
+              <TagInput value={tagNames} onChange={setTagNames} known={props.tags} label="Tags" placeholder="#mestrado or a tag…" />
+            </div>
+            <span className="goalform__word">for</span>
+            <input className="field__input goalform__num" type="number" min={0} max={12} value={h} onChange={(e) => setH(num(e.target.value))} aria-label="Hours per day" />
+            <span className="goalform__word">h</span>
+            <input className="field__input goalform__num" type="number" min={0} max={59} value={min} onChange={(e) => setMin(num(e.target.value))} aria-label="Minutes per day" />
+            <span className="goalform__word">min a day, for</span>
+          </>
+        ) : (
+          <>
+            <input className="field__input goalform__num" type="number" min={1} value={count} onChange={(e) => setCount(num(e.target.value))} aria-label="Amount per day" />
+            <input className="field__input goalform__unit" value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="pages" aria-label="Unit" />
+            <span className="goalform__word">a day, for</span>
+          </>
+        )}
         <input
           className="field__input goalform__num"
           type="number"
@@ -460,8 +591,8 @@ function GoalForm(props: {
         <input className="field__input" type="date" value={start} onChange={(e) => setStart(e.target.value)} aria-label="Start date" />
       </div>
       <div className="goalform__presets">
-        <span>Time:</span>
-        {PRESETS.map((m) => (
+        {kind === "time" && <span>Time:</span>}
+        {kind === "time" && PRESETS.map((m) => (
           <button
             key={m}
             type="button"
@@ -492,7 +623,13 @@ function GoalForm(props: {
           No end
         </button>
       </div>
-      {more && (
+      {kind === "time" && !name.trim() && projectId === null && tagNames.length === 0 && !title.trim() && (
+        <p className="goalform__hint">Without a project or tag, blocks with the goal's name count; Start makes one from now if today has none.</p>
+      )}
+      {kind === "time" && name.trim() && projectId === null && tagNames.length === 0 && !title.trim() && (
+        <p className="goalform__hint">Blocks titled “{name.trim()}” count; Start makes one from now if today has none.</p>
+      )}
+      {more && kind === "time" && (
         <label className="field goalform__filter">
           <span className="field__label">Only count blocks titled</span>
           <input className="field__input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Rust" aria-label="Title filter" />
@@ -510,9 +647,11 @@ function GoalForm(props: {
         <Button variant="ghost" onClick={props.onCancel}>
           Cancel
         </Button>
-        <button type="button" className="goalform__link" aria-expanded={more} onClick={() => setMore((v) => !v)}>
-          More options
-        </button>
+        {kind === "time" && (
+          <button type="button" className="goalform__link" aria-expanded={more} onClick={() => setMore((v) => !v)}>
+            More options
+          </button>
+        )}
       </div>
     </form>
   );

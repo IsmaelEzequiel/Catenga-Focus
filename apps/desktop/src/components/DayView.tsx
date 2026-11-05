@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import type { BlockRef, CalEvent, Session } from "../api";
 import type { UiBlock } from "../hooks/useDay";
 import { blockDeletePlan, ghostEvents, isSeriesInstance, matchBlocks } from "../lib/calendar";
+import { fmtDuration } from "../lib/dashboard";
 import { layoutLanes } from "../lib/layout";
 import { blockHasSessions, blockTotalMinutes, sameBlock, sessionBars, sessionsForBlock } from "../lib/timer";
 import { parseTitleInput, tagColorVar } from "../lib/tags";
@@ -70,6 +71,8 @@ interface Props {
   canDeleteEvents: boolean;
   /** Deletes the event in Google Calendar; false when it failed (the app already showed a notice). */
   onDeleteEvent: (eventId: string) => Promise<boolean>;
+  /** Deletes these sessions (by start) of this day; false if one failed (already told). */
+  onDeleteSessions: (starts: string[]) => Promise<boolean>;
   /** Context menu "Start timer" / "Stop timer" (same as the timer bar). */
   onStartTimer: (key: string) => void;
   onStopTimer: () => void;
@@ -81,12 +84,13 @@ interface Props {
 type Ask =
   | { kind: "event"; event: CalEvent }
   | { kind: "both"; key: string; event: CalEvent }
-  | { kind: "refused"; text: string; event: CalEvent };
+  /** A block with sessions and/or a note: they go with it. */
+  | { kind: "data"; key: string; title: string; sessions: number; minutes: number; note: boolean; event: CalEvent | null };
 
 const isTypingTarget = (t: EventTarget | null) =>
   t instanceof HTMLElement && (t.closest("input, textarea, select, [contenteditable]") !== null);
 
-export function DayView({ date, blocks, events, loaded, tagColors, now, sessions, timing, runningStart, clockMs, liveTime, preview, shortcutsOff, dragActive, selected, renameToken, reveal, onSelect, onCommit, onNotice, canDeleteEvents, onDeleteEvent, onStartTimer, onStopTimer, top }: Props) {
+export function DayView({ date, blocks, events, loaded, tagColors, now, sessions, timing, runningStart, clockMs, liveTime, preview, shortcutsOff, dragActive, selected, renameToken, reveal, onSelect, onCommit, onNotice, canDeleteEvents, onDeleteEvent, onDeleteSessions, onStartTimer, onStopTimer, top }: Props) {
   const scroller = useRef<HTMLDivElement>(null);
   const grid = useRef<HTMLDivElement>(null);
   const [editing, setEditing] = useState<string | null>(null);
@@ -241,19 +245,28 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
     if (pending && pending.key === key) setPending(null);
   };
 
-  /** The one delete path (Delete key and context menu): refuses blocks with notes/sessions, asks before dropping an event's block. */
+  /** The one delete path (Delete key and context menu): asks before a block takes its sessions/note or event with it. */
   const deleteBlock = (block: UiBlock) => {
     const plan = blockDeletePlan({
       hasSessions: blockHasSessions(sessions, block),
       hasNote: block.body.trim() !== "",
+      running: timing !== null && sameBlock(timing, block),
       event: matchBlocks(blocks, events).get(block.key),
       canDeleteEvent: canDeleteEvents,
     });
     if (plan.kind === "refuse") {
-      const text =
-        plan.reason === "sessions" ? "This block has timer sessions and can't be deleted." : "This block has notes. Edit the file to remove it.";
-      if (plan.event) setAsk({ kind: "refused", text, event: plan.event });
-      else onNotice(text);
+      onNotice("Stop the timer before deleting this block.");
+    } else if (plan.kind === "confirm-data") {
+      const own = sessionsForBlock(sessions, block);
+      setAsk({
+        kind: "data",
+        key: block.key,
+        title: block.title.trim() || "Untitled",
+        sessions: own.length,
+        minutes: blockTotalMinutes(own),
+        note: plan.note,
+        event: plan.event,
+      });
     } else if (plan.kind === "confirm") {
       setAsk({ kind: "both", key: block.key, event: plan.event });
     } else {
@@ -322,9 +335,36 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
     onSelect(key, { focusNote: true });
   };
 
+  /** A block with sessions/note: its sessions go first (a failure keeps the block), then the block, then maybe the event. */
+  const confirmData = async (withEvent: boolean) => {
+    if (!ask || ask.kind !== "data" || asking) return;
+    const { blocks: latest, sessions: latestSessions } = fresh.current;
+    const block = latest.find((b) => b.key === ask.key);
+    if (!block) {
+      setAsk(null);
+      return;
+    }
+    setAsking(true);
+    const ok = await onDeleteSessions(sessionsForBlock(latestSessions, block).map((s) => s.start));
+    if (!ok) {
+      setAsking(false);
+      return;
+    }
+    // Deleting sessions rewrites the day file (its ⏱ lines); commit on the latest blocks, found again by key or slot.
+    const now = fresh.current.blocks;
+    const target = now.find((b) => b.key === ask.key) ?? now.find((b) => sameBlock(b, block));
+    if (target) {
+      live.current.onSelect(null);
+      live.current.onCommit(now.filter((b) => b.key !== target.key));
+    }
+    if (withEvent && ask.event) await onDeleteEvent(ask.event.id);
+    setAsking(false);
+    setAsk(null);
+  };
+
   /** Deletes the event in Google; for "both", the block goes too, but only if it is still empty. */
   const confirmAsk = async (withBlock: boolean) => {
-    if (!ask || asking) return;
+    if (!ask || ask.kind === "data" || asking) return;
     setAsking(true);
     const ok = await onDeleteEvent(ask.event.id);
     setAsking(false);
@@ -340,11 +380,20 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
 
   const askText = () => {
     if (!ask) return null;
+    if (ask.kind === "data") {
+      const parts = [
+        ask.sessions > 0 ? `its ${ask.sessions} timer ${ask.sessions === 1 ? "session" : "sessions"}${ask.minutes > 0 ? ` (${fmtDuration(ask.minutes)})` : ""}` : null,
+        ask.note ? "its note" : null,
+      ].filter(Boolean);
+      return {
+        main: `Delete “${ask.title}” with ${parts.join(" and ")}?`,
+        hint: ask.event ? "This can't be undone. The Google event stays unless you delete both." : "This can't be undone.",
+      };
+    }
     const title = `“${ask.event.title}”`;
     const series = isSeriesInstance(ask.event) ? "Only this occurrence." : null;
     if (ask.kind === "event") return { main: `Delete ${title} from Google Calendar?`, hint: series };
-    if (ask.kind === "both") return { main: `Also delete ${title} from Google Calendar?`, hint: series };
-    return { main: ask.text, hint: [`The block and its note stay; only the Google event ${title} goes.`, series].filter(Boolean).join(" ") };
+    return { main: `Also delete ${title} from Google Calendar?`, hint: series };
   };
   const text = askText();
 
@@ -358,9 +407,22 @@ export function DayView({ date, blocks, events, loaded, tagColors, now, sessions
             {text.hint && <span className="dayask__hint">{text.hint}</span>}
           </span>
           <span className="dayask__actions">
+            {ask.kind === "data" ? (
+              <>
+                <Button size="sm" variant="danger" disabled={asking} onClick={() => void confirmData(false)}>
+                  Delete block
+                </Button>
+                {ask.event && (
+                  <Button size="sm" disabled={asking} onClick={() => void confirmData(true)}>
+                    Delete block and event
+                  </Button>
+                )}
+              </>
+            ) : (
             <Button size="sm" variant="danger" disabled={asking} onClick={() => void confirmAsk(ask.kind === "both")}>
-              {ask.kind === "both" ? "Delete both" : ask.kind === "refused" ? "Delete the event from Google Calendar" : "Delete"}
+              {ask.kind === "both" ? "Delete both" : "Delete"}
             </Button>
+            )}
             {ask.kind === "both" && (
               <Button
                 size="sm"

@@ -185,17 +185,20 @@ describe("isSeriesInstance", () => {
 
 describe("blockDeletePlan", () => {
   const e = event("e1", 540, 600, "x");
+  const base = { hasSessions: false, hasNote: false, running: false, event: undefined, canDeleteEvent: true };
   it("an_empty_block_without_an_event_is_deleted_straight_away", () => {
-    expect(blockDeletePlan({ hasSessions: false, hasNote: false, event: undefined, canDeleteEvent: true })).toEqual({ kind: "delete" });
-    expect(blockDeletePlan({ hasSessions: false, hasNote: false, event: e, canDeleteEvent: false })).toEqual({ kind: "delete" });
+    expect(blockDeletePlan(base)).toEqual({ kind: "delete" });
+    expect(blockDeletePlan({ ...base, event: e, canDeleteEvent: false })).toEqual({ kind: "delete" });
   });
   it("an_empty_block_with_an_event_asks_which_to_delete", () => {
-    expect(blockDeletePlan({ hasSessions: false, hasNote: false, event: e, canDeleteEvent: true })).toEqual({ kind: "confirm", event: e });
+    expect(blockDeletePlan({ ...base, event: e })).toEqual({ kind: "confirm", event: e });
   });
-  it("a_block_with_sessions_or_a_note_is_refused_and_may_offer_deleting_the_event", () => {
-    expect(blockDeletePlan({ hasSessions: true, hasNote: true, event: e, canDeleteEvent: true })).toEqual({ kind: "refuse", reason: "sessions", event: e });
-    expect(blockDeletePlan({ hasSessions: false, hasNote: true, event: e, canDeleteEvent: true })).toEqual({ kind: "refuse", reason: "notes", event: e });
-    expect(blockDeletePlan({ hasSessions: false, hasNote: true, event: undefined, canDeleteEvent: true })).toEqual({ kind: "refuse", reason: "notes", event: null });
-    expect(blockDeletePlan({ hasSessions: true, hasNote: false, event: e, canDeleteEvent: false })).toEqual({ kind: "refuse", reason: "sessions", event: null });
+  it("a_block_with_sessions_or_a_note_asks_and_says_what_goes_too", () => {
+    expect(blockDeletePlan({ ...base, hasSessions: true, hasNote: true, event: e })).toEqual({ kind: "confirm-data", sessions: true, note: true, event: e });
+    expect(blockDeletePlan({ ...base, hasNote: true })).toEqual({ kind: "confirm-data", sessions: false, note: true, event: null });
+    expect(blockDeletePlan({ ...base, hasSessions: true, event: e, canDeleteEvent: false })).toEqual({ kind: "confirm-data", sessions: true, note: false, event: null });
+  });
+  it("a_block_whose_timer_runs_is_refused", () => {
+    expect(blockDeletePlan({ ...base, running: true, hasSessions: true, event: e })).toEqual({ kind: "refuse", reason: "running", event: e });
   });
 });
