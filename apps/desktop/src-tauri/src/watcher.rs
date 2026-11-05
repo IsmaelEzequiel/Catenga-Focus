@@ -246,6 +246,9 @@ mod tests {
     #[test]
     fn watcher_ignores_non_day_files_for_index() {
         let f = fixture();
+        // The fixture's year/month folders were just created; under load macOS can deliver
+        // those (rightly a Rescan) after watching starts. Drain them before the real check.
+        settle(&f);
         fs::write(f.store.root().join("config.json"), "{}").unwrap();
         fs::write(f.store.root().join(".catenga-tmp-x"), "x").unwrap();
         fs::remove_file(f.store.root().join(".catenga-tmp-x")).unwrap();
