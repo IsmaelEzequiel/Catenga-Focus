@@ -12,6 +12,7 @@
 ---
 
 [![Desktop](https://github.com/IsmaelEzequiel/Catenga-Focus/actions/workflows/desktop.yml/badge.svg)](https://github.com/IsmaelEzequiel/Catenga-Focus/actions/workflows/desktop.yml)
+[![CI](https://github.com/IsmaelEzequiel/Catenga-Focus/actions/workflows/ci.yml/badge.svg)](https://github.com/IsmaelEzequiel/Catenga-Focus/actions/workflows/ci.yml)
 
 ---
 
