@@ -183,6 +183,18 @@ export const calendarUpdate = (date: string, eventId: string, start: number, end
 /** Keeps the tags hidden on the event (the whole series for a repeating one); title and time are untouched. */
 export const calendarSetTags = (date: string, eventId: string, tags: string[]) =>
   invoke<CalEvent>("calendar_set_tags", { date, eventId, tags });
+/** How a block's event repeats: like Google's "Daily / Every weekday / Weekly on…". */
+export type RepeatFreq = "daily" | "weekdays" | "weekly";
+export interface Repeat {
+  freq: RepeatFreq;
+  /** For "weekly": 0 = Monday … 6 = Sunday */
+  days: number[];
+  /** Last day with an occurrence (YYYY-MM-DD, inclusive); null repeats forever */
+  until: string | null;
+}
+/** Makes a one-off event repeat in Google, then re-reads the day (the result arrives as "calendar-changed"). */
+export const calendarSetRepeat = (date: string, eventId: string, repeat: Repeat) =>
+  invoke<void>("calendar_set_repeat", { date, eventId, repeat });
 /** Deletes the event in Google Calendar (only that occurrence of a repeating series); already gone counts as done. */
 export const calendarDelete = (date: string, eventId: string) => invoke<void>("calendar_delete", { date, eventId });
 

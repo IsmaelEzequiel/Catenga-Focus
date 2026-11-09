@@ -744,6 +744,20 @@ impl Client {
             .await
     }
 
+    /// Turns a one-off event into a repeating series (`rule` is an `RRULE:` line). Only
+    /// `recurrence` is sent: time, title and hidden tags stay as they are on Google.
+    pub async fn set_recurrence(
+        &self,
+        (calendar_id, event_id): (&str, &str),
+        rule: &str,
+    ) -> Result<(), Error> {
+        let url = self.calendar_url(calendar_id, &["events", event_id])?;
+        let body = serde_json::json!({ "recurrence": [rule] });
+        self.call(Method::PATCH, url.as_str(), Some(&body))
+            .await
+            .map(drop)
+    }
+
     /// Deletes the event (for an instance id of a repeating series: only that occurrence).
     /// An event that is already gone (404/410) counts as deleted.
     pub async fn delete_event(&self, calendar_id: &str, event_id: &str) -> Result<(), Error> {
@@ -1066,6 +1080,19 @@ mod tests {
         assert!(
             !reqs[1].contains("extendedProperties"),
             "no tags, nothing hidden is sent on create"
+        );
+    }
+
+    #[test]
+    fn set_recurrence_patches_only_the_rule() {
+        let (base, seen) = fake_server(vec![tok("a"), (200, EVENT.to_string())]);
+        let c = client(&base, connected_store());
+        run(c.set_recurrence(("primary", "e1"), "RRULE:FREQ=DAILY")).unwrap();
+        let reqs = seen.lock().unwrap();
+        assert!(reqs[1].starts_with("PATCH /calendar/v3/calendars/primary/events/e1 "));
+        assert_eq!(
+            body_of(&reqs[1]),
+            serde_json::json!({"recurrence": ["RRULE:FREQ=DAILY"]})
         );
     }
 

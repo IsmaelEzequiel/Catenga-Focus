@@ -273,6 +273,7 @@ pub fn run() {
             google_commands::calendar_create,
             google_commands::calendar_update,
             google_commands::calendar_set_tags,
+            google_commands::calendar_set_repeat,
             google_commands::calendar_delete,
             google_commands::projects_refresh,
             google_commands::project_from_event,

@@ -4,6 +4,7 @@ import {
   calendarDelete,
   calendarDay,
   calendarRefresh,
+  calendarSetRepeat,
   calendarSetTags,
   calendarUpdate,
   onCalendarChanged,
@@ -11,6 +12,7 @@ import {
   onCalendarsChanged,
   onProjectsChanged,
   type CalEvent,
+  type Repeat,
 } from "../api";
 import { calendarOps, type CalBlock } from "../lib/calendar";
 
@@ -192,10 +194,29 @@ export function useCalendar(
     [setEvents],
   );
 
+  /** Makes a one-off event repeat (after the pending writes), then re-reads the day. Null when done, else why it failed. */
+  const repeat = useCallback(
+    (eventId: string, rule: Repeat): Promise<string | null> => {
+      const forDate = dateRef.current;
+      const run = chain.current.then(async () => {
+        try {
+          await calendarSetRepeat(forDate, eventId, rule);
+          await read(forDate);
+          return null;
+        } catch (e) {
+          return message(e);
+        }
+      });
+      chain.current = run.then(() => undefined);
+      return run;
+    },
+    [read],
+  );
+
   /** Re-reads the visible day from the cache (e.g. after an event became a project). */
   const reload = useCallback(() => read(dateRef.current), [read]);
 
   /** False until the cached events of `date` are read (always true when Google Calendar is off). */
   const loaded = !enabled || state?.date === date;
-  return { events: enabled && state?.date === date ? state.events : [], loaded, sync, remove, reload };
+  return { events: enabled && state?.date === date ? state.events : [], loaded, sync, remove, repeat, reload };
 }

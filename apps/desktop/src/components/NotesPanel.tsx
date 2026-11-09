@@ -6,6 +6,7 @@ import { bodyToNote } from "../lib/note";
 import { tagColorVar } from "../lib/tags";
 import { fmtMinutes } from "../lib/time";
 import { ProjectChip, type ProjectPanel } from "./ProjectChip";
+import { RepeatControl, type RepeatPanel } from "./RepeatControl";
 import { SessionsSummary, TimerBar, type TimerPanel } from "./TimerBar";
 import { Banner } from "./ui/Banner";
 import { Button } from "./ui/Button";
@@ -31,6 +32,7 @@ interface Props {
   onOpenHistory: (by: HistoryKind, value: string) => void;
   timer: TimerPanel;
   project: ProjectPanel;
+  repeat: RepeatPanel;
   tagColors: Record<string, string>;
   /** The block stands for a Google Calendar event. */
   fromCalendar: boolean;
@@ -86,7 +88,7 @@ export function NotesPanel(p: Props) {
           {p.fromCalendar && " · Google Calendar"}
         </span>
         <h2 className={title ? "notes__title" : "notes__title notes__title--empty"}>{title || "Untitled"}</h2>
-        {(block.tags.length > 0 || p.project.current || p.project.canMake) && (
+        {(block.tags.length > 0 || p.project.current || p.project.canMake || p.repeat.state !== "none") && (
           <div className="notes__chips">
             {block.tags.map((tag) => (
               <button
@@ -100,6 +102,7 @@ export function NotesPanel(p: Props) {
               </button>
             ))}
             <ProjectChip panel={p.project} />
+            <RepeatControl key={block.key} panel={p.repeat} />
           </div>
         )}
       </header>

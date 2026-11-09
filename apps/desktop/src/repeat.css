@@ -1,0 +1,105 @@
+/* "Repeat" on a block's Google event, in the notes panel's chip row (components/RepeatControl.tsx). */
+.repeatchip {
+  height: 22px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 var(--space-2);
+  border-radius: 999px;
+  background: var(--color-bg);
+  font-size: var(--text-xs);
+  color: var(--color-ink-muted);
+  white-space: nowrap;
+}
+
+.repeatchip__icon {
+  width: 12px;
+  height: 12px;
+}
+
+.repeatchip__open {
+  height: 22px;
+  padding: 0 var(--space-2);
+}
+
+/* The form takes a line of its own under the chips. */
+.repeat {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+}
+
+.repeat__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.repeat__label {
+  width: 52px;
+  font-size: var(--text-xs);
+  color: var(--color-ink-muted);
+}
+
+.repeat__days {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.repeat__day {
+  width: var(--control-sm);
+  height: var(--control-sm);
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  background: none;
+  color: var(--color-ink-muted);
+  font: 500 var(--text-xs) var(--font-body);
+  cursor: pointer;
+}
+
+.repeat__day:hover {
+  background: var(--color-hover);
+  color: var(--color-ink);
+}
+
+.repeat__day[aria-pressed="true"] {
+  border-color: var(--color-sun-ink);
+  background: var(--color-sun-tint);
+  color: var(--color-ink);
+  font-weight: 600;
+}
+
+.repeat__day:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.repeat__date {
+  height: var(--control-sm);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.repeat__note {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-ink-muted);
+}
+
+.repeat__note--error {
+  color: var(--color-danger);
+}
+
+.repeat__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
