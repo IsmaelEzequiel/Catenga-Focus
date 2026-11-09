@@ -31,7 +31,7 @@ import { useTimerSetup } from "./hooks/useTimerSetup";
 import { defaultPlan, loadPlan, safeStorage } from "./lib/focus";
 import { findGoalBlock, newGoalBlock } from "./lib/goalPlay";
 import { goalSubjectText, matchesGoal } from "./lib/goals";
-import { matchBlocks } from "./lib/calendar";
+import { isSeriesInstance, matchBlocks } from "./lib/calendar";
 import { startNowTarget } from "./lib/startNow";
 import { settleNotes } from "./lib/lifecycle";
 import { applyNotesFolder } from "./lib/notesFolder";
@@ -922,6 +922,11 @@ function App() {
                 }}
                 tagColors={tagColors}
                 fromCalendar={selectedEvent !== undefined}
+                repeat={{
+                  state: !selectedEvent ? "none" : isSeriesInstance(selectedEvent) ? "series" : "one-off",
+                  date,
+                  onRepeat: (rule) => (selectedEvent ? calendar.repeat(selectedEvent.id, rule) : Promise.resolve("this block has no Google event")),
+                }}
                 nowTarget={nowItem}
                 onOpenNow={openNow}
                 project={{

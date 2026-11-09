@@ -1216,6 +1216,54 @@ pub async fn calendar_set_tags(
     set_event_tags(&google, &index, &db, (&date, &event_id), &tags).await
 }
 
+/// Makes a one-off event repeat (`docs/plans/M16-repeat.md`). An occurrence of a series
+/// is refused: its series is edited in Google Calendar.
+async fn set_event_repeat(
+    google: &GoogleState,
+    index: &IndexHandle,
+    db: &AppDbHandle,
+    (date, event_id): (&str, &str),
+    repeat: &google::Repeat,
+) -> Result<(), String> {
+    check_date(date)?;
+    if event_id.is_empty() {
+        return Err("missing event id".into());
+    }
+    let cached = google
+        .cache_get(index, date)
+        .and_then(|(events, _)| events.into_iter().find(|e| e.id == event_id))
+        .ok_or("Event not found; refresh the day and try again")?;
+    if cached.recurring_event_id.is_some() {
+        return Err("This event already repeats; change its series in Google Calendar".into());
+    }
+    let rule = google::recurrence_rule(repeat, date, &TimeZone::system())?;
+    let (account, calendar) = route(google, index, db, date, event_id)?;
+    account
+        .client
+        .set_recurrence((&calendar, event_id), &rule)
+        .await
+        .map_err(|e| google.describe(&e))
+}
+
+/// Makes the event repeat, then re-reads the day from Google: the day's occurrence
+/// now has an instance id, and the timeline must link the block to it.
+#[tauri::command]
+pub async fn calendar_set_repeat(
+    app: AppHandle,
+    date: String,
+    event_id: String,
+    repeat: google::Repeat,
+) -> Result<(), String> {
+    let (google, index, db) = (
+        app.state::<GoogleState>(),
+        app.state::<IndexHandle>(),
+        app.state::<AppDbHandle>(),
+    );
+    set_event_repeat(&google, &index, &db, (&date, &event_id), &repeat).await?;
+    refresh_day(&app, &google, &index, &db, &date).await;
+    Ok(())
+}
+
 async fn delete_event(
     google: &GoogleState,
     index: &IndexHandle,
@@ -2893,6 +2941,74 @@ mod tests {
                 .tags
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn repeat_patches_the_one_off_event_in_its_own_calendar() {
+        let (base, seen) = fake_server(vec![tok_as("tokA"), (200, "{}".to_string())]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let index = no_index();
+        state.cache_put(&index, "2026-10-21", &[ev_in("one", "a@x")], 7);
+        let daily = google::Repeat {
+            freq: google::RepeatFreq::Daily,
+            days: vec![],
+            until: None,
+        };
+        run(set_event_repeat(
+            &state,
+            &index,
+            &db,
+            ("2026-10-21", "one"),
+            &daily,
+        ))
+        .unwrap();
+        let reqs = seen.lock().unwrap();
+        assert!(
+            reqs[1].starts_with("PATCH /calendar/v3/calendars/a@x/events/one "),
+            "{}",
+            reqs[1]
+        );
+        assert_eq!(auth_of(&reqs[1]), "toka");
+        assert_eq!(
+            body_json(&reqs[1]),
+            serde_json::json!({"recurrence": ["RRULE:FREQ=DAILY"]})
+        );
+    }
+
+    #[test]
+    fn repeat_refuses_occurrences_unknown_events_and_bad_rules() {
+        let (base, seen) = fake_server(vec![]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let index = no_index();
+        let mut instance = ev_in("s1_2026", "a@x");
+        instance.recurring_event_id = Some("s1".into());
+        state.cache_put(&index, "2026-10-21", &[instance, ev_in("one", "a@x")], 7);
+        let weekly_none = google::Repeat {
+            freq: google::RepeatFreq::Weekly,
+            days: vec![],
+            until: None,
+        };
+        let daily = google::Repeat {
+            freq: google::RepeatFreq::Daily,
+            days: vec![],
+            until: None,
+        };
+        let err = |id: &str, r: &google::Repeat| {
+            run(set_event_repeat(&state, &index, &db, ("2026-10-21", id), r)).unwrap_err()
+        };
+        assert_eq!(
+            err("s1_2026", &daily),
+            "This event already repeats; change its series in Google Calendar"
+        );
+        assert_eq!(
+            err("nope", &daily),
+            "Event not found; refresh the day and try again"
+        );
+        assert_eq!(
+            err("one", &weekly_none),
+            "pick at least one day of the week"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing reaches Google");
     }
 
     #[test]

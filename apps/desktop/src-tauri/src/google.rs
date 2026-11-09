@@ -502,8 +502,132 @@ pub fn event_body(
     Ok(body)
 }
 
+/// How often a block's event repeats, as the frontend sends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepeatFreq {
+    Daily,
+    /// Monday to Friday.
+    Weekdays,
+    /// On the chosen `days`.
+    Weekly,
+}
+
+/// A repeat rule for an event: like Google Calendar's "Daily / Every weekday / Weekly on…",
+/// ending never or on a date.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Repeat {
+    pub freq: RepeatFreq,
+    /// Days of the week for `weekly`: 0 = Monday … 6 = Sunday.
+    #[serde(default)]
+    pub days: Vec<u8>,
+    /// Last day with an occurrence (`YYYY-MM-DD`, inclusive); `None` repeats forever.
+    #[serde(default)]
+    pub until: Option<String>,
+}
+
+const BYDAY: [&str; 7] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
+
+/// The `RRULE:` line for an event that first happens on `date`. `UNTIL` is the end of the
+/// last day in `tz`, in UTC (RFC 5545 wants UTC for a zoned start).
+pub fn recurrence_rule(repeat: &Repeat, date: &str, tz: &TimeZone) -> Result<String, String> {
+    let first = parse_date(date)?;
+    let mut rule = match repeat.freq {
+        RepeatFreq::Daily => "RRULE:FREQ=DAILY".to_string(),
+        RepeatFreq::Weekdays => "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR".to_string(),
+        RepeatFreq::Weekly => {
+            let mut days = repeat.days.clone();
+            days.sort_unstable();
+            days.dedup();
+            if days.is_empty() || days.iter().any(|d| *d > 6) {
+                return Err("pick at least one day of the week".into());
+            }
+            let names: Vec<&str> = days.iter().map(|d| BYDAY[usize::from(*d)]).collect();
+            format!("RRULE:FREQ=WEEKLY;BYDAY={}", names.join(","))
+        }
+    };
+    if let Some(until) = &repeat.until {
+        let last = parse_date(until)?;
+        if last < first {
+            return Err("the end date is before the block's day".into());
+        }
+        let end = last
+            .at(23, 59, 59, 0)
+            .to_zoned(tz.clone())
+            .map_err(|e| e.to_string())?
+            .timestamp();
+        rule.push_str(&format!(";UNTIL={}", end.strftime("%Y%m%dT%H%M%SZ")));
+    }
+    Ok(rule)
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn repeat(freq: RepeatFreq, days: &[u8], until: Option<&str>) -> Repeat {
+        Repeat {
+            freq,
+            days: days.to_vec(),
+            until: until.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn recurrence_rules_like_google_offers() {
+        let rule = |r: Repeat| recurrence_rule(&r, "2026-11-09", &sp()).unwrap();
+        assert_eq!(
+            rule(repeat(RepeatFreq::Daily, &[], None)),
+            "RRULE:FREQ=DAILY"
+        );
+        assert_eq!(
+            rule(repeat(RepeatFreq::Weekdays, &[], None)),
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
+        );
+        assert_eq!(
+            rule(repeat(RepeatFreq::Weekly, &[4, 0, 2, 0], None)),
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR",
+            "days sorted and deduplicated"
+        );
+    }
+
+    #[test]
+    fn recurrence_until_is_the_end_of_the_last_local_day_in_utc() {
+        let r = repeat(RepeatFreq::Daily, &[], Some("2026-12-31"));
+        // 23:59:59 in São Paulo (UTC−3) is 02:59:59 UTC the next day.
+        assert_eq!(
+            recurrence_rule(&r, "2026-11-09", &sp()).unwrap(),
+            "RRULE:FREQ=DAILY;UNTIL=20270101T025959Z"
+        );
+        // The same day as the block is allowed: a single occurrence.
+        let same = repeat(RepeatFreq::Daily, &[], Some("2026-11-09"));
+        assert!(recurrence_rule(&same, "2026-11-09", &sp()).is_ok());
+    }
+
+    #[test]
+    fn recurrence_rejects_bad_input() {
+        let bad = |r: Repeat| recurrence_rule(&r, "2026-11-09", &sp()).is_err();
+        assert!(
+            bad(repeat(RepeatFreq::Weekly, &[], None)),
+            "weekly needs a day"
+        );
+        assert!(bad(repeat(RepeatFreq::Weekly, &[7], None)), "no eighth day");
+        assert!(
+            bad(repeat(RepeatFreq::Daily, &[], Some("2026-11-08"))),
+            "ends before it starts"
+        );
+        assert!(bad(repeat(RepeatFreq::Daily, &[], Some("31/12/2026"))));
+    }
+
+    #[test]
+    fn repeat_deserializes_from_the_frontend_shape() {
+        let r: Repeat =
+            serde_json::from_str(r#"{"freq":"weekly","days":[1,3],"until":null}"#).unwrap();
+        assert_eq!(r, repeat(RepeatFreq::Weekly, &[1, 3], None));
+        let r: Repeat = serde_json::from_str(r#"{"freq":"daily"}"#).unwrap();
+        assert_eq!(r, repeat(RepeatFreq::Daily, &[], None));
+    }
+
     use super::*;
 
     fn sp() -> TimeZone {
