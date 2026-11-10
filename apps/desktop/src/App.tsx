@@ -42,6 +42,7 @@ import { blockProject, blockProjectKey, canMakeProject } from "./lib/projects";
 import { resolveBlockKey, type BlockTarget } from "./lib/search";
 import { sameBlock, sessionRelinks, toBlockRef } from "./lib/timer";
 import { addDays, fmtMinutes, toDateString } from "./lib/time";
+import { repeatRequest, weekdayOf } from "./lib/repeat";
 
 const IS_MAC = navigator.userAgent.includes("Mac");
 
@@ -90,6 +91,8 @@ function App() {
   const calendar = useCalendar(date, google.status?.connected ?? false, calendarMinutes, onNotice, google.recheck);
   const calendarRef = useRef(calendar);
   calendarRef.current = calendar;
+  const googleConnectedRef = useRef(false);
+  googleConnectedRef.current = google.status?.connected ?? false;
 
   const timer = useTimer(onNotice);
   const timerRef = useRef(timer);
@@ -650,6 +653,13 @@ function App() {
       const block: UiBlock = { key: crypto.randomUUID(), start: b.start, end: b.end, title: b.title, tags: b.tags, body: "" };
       // Same path as a block made on the grid: saved to the day file, then the Google event is created.
       commitBlocks([...dayRef.current.blocks, block]);
+      // `9-10 x daily`: the event is made to repeat once it exists ("weekly" alone = the block's weekday).
+      if (b.repeat && googleConnectedRef.current) {
+        const rule = { freq: b.repeat.freq, days: b.repeat.days.length > 0 ? b.repeat.days : [weekdayOf(dateRef.current)], until: null };
+        void calendarRef.current
+          .repeat({ start: b.start, end: b.end, title: b.title.trim() }, repeatRequest(rule))
+          .then((err) => err && setNotice(`Couldn't make it repeat: ${err}`));
+      }
       onSelect(block.key);
       setReveal((r) => ({ minute: b.start, token: (r?.token ?? 0) + 1 }));
       setQuickAddOpen(false);
@@ -865,6 +875,7 @@ function App() {
                     isToday={date === toDateString(now)}
                     loaded={day.loaded}
                     knownTags={Object.keys(tagColors)}
+                    canRepeat={google.status?.connected ?? false}
                     onPreview={setQuickPreview}
                     onAdd={addQuickBlock}
                     onClose={() => setQuickAddOpen(false)}
@@ -923,9 +934,21 @@ function App() {
                 tagColors={tagColors}
                 fromCalendar={selectedEvent !== undefined}
                 repeat={{
-                  state: !selectedEvent ? "none" : isSeriesInstance(selectedEvent) ? "series" : "one-off",
+                  // A block whose event is still being created can already be made to repeat (M16).
+                  state: selectedEvent
+                    ? isSeriesInstance(selectedEvent)
+                      ? "series"
+                      : "one-off"
+                    : selectedBlock && calendar.creating.has(selectedBlock.key)
+                      ? "one-off"
+                      : "none",
                   date,
-                  onRepeat: (rule) => (selectedEvent ? calendar.repeat(selectedEvent.id, rule) : Promise.resolve("this block has no Google event")),
+                  onRepeat: (rule) =>
+                    selectedEvent
+                      ? calendar.repeat(selectedEvent.id, rule)
+                      : selectedBlock
+                        ? calendar.repeat({ start: selectedBlock.start, end: selectedBlock.end, title: selectedBlock.title.trim() }, rule)
+                        : Promise.resolve("this block has no Google event"),
                 }}
                 nowTarget={nowItem}
                 onOpenNow={openNow}

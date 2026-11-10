@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blockDeletePlan, calendarOps, ghostEvents, isSeriesInstance, matchBlocks, sameTags, type CalBlock, type CalEvent } from "./calendar";
+import { blockDeletePlan, calendarOps, ghostEvents, isSeriesInstance, matchBlocks, oneOffEventFor, sameTags, type CalBlock, type CalEvent } from "./calendar";
 
 const block = (key: string, start: number, end: number, title: string, tags: string[] = []): CalBlock => ({ key, start, end, title, tags });
 const event = (id: string, start: number, end: number, title: string, tags: string[] = []): CalEvent => ({ id, start, end, title, tags, projectKey: null, projectId: null, color: "#3d6fb6" });
@@ -200,5 +200,15 @@ describe("blockDeletePlan", () => {
   });
   it("a_block_whose_timer_runs_is_refused", () => {
     expect(blockDeletePlan({ ...base, running: true, hasSessions: true, event: e })).toEqual({ kind: "refuse", reason: "running", event: e });
+  });
+});
+
+describe("oneOffEventFor", () => {
+  it("finds_the_one_off_event_of_a_slot_and_skips_series_occurrences", () => {
+    const series = { ...event("s_1", 540, 600, "Rust"), projectKey: "series:s" };
+    const created = event("e1", 540, 600, "Rust");
+    expect(oneOffEventFor({ start: 540, end: 600, title: "Rust " }, [series, created])?.id).toBe("e1");
+    expect(oneOffEventFor({ start: 540, end: 600, title: "Rust" }, [series])).toBeUndefined();
+    expect(oneOffEventFor({ start: 540, end: 630, title: "Rust" }, [created])).toBeUndefined();
   });
 });

@@ -81,3 +81,31 @@ describe("parseQuickAdd", () => {
     expect(parseQuickAdd("9-10 · ")).toEqual({ error: "Add a title after the time range" });
   });
 });
+
+describe("parseQuickAdd repeat (M16)", () => {
+  it("takes_a_trailing_daily_or_weekdays", () => {
+    expect(parseQuickAdd("9-10 deep work #mestrado daily")).toEqual({ ...ok(540, 600, "deep work", ["mestrado"]), repeat: { freq: "daily", days: [] } });
+    expect(parseQuickAdd("9-10 deep work weekdays")).toEqual({ ...ok(540, 600, "deep work"), repeat: { freq: "weekdays", days: [] } });
+    expect(parseQuickAdd("9-10 inglês diário")).toEqual({ ...ok(540, 600, "inglês"), repeat: { freq: "daily", days: [] } });
+  });
+
+  it("takes_weekly_with_english_or_portuguese_days_in_order", () => {
+    expect(parseQuickAdd("9-10 inglês weekly qua seg")).toEqual({ ...ok(540, 600, "inglês"), repeat: { freq: "weekly", days: [0, 2] } });
+    expect(parseQuickAdd("9-10 gym weekly Mon, Fri")).toEqual({ ...ok(540, 600, "gym"), repeat: { freq: "weekly", days: [0, 4] } });
+  });
+
+  it("weekly_without_days_leaves_them_empty_for_the_blocks_weekday", () => {
+    expect(parseQuickAdd("9-10 review semanal")).toEqual({ ...ok(540, 600, "review"), repeat: { freq: "weekly", days: [] } });
+  });
+
+  it("is_only_a_repeat_at_the_end_and_never_the_whole_title", () => {
+    expect(parseQuickAdd("9-10 daily standup")).toEqual(ok(540, 600, "daily standup"));
+    expect(parseQuickAdd("9-10 daily")).toEqual(ok(540, 600, "daily"));
+    expect(parseQuickAdd("9-10 weekly seg")).toEqual(ok(540, 600, "weekly seg"));
+  });
+
+  it("days_only_go_with_weekly", () => {
+    expect(parseQuickAdd("9-10 aula daily seg")).toEqual(ok(540, 600, "aula daily seg"));
+    expect(parseQuickAdd("9-10 aula qua")).toEqual(ok(540, 600, "aula qua"));
+  });
+});
