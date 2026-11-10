@@ -73,6 +73,10 @@ export function calendarOps<B extends CalBlock>(prev: B[], next: B[], events: Ca
 /** An occurrence of a repeating series: deleting it removes only that occurrence in Google. */
 export const isSeriesInstance = (e: CalEvent): boolean => e.projectKey?.startsWith("series:") ?? false;
 
+/** The one-off event standing for a block's slot (start, end, title), e.g. the one just created for it. */
+export const oneOffEventFor = (slot: Range & { title: string }, events: CalEvent[]): CalEvent | undefined =>
+  events.find((e) => !isSeriesInstance(e) && sameSlot({ ...slot, key: "", tags: [] }, e));
+
 export type BlockDeletePlan =
   | { kind: "delete" }
   | { kind: "confirm"; event: CalEvent }

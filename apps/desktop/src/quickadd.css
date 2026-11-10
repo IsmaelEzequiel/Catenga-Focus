@@ -82,6 +82,10 @@
   color: var(--color-ink-muted);
 }
 
+.quickadd__repeat {
+  color: var(--color-sun-ink);
+}
+
 .quickadd__new {
   color: var(--color-sun-ink);
 }

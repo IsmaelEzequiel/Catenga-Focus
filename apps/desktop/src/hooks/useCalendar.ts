@@ -14,7 +14,8 @@ import {
   type CalEvent,
   type Repeat,
 } from "../api";
-import { calendarOps, type CalBlock } from "../lib/calendar";
+import { calendarOps, oneOffEventFor, type CalBlock } from "../lib/calendar";
+import type { Range } from "../lib/time";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -33,6 +34,8 @@ export function useCalendar(
   onRefreshFailed: () => void,
 ) {
   const [state, setState] = useState<{ date: string; events: CalEvent[] } | null>(null);
+  /** Keys of blocks whose Google event is being created: they can already be made to repeat (M16). */
+  const [creating, setCreating] = useState<ReadonlySet<string>>(new Set());
   const dateRef = useRef(date);
   dateRef.current = date;
   const enabledRef = useRef(enabled);
@@ -149,6 +152,7 @@ export function useCalendar(
             eventsRef.current.map((e) => (e.id === eventId ? { ...e, tags: block.tags } : e)),
           );
         }
+        if (op.kind === "create") setCreating((s) => new Set(s).add(op.block.key));
         chain.current = chain.current.then(async () => {
           try {
             const { block } = op;
@@ -164,6 +168,13 @@ export function useCalendar(
             noticeRef.current(`Couldn't update Google Calendar: ${message(e)}`);
             // Drop the optimistic change.
             if (op.kind !== "create") await read(forDate);
+          } finally {
+            if (op.kind === "create")
+              setCreating((s) => {
+                const next = new Set(s);
+                next.delete(op.block.key);
+                return next;
+              });
           }
         });
       }
@@ -194,12 +205,17 @@ export function useCalendar(
     [setEvents],
   );
 
-  /** Makes a one-off event repeat (after the pending writes), then re-reads the day. Null when done, else why it failed. */
+  /**
+   * Makes a one-off event repeat (after the pending writes), then re-reads the day. Null when done, else why it failed.
+   * `target` is the event id, or the slot of a block whose event is still being created (found once the create is done).
+   */
   const repeat = useCallback(
-    (eventId: string, rule: Repeat): Promise<string | null> => {
+    (target: string | (Range & { title: string }), rule: Repeat): Promise<string | null> => {
       const forDate = dateRef.current;
       const run = chain.current.then(async () => {
         try {
+          const eventId = typeof target === "string" ? target : oneOffEventFor(target, eventsRef.current)?.id;
+          if (!eventId) return "this block isn't in Google Calendar yet";
           await calendarSetRepeat(forDate, eventId, rule);
           await read(forDate);
           return null;
@@ -218,5 +234,5 @@ export function useCalendar(
 
   /** False until the cached events of `date` are read (always true when Google Calendar is off). */
   const loaded = !enabled || state?.date === date;
-  return { events: enabled && state?.date === date ? state.events : [], loaded, sync, remove, repeat, reload };
+  return { events: enabled && state?.date === date ? state.events : [], loaded, creating, sync, remove, repeat, reload };
 }

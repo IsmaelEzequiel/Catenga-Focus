@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { PlusIcon } from "@heroicons/react/20/solid";
 import { parseQuickAdd, type QuickAdd as Parsed } from "../lib/quickAdd";
+import { describeRepeat, weekdayOf } from "../lib/repeat";
 import { fmtDateShort, fmtMinutes } from "../lib/time";
 import "../quickadd.css";
 
@@ -11,6 +12,8 @@ interface Props {
   loaded: boolean;
   /** Tags that already exist; any other tag in the text is flagged "new tag" in the preview. */
   knownTags?: string[];
+  /** Google Calendar is connected: a trailing `daily` / `weekdays` / `weekly …` makes the event repeat. */
+  canRepeat?: boolean;
   /** Called whenever the parsed time range changes: `null` when the text doesn't parse and when the bar closes. */
   onPreview?: (range: { start: number; end: number } | null) => void;
   onAdd: (block: Parsed) => void;
@@ -23,6 +26,7 @@ export function QuickAdd({
   isToday,
   loaded,
   knownTags,
+  canRepeat = false,
   onPreview,
   onAdd,
   onClose,
@@ -121,12 +125,23 @@ export function QuickAdd({
                   )}
                 </span>
               ))}
+              {ok.repeat && (
+                <span className="quickadd__repeat">
+                  {canRepeat
+                    ? describeRepeat({
+                        freq: ok.repeat.freq,
+                        days: ok.repeat.days.length > 0 ? ok.repeat.days : [weekdayOf(date)],
+                        until: null,
+                      })
+                    : "Repeat needs Google Calendar"}
+                </span>
+              )}
             </span>
           ) : parseError ? (
             <span className="quickadd__hint">{parseError}</span>
           ) : (
             <span className="quickadd__hint">
-              Type a time range, a title and #tags
+              Type a time range, a title and #tags; end with daily, weekdays or weekly mon wed to repeat
             </span>
           )}
         </div>

@@ -40,8 +40,14 @@ export function RepeatControl({ panel }: { panel: RepeatPanel }) {
 
   if (!draft) {
     return (
-      <Button size="sm" variant="ghost" icon={ArrowPathIcon} className="repeatchip__open" onClick={() => setDraft(defaultRepeat(panel.date))}>
-        Repeat
+      <Button
+        size="sm"
+        icon={ArrowPathIcon}
+        className="repeatchip__open"
+        title="Make this block's Google event repeat"
+        onClick={() => setDraft(defaultRepeat(panel.date))}
+      >
+        Does not repeat
       </Button>
     );
   }
