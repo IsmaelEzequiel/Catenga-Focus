@@ -119,6 +119,7 @@ describe("reconnect hints", () => {
     connected: true,
     accounts: [],
     newEventCalendarId: null,
+    newEventReminder: { kind: "default" },
     needsReconnect: false,
     ...over,
   });

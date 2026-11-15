@@ -461,6 +461,49 @@ pub fn tags_patch(tags: &[String]) -> Value {
     json!({ "extendedProperties": { "private": { TAGS_PROPERTY: tags_value(tags) } } })
 }
 
+/// The longest reminder Google accepts: 4 weeks before the event.
+const MAX_REMINDER_MINUTES: u32 = 40_320;
+
+/// The notifications an event created by the app gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Reminder {
+    /// Whatever the calendar's own defaults are in Google.
+    #[default]
+    Default,
+    None,
+    /// One notification (no email) this long before the start.
+    Popup {
+        minutes: u32,
+    },
+}
+
+impl Reminder {
+    /// The text kept in the app database.
+    pub fn to_saved(self) -> String {
+        serde_json::to_string(&self).unwrap_or_default()
+    }
+
+    /// Reads `to_saved`; nothing saved, or text this build doesn't know, is Google's default.
+    pub fn from_saved(saved: Option<&str>) -> Self {
+        saved
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// The `reminders` of a new event; `None` leaves it out, so Google applies the calendar's defaults.
+pub fn reminders_body(reminder: Reminder) -> Option<Value> {
+    let overrides = match reminder {
+        Reminder::Default => return None,
+        Reminder::None => json!([]),
+        Reminder::Popup { minutes } => {
+            json!([{ "method": "popup", "minutes": minutes.min(MAX_REMINDER_MINUTES) }])
+        }
+    };
+    Some(json!({ "useDefault": false, "overrides": overrides }))
+}
+
 fn wall_clock(day: Date, minutes: u32) -> Result<jiff::civil::DateTime, String> {
     day.at(0, 0, 0, 0)
         .checked_add(SignedDuration::from_mins(i64::from(minutes)))
@@ -968,6 +1011,58 @@ mod tests {
         assert_eq!(b["extendedProperties"]["private"]["catengaTags"], "");
         let b = event_body("2026-10-21", 540, 600, "X", None, &sp()).unwrap();
         assert!(b.get("extendedProperties").is_none());
+    }
+
+    #[test]
+    fn reminders_body_is_absent_for_googles_default() {
+        assert_eq!(reminders_body(Reminder::Default), None);
+    }
+
+    #[test]
+    fn reminders_body_for_none_turns_the_defaults_off() {
+        assert_eq!(
+            reminders_body(Reminder::None),
+            Some(json!({"useDefault": false, "overrides": []}))
+        );
+    }
+
+    #[test]
+    fn reminders_body_for_a_notification_has_one_popup_and_no_email() {
+        assert_eq!(
+            reminders_body(Reminder::Popup { minutes: 10 }),
+            Some(json!({"useDefault": false, "overrides": [{"method": "popup", "minutes": 10}]}))
+        );
+    }
+
+    #[test]
+    fn reminders_body_keeps_the_minutes_within_googles_limit() {
+        let body = reminders_body(Reminder::Popup { minutes: 99_999 }).unwrap();
+        assert_eq!(body["overrides"][0]["minutes"], 40_320);
+    }
+
+    #[test]
+    fn reminder_is_saved_as_text_and_anything_else_reads_as_the_default() {
+        for r in [
+            Reminder::Default,
+            Reminder::None,
+            Reminder::Popup { minutes: 15 },
+        ] {
+            assert_eq!(Reminder::from_saved(Some(&r.to_saved())), r);
+        }
+        assert_eq!(Reminder::from_saved(None), Reminder::Default);
+        assert_eq!(Reminder::from_saved(Some("garbage")), Reminder::Default);
+    }
+
+    #[test]
+    fn reminder_reaches_the_frontend_tagged_by_kind() {
+        assert_eq!(
+            serde_json::to_value(Reminder::Popup { minutes: 5 }).unwrap(),
+            json!({"kind": "popup", "minutes": 5})
+        );
+        assert_eq!(
+            serde_json::to_value(Reminder::None).unwrap(),
+            json!({"kind": "none"})
+        );
     }
 
     #[test]

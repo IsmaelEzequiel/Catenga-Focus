@@ -1,6 +1,8 @@
 import { CalendarIcon } from "@heroicons/react/20/solid";
-import type { Calendar, GoogleStatus } from "../api";
+import { useState } from "react";
+import type { Calendar, GoogleStatus, Reminder } from "../api";
 import { calendarGroups, newEventGroups } from "../lib/calendars";
+import { MAX_REMINDER_MINUTES, reminderMinutes, reminderOfKind } from "../lib/reminders";
 import { canReconnect, projectStyle } from "../lib/projects";
 import { ProjectDot } from "./ProjectPicker";
 import { ErrorBanner, Row } from "./settingsParts";
@@ -20,10 +22,61 @@ interface Props {
   onCancel: () => void;
   onDisconnect: (email: string) => void;
   onSetNewEventCalendar: (googleCalendarId: string) => void;
+  onSetNewEventReminder: (reminder: Reminder) => void;
   onSetShown: (id: number, shown: boolean) => void;
 }
 
-/** Google accounts (several), where new blocks go, and the calendars that feed the timeline, grouped by account. */
+/** The notifications of events the app creates: Google's defaults, none, or one notification N minutes before. */
+function ReminderField({ reminder, onChange }: { reminder: Reminder; onChange: (reminder: Reminder) => void }) {
+  // What is being typed; saved as soon as it is a valid number of minutes.
+  const [minutes, setMinutes] = useState(reminder.kind === "popup" ? String(reminder.minutes) : "");
+  const pick = (kind: string) => {
+    const next = reminderOfKind(kind, reminder);
+    if (next.kind === "popup") setMinutes(String(next.minutes));
+    onChange(next);
+  };
+  const type = (text: string) => {
+    setMinutes(text);
+    const n = reminderMinutes(text);
+    if (n !== null) onChange({ kind: "popup", minutes: n });
+  };
+  return (
+    <div className="field projtags__field">
+      <label className="field__label" htmlFor="settings-new-event-reminder">
+        Notifications for new events
+      </label>
+      <div className="projtags__reminder">
+        <select
+          id="settings-new-event-reminder"
+          className="field__input"
+          value={reminder.kind}
+          onChange={(e) => pick(e.target.value)}
+        >
+          <option value="default">Google's default</option>
+          <option value="none">None</option>
+          <option value="popup">Notification before it starts</option>
+        </select>
+        {reminder.kind === "popup" && (
+          <>
+            <input
+              className="field__input projtags__minutes"
+              type="number"
+              min={0}
+              max={MAX_REMINDER_MINUTES}
+              value={minutes}
+              onChange={(e) => type(e.target.value)}
+              aria-label="Minutes before the event"
+            />
+            <span className="field__hint">minutes before</span>
+          </>
+        )}
+      </div>
+      <span className="field__hint">Applies to events created here from now on.</span>
+    </div>
+  );
+}
+
+/** Google accounts (several), where new blocks go, their notifications, and the calendars that feed the timeline, grouped by account. */
 export function CalendarsPane(p: Props) {
   const status = p.status;
   if (!status) return null;
@@ -104,6 +157,8 @@ export function CalendarsPane(p: Props) {
           </select>
         </div>
       )}
+
+      {status.connected && <ReminderField reminder={status.newEventReminder} onChange={p.onSetNewEventReminder} />}
 
       <div className="card card--flush">
         <header className="card__head">

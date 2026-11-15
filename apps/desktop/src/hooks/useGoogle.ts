@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { googleCancelConnect, googleConnect, googleDisconnect, googleSetNewEventCalendar, googleStatus, onCalendarsChanged, onProjectsChanged, type GoogleStatus } from "../api";
+import { googleCancelConnect, googleConnect, googleDisconnect, googleSetNewEventCalendar, googleSetNewEventReminder, googleStatus, onCalendarsChanged, onProjectsChanged, type GoogleStatus, type Reminder } from "../api";
 import { createPkce, randomState } from "../lib/pkce";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -102,5 +102,15 @@ export function useGoogle() {
     }
   }, []);
 
-  return { status, connecting, error, connect, cancel, disconnect, setNewEventCalendar, recheck };
+  /** Chooses the notifications events created by the app get. */
+  const setNewEventReminder = useCallback(async (reminder: Reminder) => {
+    setError(null);
+    try {
+      setStatus(await googleSetNewEventReminder(reminder));
+    } catch (e) {
+      setError(message(e));
+    }
+  }, []);
+
+  return { status, connecting, error, connect, cancel, disconnect, setNewEventCalendar, setNewEventReminder, recheck };
 }

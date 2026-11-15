@@ -2,7 +2,7 @@
 //! tests run against a local fake server. The refresh token lives in the OS keychain,
 //! the access token only in memory.
 
-use crate::google::{self, CalEvent, CalendarInfo, SeriesInfo, TokenError, Tokens};
+use crate::google::{self, CalEvent, CalendarInfo, Reminder, SeriesInfo, TokenError, Tokens};
 use jiff::tz::TimeZone;
 use keyring::Entry;
 use reqwest::Method;
@@ -663,19 +663,23 @@ impl Client {
         Ok(events)
     }
 
-    /// Creates a timed event; `tags` (when any) are kept hidden on it.
+    /// Creates a timed event; `tags` (when any) are kept hidden on it, and `reminder`
+    /// replaces the calendar's default notifications unless it is `Reminder::Default`.
     pub async fn create_event(
         &self,
         calendar_id: &str,
         date: &str,
         (start, end): (u32, u32),
         title: &str,
-        tags: &[String],
+        (tags, reminder): (&[String], Reminder),
         tz: &TimeZone,
     ) -> Result<CalEvent, Error> {
         let tags = (!tags.is_empty()).then_some(tags);
-        let payload =
+        let mut payload =
             google::event_body(date, start, end, title, tags, tz).map_err(Error::Message)?;
+        if let Some(reminders) = google::reminders_body(reminder) {
+            payload["reminders"] = reminders;
+        }
         let url = self.calendar_url(calendar_id, &["events"])?;
         let body = self
             .call(Method::POST, url.as_str(), Some(&payload))
@@ -1070,8 +1074,15 @@ mod tests {
     fn create_posts_the_body_and_returns_the_event() {
         let (base, seen) = fake_server(vec![tok("a"), (200, EVENT.to_string())]);
         let c = client(&base, connected_store());
-        let e = run(c.create_event("primary", "2026-10-21", (540, 600), "Deep work", &[], &tz()))
-            .unwrap();
+        let e = run(c.create_event(
+            "primary",
+            "2026-10-21",
+            (540, 600),
+            "Deep work",
+            (&[], Reminder::Default),
+            &tz(),
+        ))
+        .unwrap();
         assert_eq!((e.id.as_str(), e.start, e.end), ("e1", 540, 600));
         let reqs = seen.lock().unwrap();
         assert!(reqs[1].starts_with("POST /calendar/v3/calendars/primary/events "));
@@ -1081,6 +1092,35 @@ mod tests {
             !reqs[1].contains("extendedProperties"),
             "no tags, nothing hidden is sent on create"
         );
+    }
+
+    #[test]
+    fn create_sends_the_chosen_reminder_and_nothing_for_googles_default() {
+        let (base, seen) = fake_server(vec![
+            tok("a"),
+            (200, EVENT.to_string()),
+            (200, EVENT.to_string()),
+        ]);
+        let c = client(&base, connected_store());
+        let new_event = |reminder| {
+            run(c.create_event(
+                "primary",
+                "2026-10-21",
+                (540, 600),
+                "Deep",
+                (&[], reminder),
+                &tz(),
+            ))
+            .unwrap();
+        };
+        new_event(Reminder::None);
+        new_event(Reminder::Default);
+        let reqs = seen.lock().unwrap();
+        assert_eq!(
+            body_of(&reqs[1])["reminders"],
+            serde_json::json!({"useDefault": false, "overrides": []})
+        );
+        assert!(body_of(&reqs[2]).get("reminders").is_none());
     }
 
     #[test]
@@ -1110,7 +1150,15 @@ mod tests {
         ]);
         let c = client(&base, connected_store());
         let tags = vec!["rust".to_string(), "mestrado".to_string()];
-        run(c.create_event("primary", "2026-10-21", (540, 600), "Deep", &tags, &tz())).unwrap();
+        run(c.create_event(
+            "primary",
+            "2026-10-21",
+            (540, 600),
+            "Deep",
+            (&tags, Reminder::Default),
+            &tz(),
+        ))
+        .unwrap();
         run(c.update_event(
             ("primary", "e1"),
             "2026-10-21",
@@ -1456,7 +1504,7 @@ mod tests {
             "2026-10-21",
             (540, 600),
             "T",
-            &[],
+            (&[], Reminder::Default),
             &tz(),
         ))
         .unwrap();

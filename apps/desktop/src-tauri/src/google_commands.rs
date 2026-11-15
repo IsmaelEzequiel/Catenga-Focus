@@ -3,7 +3,7 @@
 
 use crate::app_db::{AppDb, Calendar, Project, ProjectKind, ProjectRow, project_key};
 use crate::commands::{AppDbHandle, IndexHandle, now_secs};
-use crate::google::{self, CalEvent};
+use crate::google::{self, CalEvent, Reminder};
 use crate::google_client::{
     Client, Credentials, Endpoints, Error, KeychainVault, MemoryStore, Vault, migrate_legacy,
 };
@@ -23,6 +23,8 @@ const NOT_CONFIGURED: &str = "Google Calendar isn't configured in this build";
 const DISCONNECTED: &str = "Google Calendar was disconnected \u{2014} connect again";
 /// Meta key (app database, local) of the calendar new blocks are created in.
 const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
+/// Meta key (app database, local) of the notifications new events get (`Reminder::to_saved`).
+const NEW_EVENT_REMINDER: &str = "new_event_reminder";
 /// The email of an account the migration could not name yet (the single-account token
 /// found with no email; resolved in the background, retried at the next start).
 const UNNAMED_ACCOUNT: &str = "";
@@ -43,6 +45,8 @@ pub struct GoogleStatus {
     pub needs_reconnect: bool,
     /// `google_calendar_id` new blocks are created in (the resolved default).
     pub new_event_calendar_id: Option<String>,
+    /// The notifications events created by the app get.
+    pub new_event_reminder: Reminder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -319,6 +323,7 @@ impl GoogleState {
             connected: !accounts.is_empty(),
             needs_reconnect: accounts.iter().any(|a| a.needs_reconnect),
             new_event_calendar_id: new_event_calendar(calendars, &emails, chosen),
+            new_event_reminder: Reminder::Default,
             accounts,
         }
     }
@@ -329,7 +334,10 @@ impl GoogleState {
             db.0.as_ref()
                 .ok()
                 .and_then(|db| db.meta(NEW_EVENT_CALENDAR).ok().flatten());
-        self.status(&known(db).calendars, chosen.as_deref())
+        GoogleStatus {
+            new_event_reminder: new_event_reminder(db),
+            ..self.status(&known(db).calendars, chosen.as_deref())
+        }
     }
 
     /// Maps a client error to the user-facing text.
@@ -744,6 +752,35 @@ fn set_new_event_calendar(
     Ok(google.status_with(db))
 }
 
+/// Chooses the notifications events created by the app get.
+#[tauri::command]
+pub fn google_set_new_event_reminder(
+    google: State<GoogleState>,
+    db: State<AppDbHandle>,
+    reminder: Reminder,
+) -> Result<GoogleStatus, String> {
+    set_new_event_reminder(&google, &db, reminder)
+}
+
+fn set_new_event_reminder(
+    google: &GoogleState,
+    db: &AppDbHandle,
+    reminder: Reminder,
+) -> Result<GoogleStatus, String> {
+    db.get()?
+        .set_meta(NEW_EVENT_REMINDER, &reminder.to_saved())?;
+    Ok(google.status_with(db))
+}
+
+/// The saved choice; Google's default when nothing was chosen or the database is unavailable.
+fn new_event_reminder(db: &AppDbHandle) -> Reminder {
+    let saved =
+        db.0.as_ref()
+            .ok()
+            .and_then(|db| db.meta(NEW_EVENT_REMINDER).ok().flatten());
+    Reminder::from_saved(saved.as_deref())
+}
+
 #[tauri::command]
 pub fn calendar_day(
     google: State<GoogleState>,
@@ -1062,7 +1099,7 @@ async fn create_event(
             date,
             (start, end),
             &title,
-            tags,
+            (tags, new_event_reminder(db)),
             &TimeZone::system(),
         )
         .await
@@ -1624,6 +1661,7 @@ mod tests {
                 accounts: vec![],
                 needs_reconnect: false,
                 new_event_calendar_id: None,
+                new_event_reminder: Reminder::Default,
             }
         );
         assert!(!state.connected());
@@ -1735,10 +1773,11 @@ mod tests {
             }],
             needs_reconnect: true,
             new_event_calendar_id: Some("a@b.c".into()),
+            new_event_reminder: Reminder::None,
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
-            serde_json::json!({"configured":true,"connected":true,"accounts":[{"email":"a@b.c","needsReconnect":true}],"needsReconnect":true,"newEventCalendarId":"a@b.c"})
+            serde_json::json!({"configured":true,"connected":true,"accounts":[{"email":"a@b.c","needsReconnect":true}],"needsReconnect":true,"newEventCalendarId":"a@b.c","newEventReminder":{"kind":"none"}})
         );
         let day = CalendarDay {
             events: vec![ev("a", 1, 2)],
@@ -2421,6 +2460,7 @@ mod tests {
                 ],
                 needs_reconnect: true,
                 new_event_calendar_id: Some("work@x".into()),
+                new_event_reminder: Reminder::Default,
             }
         );
     }
@@ -2789,6 +2829,59 @@ mod tests {
 
     fn body_json(req: &str) -> serde_json::Value {
         serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn new_events_carry_the_chosen_notifications() {
+        let created = r#"{"id":"n1","summary":"Deep","start":{"dateTime":"2026-10-21T09:00:00-03:00"},"end":{"dateTime":"2026-10-21T10:00:00-03:00"}}"#;
+        let (base, seen) = fake_server(vec![
+            tok_as("tokA"),
+            (200, created.to_string()),
+            (200, created.to_string()),
+            (200, created.to_string()),
+        ]);
+        let (state, db, _tmp) = two_accounts(&base);
+        let new_block = || {
+            run(create_event(
+                &state,
+                &no_index(),
+                &db,
+                ("2026-10-21", 540, 600),
+                "Deep",
+                &[],
+            ))
+            .unwrap();
+        };
+        // nothing chosen: Google's defaults apply, so nothing is sent
+        assert_eq!(state.status_with(&db).new_event_reminder, Reminder::Default);
+        new_block();
+        let status = set_new_event_reminder(&state, &db, Reminder::None).unwrap();
+        assert_eq!(status.new_event_reminder, Reminder::None);
+        new_block();
+        set_new_event_reminder(&state, &db, Reminder::Popup { minutes: 10 }).unwrap();
+        new_block();
+        let reqs = seen.lock().unwrap();
+        assert!(body_json(&reqs[1]).get("reminders").is_none());
+        assert_eq!(
+            body_json(&reqs[2])["reminders"],
+            serde_json::json!({"useDefault": false, "overrides": []})
+        );
+        assert_eq!(
+            body_json(&reqs[3])["reminders"]["overrides"],
+            serde_json::json!([{"method": "popup", "minutes": 10}])
+        );
+    }
+
+    #[test]
+    fn the_chosen_notifications_survive_a_restart() {
+        let (base, _) = fake_server(vec![]);
+        let (state, db, _tmp) = two_accounts(&base);
+        set_new_event_reminder(&state, &db, Reminder::Popup { minutes: 30 }).unwrap();
+        let restarted = state_with(vec![("a@x", client_for(&base, "ra"))]);
+        assert_eq!(
+            restarted.status_with(&db).new_event_reminder,
+            Reminder::Popup { minutes: 30 }
+        );
     }
 
     #[test]

@@ -281,6 +281,22 @@
   padding: var(--space-2) 0;
 }
 
+.projtags__reminder {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.projtags__reminder select {
+  flex: 1;
+  min-width: 0;
+}
+
+.projtags__minutes {
+  width: 80px;
+  font-variant-numeric: tabular-nums;
+}
+
 .card__head.projtags__head {
   flex-direction: row;
   align-items: flex-start;
