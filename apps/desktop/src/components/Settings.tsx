@@ -7,6 +7,7 @@ import {
   type Config,
   type GoogleStatus,
   type NotesDirInfo,
+  type Reminder,
   type SyncStatus,
 } from "../api";
 import type { ApplyResult } from "../lib/notesFolder";
@@ -39,6 +40,7 @@ interface Props {
   onGoogleCancel: () => void;
   onGoogleDisconnect: (email: string) => void;
   onGoogleSetNewEventCalendar: (googleCalendarId: string) => void;
+  onGoogleSetNewEventReminder: (reminder: Reminder) => void;
   /** Shared with the timeline and the Goals page. */
   projects: ReturnType<typeof useProjects>;
   /** The pane to open on; General when omitted. */
@@ -61,6 +63,7 @@ export function Settings({
   onGoogleCancel,
   onGoogleDisconnect,
   onGoogleSetNewEventCalendar,
+  onGoogleSetNewEventReminder,
   projects,
   initialTab = "general",
   onApplyNotesFolder,
@@ -232,6 +235,7 @@ export function Settings({
                 onCancel={onGoogleCancel}
                 onDisconnect={onGoogleDisconnect}
                 onSetNewEventCalendar={onGoogleSetNewEventCalendar}
+                onSetNewEventReminder={onGoogleSetNewEventReminder}
                 onSetShown={(id, shown) => void projects.setShown(id, shown)}
               />
             )}

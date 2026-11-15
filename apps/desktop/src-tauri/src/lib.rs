@@ -268,6 +268,7 @@ pub fn run() {
             google_commands::google_cancel_connect,
             google_commands::google_disconnect,
             google_commands::google_set_new_event_calendar,
+            google_commands::google_set_new_event_reminder,
             google_commands::calendar_day,
             google_commands::calendar_refresh,
             google_commands::calendar_create,

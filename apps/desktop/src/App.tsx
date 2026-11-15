@@ -976,6 +976,7 @@ function App() {
           onGoogleCancel={google.cancel}
           onGoogleDisconnect={(email) => void google.disconnect(email)}
           onGoogleSetNewEventCalendar={(id) => void google.setNewEventCalendar(id)}
+          onGoogleSetNewEventReminder={(r) => void google.setNewEventReminder(r)}
           projects={projects}
           initialTab={settingsTab}
           onApplyNotesFolder={(path) => applyNotesFolder(dayRef.current, path, setNotesDir, appRestart)}

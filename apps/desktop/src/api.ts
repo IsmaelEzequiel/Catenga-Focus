@@ -138,7 +138,12 @@ export interface GoogleStatus {
   needsReconnect: boolean;
   /** `googleCalendarId` new blocks are created in (the default already resolved) */
   newEventCalendarId: string | null;
+  /** the notifications events created by the app get */
+  newEventReminder: Reminder;
 }
+
+/** `default` = the calendar's own defaults in Google; `popup` = one notification (no email) `minutes` before. */
+export type Reminder = { kind: "default" } | { kind: "none" } | { kind: "popup"; minutes: number };
 
 export interface CalEvent {
   id: string;
@@ -171,6 +176,9 @@ export const googleDisconnect = (email: string) => invoke<GoogleStatus>("google_
 /** Where new blocks are created (a `Calendar.googleCalendarId`). */
 export const googleSetNewEventCalendar = (googleCalendarId: string) =>
   invoke<GoogleStatus>("google_set_new_event_calendar", { googleCalendarId });
+/** The notifications events created by the app get from now on. */
+export const googleSetNewEventReminder = (reminder: Reminder) =>
+  invoke<GoogleStatus>("google_set_new_event_reminder", { reminder });
 /** Cached events only; empty when not connected. */
 export const calendarDay = (date: string) => invoke<CalendarDay>("calendar_day", { date });
 /** Fetches in the background; the result arrives as "calendar-changed" / "calendar-error". */
